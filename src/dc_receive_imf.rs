@@ -25,12 +25,12 @@ use crate::types::*;
 use crate::x::*;
 
 pub unsafe fn dc_receive_imf(
-    mut context: *mut dc_context_t,
-    mut imf_raw_not_terminated: *const libc::c_char,
-    mut imf_raw_bytes: size_t,
-    mut server_folder: *const libc::c_char,
-    mut server_uid: uint32_t,
-    mut flags: uint32_t,
+    context: *mut dc_context_t,
+    imf_raw_not_terminated: *const libc::c_char,
+    imf_raw_bytes: size_t,
+    server_folder: *const libc::c_char,
+    server_uid: uint32_t,
+    flags: uint32_t,
 ) {
     let mut current_block: u64;
     /* the function returns the number of created messages in the database */
@@ -56,7 +56,7 @@ pub unsafe fn dc_receive_imf(
     let mut sort_timestamp: time_t = -1i32 as time_t;
     let mut sent_timestamp: time_t = -1i32 as time_t;
     let mut rcvd_timestamp: time_t = -1i32 as time_t;
-    let mut mime_parser: *mut dc_mimeparser_t = dc_mimeparser_new((*context).blobdir, context);
+    let mut mime_parser: *mut dc_mimeparser_t = dc_mimeparser_new((*context).blobdir);
     let mut transaction_pending: libc::c_int = 0i32;
     let mut field: *const mailimf_field = 0 as *const mailimf_field;
     let mut mime_in_reply_to: *mut libc::c_char = 0 as *mut libc::c_char;
@@ -76,7 +76,7 @@ pub unsafe fn dc_receive_imf(
         },
         server_uid,
     );
-    to_ids = dc_array_new(context, 16i32 as size_t);
+    to_ids = dc_array_new(16i32 as size_t);
     if to_ids.is_null()
         || created_db_entries.is_null()
         || rr_event_to_send.is_null()
@@ -88,7 +88,7 @@ pub unsafe fn dc_receive_imf(
             b"Bad param.\x00" as *const u8 as *const libc::c_char,
         );
     } else {
-        dc_mimeparser_parse(mime_parser, imf_raw_not_terminated, imf_raw_bytes);
+        dc_mimeparser_parse(context, mime_parser, imf_raw_not_terminated, imf_raw_bytes);
         if (*mime_parser).header.count == 0i32 {
             dc_log_info(
                 context,
@@ -117,7 +117,7 @@ pub unsafe fn dc_receive_imf(
                 let mut fld_from: *mut mailimf_from = (*field).fld_data.fld_from;
                 if !fld_from.is_null() {
                     let mut check_self: libc::c_int = 0;
-                    let mut from_list: *mut dc_array_t = dc_array_new(context, 16i32 as size_t);
+                    let mut from_list: *mut dc_array_t = dc_array_new(16i32 as size_t);
                     dc_add_or_lookup_contacts_by_mailbox_list(
                         context,
                         (*fld_from).frm_mb_list,
@@ -1441,7 +1441,7 @@ unsafe fn create_or_lookup_group(
                                 }
                             }
                             if 0 != ok {
-                                let mut chat: *mut dc_chat_t = dc_chat_new(context);
+                                let mut chat: *mut dc_chat_t = dc_chat_new();
                                 dc_log_info(
                                     context,
                                     0i32,
@@ -1453,9 +1453,9 @@ unsafe fn create_or_lookup_group(
                                         grpimage
                                     },
                                 );
-                                dc_chat_load_from_db(chat, chat_id);
+                                dc_chat_load_from_db(context, chat, chat_id);
                                 dc_param_set((*chat).param, 'i' as i32, grpimage);
-                                dc_chat_update_param(chat);
+                                dc_chat_update_param(context, chat);
                                 dc_chat_unref(chat);
                                 free(grpimage as *mut libc::c_void);
                                 send_EVENT_CHAT_MODIFIED = 1i32
@@ -1715,7 +1715,7 @@ unsafe fn create_adhoc_grp_id(
     - sha-256 this string (without possibly terminating null-characters)
     - encode the first 64 bits of the sha-256 output as lowercase hex (results in 16 characters from the set [0-9a-f])
      */
-    let mut member_addrs: *mut dc_array_t = dc_array_new(context, 23i32 as size_t);
+    let mut member_addrs: *mut dc_array_t = dc_array_new(23i32 as size_t);
     let mut member_ids_str: *mut libc::c_char =
         dc_array_get_string(member_ids, b",\x00" as *const u8 as *const libc::c_char);
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
@@ -1796,10 +1796,10 @@ unsafe fn search_chat_ids_by_contact_ids(
 ) -> *mut dc_array_t {
     /* searches chat_id's by the given contact IDs, may return zero, one or more chat_id's */
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
-    let mut contact_ids: *mut dc_array_t = dc_array_new(context, 23i32 as size_t);
+    let mut contact_ids: *mut dc_array_t = dc_array_new(23i32 as size_t);
     let mut contact_ids_str: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut q3: *mut libc::c_char = 0 as *mut libc::c_char;
-    let mut chat_ids: *mut dc_array_t = dc_array_new(context, 23i32 as size_t);
+    let mut chat_ids: *mut dc_array_t = dc_array_new(23i32 as size_t);
     if !(context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint) {
         /* copy array, remove duplicates and SELF, sort by ID */
         let mut i: libc::c_int = 0;
@@ -1867,12 +1867,12 @@ unsafe fn check_verified_properties(
 ) -> libc::c_int {
     let mut current_block: u64;
     let mut everythings_okay: libc::c_int = 0i32;
-    let mut contact: *mut dc_contact_t = dc_contact_new(context);
-    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new(context);
+    let mut contact: *mut dc_contact_t = dc_contact_new();
+    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new();
     let mut to_ids_str: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut q3: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
-    if 0 == dc_contact_load_from_db(contact, (*context).sql, from_id) {
+    if 0 == dc_contact_load_from_db(context, contact, from_id) {
         *failure_reason = dc_mprintf(
             b"%s. See \"Info\" for details.\x00" as *const u8 as *const libc::c_char,
             b"Internal Error; cannot load contact.\x00" as *const u8 as *const libc::c_char,
@@ -1891,7 +1891,7 @@ unsafe fn check_verified_properties(
         // and results in group-splits otherwise.
         if from_id != 1i32 as libc::c_uint {
             if 0 == dc_apeerstate_load_by_addr(peerstate, (*context).sql, (*contact).addr)
-                || dc_contact_is_verified_ex(contact, peerstate) != 2i32
+                || dc_contact_is_verified_ex(context, contact, peerstate) != 2i32
             {
                 *failure_reason = dc_mprintf(
                     b"%s. See \"Info\" for details.\x00" as *const u8 as *const libc::c_char,
@@ -1968,7 +1968,7 @@ unsafe fn check_verified_properties(
                                 (*peerstate).gossip_key_fingerprint,
                                 2i32,
                             );
-                            dc_apeerstate_save_to_db(peerstate, (*context).sql, 0i32);
+                            dc_apeerstate_save_to_db(context, peerstate, 0i32);
                             is_verified = 1i32
                         }
                     }

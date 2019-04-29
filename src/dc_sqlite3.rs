@@ -16,28 +16,28 @@ use crate::x::*;
 #[repr(C)]
 pub struct dc_sqlite3_t {
     pub cobj: *mut sqlite3,
-    pub context: *mut dc_context_t,
 }
 
-pub unsafe fn dc_sqlite3_new(mut context: *mut dc_context_t) -> *mut dc_sqlite3_t {
+pub unsafe fn dc_sqlite3_new() -> *mut dc_sqlite3_t {
     let mut sql: *mut dc_sqlite3_t = 0 as *mut dc_sqlite3_t;
     sql = calloc(1, ::std::mem::size_of::<dc_sqlite3_t>()) as *mut dc_sqlite3_t;
     if sql.is_null() {
         exit(24i32);
     }
-    (*sql).context = context;
-    return sql;
+    sql
 }
-pub unsafe fn dc_sqlite3_unref(mut sql: *mut dc_sqlite3_t) {
+
+pub unsafe fn dc_sqlite3_unref(context: *mut dc_context_t, sql: *mut dc_sqlite3_t) {
     if sql.is_null() {
         return;
     }
     if !(*sql).cobj.is_null() {
-        dc_sqlite3_close(sql);
+        dc_sqlite3_close(context, sql);
     }
     free(sql as *mut libc::c_void);
 }
-pub unsafe fn dc_sqlite3_close(mut sql: *mut dc_sqlite3_t) {
+
+pub unsafe fn dc_sqlite3_close(context: *mut dc_context_t, sql: *mut dc_sqlite3_t) {
     if sql.is_null() {
         return;
     }
@@ -46,15 +46,16 @@ pub unsafe fn dc_sqlite3_close(mut sql: *mut dc_sqlite3_t) {
         (*sql).cobj = 0 as *mut sqlite3
     }
     dc_log_info(
-        (*sql).context,
+        context,
         0i32,
         b"Database closed.\x00" as *const u8 as *const libc::c_char,
     );
 }
 pub unsafe fn dc_sqlite3_open(
-    mut sql: *mut dc_sqlite3_t,
-    mut dbfile: *const libc::c_char,
-    mut flags: libc::c_int,
+    sql: *mut dc_sqlite3_t,
+    dbfile: *const libc::c_char,
+    flags: libc::c_int,
+    context: &mut dc_context_t,
 ) -> libc::c_int {
     let mut current_block: u64;
     if 0 != dc_sqlite3_is_open(sql) {
@@ -63,14 +64,14 @@ pub unsafe fn dc_sqlite3_open(
     if !(sql.is_null() || dbfile.is_null()) {
         if sqlite3_threadsafe() == 0i32 {
             dc_log_error(
-                (*sql).context,
+                context,
                 0i32,
                 b"Sqlite3 compiled thread-unsafe; this is not supported.\x00" as *const u8
                     as *const libc::c_char,
             );
         } else if !(*sql).cobj.is_null() {
             dc_log_error(
-                (*sql).context,
+                context,
                 0i32,
                 b"Cannot open, database \"%s\" already opened.\x00" as *const u8
                     as *const libc::c_char,
@@ -89,6 +90,7 @@ pub unsafe fn dc_sqlite3_open(
         ) != 0i32
         {
             dc_sqlite3_log_error(
+                context,
                 sql,
                 b"Cannot open database \"%s\".\x00" as *const u8 as *const libc::c_char,
                 dbfile,
@@ -104,11 +106,12 @@ pub unsafe fn dc_sqlite3_open(
                 let mut dbversion_before_update: libc::c_int = 0i32;
                 /* Init tables to dbversion=0 */
                 if 0 == dc_sqlite3_table_exists(
+                    context,
                     sql,
                     b"config\x00" as *const u8 as *const libc::c_char,
                 ) {
                     dc_log_info(
-                        (*sql).context,
+                        context,
                         0i32,
                         b"First time init: creating tables in \"%s\".\x00" as *const u8
                             as *const libc::c_char,
@@ -202,31 +205,38 @@ pub unsafe fn dc_sqlite3_open(
                             as *const libc::c_char,
                     );
                     if 0 == dc_sqlite3_table_exists(
+                        context,
                         sql,
                         b"config\x00" as *const u8 as *const libc::c_char,
                     ) || 0
                         == dc_sqlite3_table_exists(
+                            context,
                             sql,
                             b"contacts\x00" as *const u8 as *const libc::c_char,
                         )
                         || 0 == dc_sqlite3_table_exists(
+                            context,
                             sql,
                             b"chats\x00" as *const u8 as *const libc::c_char,
                         )
                         || 0 == dc_sqlite3_table_exists(
+                            context,
                             sql,
                             b"chats_contacts\x00" as *const u8 as *const libc::c_char,
                         )
                         || 0 == dc_sqlite3_table_exists(
+                            context,
                             sql,
                             b"msgs\x00" as *const u8 as *const libc::c_char,
                         )
                         || 0 == dc_sqlite3_table_exists(
+                            context,
                             sql,
                             b"jobs\x00" as *const u8 as *const libc::c_char,
                         )
                     {
                         dc_sqlite3_log_error(
+                            context,
                             sql,
                             b"Cannot create tables in new database \"%s\".\x00" as *const u8
                                 as *const libc::c_char,
@@ -754,15 +764,14 @@ pub unsafe fn dc_sqlite3_open(
                                     as *const libc::c_char,
                             );
                             while sqlite3_step(stmt) == 100i32 {
-                                let mut peerstate: *mut dc_apeerstate_t =
-                                    dc_apeerstate_new((*sql).context);
+                                let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new();
                                 if 0 != dc_apeerstate_load_by_addr(
                                     peerstate,
                                     sql,
                                     sqlite3_column_text(stmt, 0i32) as *const libc::c_char,
                                 ) && 0 != dc_apeerstate_recalc_fingerprint(peerstate)
                                 {
-                                    dc_apeerstate_save_to_db(peerstate, sql, 0i32);
+                                    dc_apeerstate_save_to_db(context, peerstate, 0i32);
                                 }
                                 dc_apeerstate_unref(peerstate);
                             }
@@ -772,7 +781,7 @@ pub unsafe fn dc_sqlite3_open(
                             let mut repl_from: *mut libc::c_char = dc_sqlite3_get_config(
                                 sql,
                                 b"backup_for\x00" as *const u8 as *const libc::c_char,
-                                (*(*sql).context).blobdir,
+                                (*context).blobdir,
                             );
                             dc_ensure_no_slash(repl_from);
                             if 0 != !('f' as i32 == 'f' as i32) as libc::c_int as libc::c_long {
@@ -816,6 +825,7 @@ pub unsafe fn dc_sqlite3_open(
                             sqlite3_free(q3 as *mut libc::c_void);
                             free(repl_from as *mut libc::c_void);
                             dc_sqlite3_set_config(
+                                context,
                                 sql,
                                 b"backup_for\x00" as *const u8 as *const libc::c_char,
                                 0 as *const libc::c_char,
@@ -831,7 +841,7 @@ pub unsafe fn dc_sqlite3_open(
                 13628706266672894061 => {}
                 _ => {
                     dc_log_info(
-                        (*sql).context,
+                        context,
                         0i32,
                         b"Opened \"%s\".\x00" as *const u8 as *const libc::c_char,
                         dbfile,
@@ -841,20 +851,21 @@ pub unsafe fn dc_sqlite3_open(
             }
         }
     }
-    dc_sqlite3_close(sql);
+    dc_sqlite3_close(context, sql);
     return 0i32;
 }
 /* handle configurations, private */
 pub unsafe fn dc_sqlite3_set_config(
-    mut sql: *mut dc_sqlite3_t,
-    mut key: *const libc::c_char,
-    mut value: *const libc::c_char,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    key: *const libc::c_char,
+    value: *const libc::c_char,
 ) -> libc::c_int {
     let mut state: libc::c_int = 0i32;
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     if key.is_null() {
         dc_log_error(
-            (*sql).context,
+            context,
             0i32,
             b"dc_sqlite3_set_config(): Bad parameter.\x00" as *const u8 as *const libc::c_char,
         );
@@ -862,7 +873,7 @@ pub unsafe fn dc_sqlite3_set_config(
     }
     if 0 == dc_sqlite3_is_open(sql) {
         dc_log_error(
-            (*sql).context,
+            context,
             0i32,
             b"dc_sqlite3_set_config(): Database not ready.\x00" as *const u8 as *const libc::c_char,
         );
@@ -898,7 +909,7 @@ pub unsafe fn dc_sqlite3_set_config(
             sqlite3_finalize(stmt);
         } else {
             dc_log_error(
-                (*sql).context,
+                context,
                 0i32,
                 b"dc_sqlite3_set_config(): Cannot read value.\x00" as *const u8
                     as *const libc::c_char,
@@ -916,7 +927,7 @@ pub unsafe fn dc_sqlite3_set_config(
     }
     if state != 101i32 {
         dc_log_error(
-            (*sql).context,
+            context,
             0i32,
             b"dc_sqlite3_set_config(): Cannot change value.\x00" as *const u8
                 as *const libc::c_char,
@@ -928,8 +939,9 @@ pub unsafe fn dc_sqlite3_set_config(
 /* tools, these functions are compatible to the corresponding sqlite3_* functions */
 /* the result mus be freed using sqlite3_finalize() */
 pub unsafe fn dc_sqlite3_prepare(
-    mut sql: *mut dc_sqlite3_t,
-    mut querystr: *const libc::c_char,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    querystr: *const libc::c_char,
 ) -> *mut sqlite3_stmt {
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     if sql.is_null() || querystr.is_null() || (*sql).cobj.is_null() {
@@ -944,6 +956,7 @@ pub unsafe fn dc_sqlite3_prepare(
     ) != 0i32
     {
         dc_sqlite3_log_error(
+            context,
             sql,
             b"Query failed: %s\x00" as *const u8 as *const libc::c_char,
             querystr,
@@ -953,9 +966,10 @@ pub unsafe fn dc_sqlite3_prepare(
     return stmt;
 }
 pub unsafe extern "C" fn dc_sqlite3_log_error(
-    mut sql: *mut dc_sqlite3_t,
-    mut msg_format: *const libc::c_char,
-    mut va: ...
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    msg_format: *const libc::c_char,
+    va: ...
 ) {
     let mut msg: *mut libc::c_char = 0 as *mut libc::c_char;
     if sql.is_null() || msg_format.is_null() {
@@ -964,7 +978,7 @@ pub unsafe extern "C" fn dc_sqlite3_log_error(
     // FIXME: evil transmute
     msg = sqlite3_vmprintf(msg_format, std::mem::transmute(va));
     dc_log_error(
-        (*sql).context,
+        context,
         0i32,
         b"%s SQLite says: %s\x00" as *const u8 as *const libc::c_char,
         if !msg.is_null() {
@@ -1013,8 +1027,9 @@ pub unsafe fn dc_sqlite3_get_config(
     return dc_strdup_keep_null(def);
 }
 pub unsafe fn dc_sqlite3_execute(
-    mut sql: *mut dc_sqlite3_t,
-    mut querystr: *const libc::c_char,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    querystr: *const libc::c_char,
 ) -> libc::c_int {
     let mut success: libc::c_int = 0i32;
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
@@ -1024,6 +1039,7 @@ pub unsafe fn dc_sqlite3_execute(
         sqlState = sqlite3_step(stmt);
         if sqlState != 101i32 && sqlState != 100i32 {
             dc_sqlite3_log_error(
+                context,
                 sql,
                 b"Cannot execute \"%s\".\x00" as *const u8 as *const libc::c_char,
                 querystr,
@@ -1036,7 +1052,8 @@ pub unsafe fn dc_sqlite3_execute(
     return success;
 }
 pub unsafe fn dc_sqlite3_set_config_int(
-    mut sql: *mut dc_sqlite3_t,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
     mut key: *const libc::c_char,
     mut value: int32_t,
 ) -> libc::c_int {
@@ -1047,16 +1064,18 @@ pub unsafe fn dc_sqlite3_set_config_int(
     if value_str.is_null() {
         return 0i32;
     }
-    let mut ret: libc::c_int = dc_sqlite3_set_config(sql, key, value_str);
+    let mut ret: libc::c_int = dc_sqlite3_set_config(context, sql, key, value_str);
     free(value_str as *mut libc::c_void);
     return ret;
 }
 pub unsafe fn dc_sqlite3_get_config_int(
-    mut sql: *mut dc_sqlite3_t,
-    mut key: *const libc::c_char,
-    mut def: int32_t,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    key: *const libc::c_char,
+    def: int32_t,
 ) -> int32_t {
-    let mut str: *mut libc::c_char = dc_sqlite3_get_config(sql, key, 0 as *const libc::c_char);
+    let mut str: *mut libc::c_char =
+        dc_sqlite3_get_config(context, sql, key, 0 as *const libc::c_char);
     if str.is_null() {
         return def;
     }
@@ -1065,8 +1084,9 @@ pub unsafe fn dc_sqlite3_get_config_int(
     return ret;
 }
 pub unsafe fn dc_sqlite3_table_exists(
-    mut sql: *mut dc_sqlite3_t,
-    mut name: *const libc::c_char,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    name: *const libc::c_char,
 ) -> libc::c_int {
     let mut ret: libc::c_int = 0i32;
     let mut querystr: *mut libc::c_char = 0 as *mut libc::c_char;
@@ -1079,7 +1099,7 @@ pub unsafe fn dc_sqlite3_table_exists(
     if querystr.is_null() {
         /* this statement cannot be used with binded variables */
         dc_log_error(
-            (*sql).context,
+            context,
             0i32,
             b"dc_sqlite3_table_exists_(): Out of memory.\x00" as *const u8 as *const libc::c_char,
         );
@@ -1136,8 +1156,9 @@ pub unsafe fn dc_sqlite3_get_config_int64(
     return ret;
 }
 pub unsafe fn dc_sqlite3_try_execute(
-    mut sql: *mut dc_sqlite3_t,
-    mut querystr: *const libc::c_char,
+    context: *mut dc_context_t,
+    sql: *mut dc_sqlite3_t,
+    querystr: *const libc::c_char,
 ) -> libc::c_int {
     // same as dc_sqlite3_execute() but does not pass error to ui
     let mut success: libc::c_int = 0i32;
@@ -1148,7 +1169,7 @@ pub unsafe fn dc_sqlite3_try_execute(
         sql_state = sqlite3_step(stmt);
         if sql_state != 101i32 && sql_state != 100i32 {
             dc_log_warning(
-                (*sql).context,
+                context,
                 0i32,
                 b"Try-execute for \"%s\" failed: %s\x00" as *const u8 as *const libc::c_char,
                 querystr,

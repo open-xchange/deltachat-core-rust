@@ -36,6 +36,7 @@ pub unsafe fn dc_get_oauth2_url(
         oauth2 = get_info(addr);
         if !oauth2.is_null() {
             dc_sqlite3_set_config(
+                context,
                 (*context).sql,
                 b"oauth2_pending_redirect_uri\x00" as *const u8 as *const libc::c_char,
                 redirect_uri,
@@ -174,7 +175,7 @@ pub unsafe fn dc_get_oauth2_access_token(
                 b"Internal OAuth2 error: 2\x00" as *const u8 as *const libc::c_char,
             );
         } else {
-            pthread_mutex_lock(&mut (*context).oauth2_critical);
+            // pthread_mutex_lock(&mut (*context).oauth2_critical);
             locked = 1i32;
             // read generated token
             if 0 == flags & 0x1i32 && 0 == is_expired(context) {
@@ -381,11 +382,13 @@ pub unsafe fn dc_get_oauth2_access_token(
                                 && 0 != *refresh_token.offset(0isize) as libc::c_int
                             {
                                 dc_sqlite3_set_config(
+                                    context,
                                     (*context).sql,
                                     b"oauth2_refresh_token\x00" as *const u8 as *const libc::c_char,
                                     refresh_token,
                                 );
                                 dc_sqlite3_set_config(
+                                    context,
                                     (*context).sql,
                                     b"oauth2_refresh_token_for\x00" as *const u8
                                         as *const libc::c_char,
@@ -405,6 +408,7 @@ pub unsafe fn dc_get_oauth2_access_token(
                                 );
                             } else {
                                 dc_sqlite3_set_config(
+                                    context,
                                     (*context).sql,
                                     b"oauth2_access_token\x00" as *const u8 as *const libc::c_char,
                                     access_token,
@@ -421,6 +425,7 @@ pub unsafe fn dc_get_oauth2_access_token(
                                 );
                                 if 0 != update_redirect_uri_on_success {
                                     dc_sqlite3_set_config(
+                                        context,
                                         (*context).sql,
                                         b"oauth2_redirect_uri\x00" as *const u8
                                             as *const libc::c_char,
@@ -435,7 +440,7 @@ pub unsafe fn dc_get_oauth2_access_token(
         }
     }
     if 0 != locked {
-        pthread_mutex_unlock(&mut (*context).oauth2_critical);
+        // pthread_mutex_unlock(&mut (*context).oauth2_critical);
     }
     free(refresh_token as *mut libc::c_void);
     free(refresh_token_for as *mut libc::c_void);

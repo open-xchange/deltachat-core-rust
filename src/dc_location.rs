@@ -82,7 +82,7 @@ pub unsafe fn dc_send_locations_to_chat(
         sqlite3_bind_int(stmt, 3i32, chat_id as libc::c_int);
         sqlite3_step(stmt);
         if 0 != seconds && 0 == is_sending_locations_before {
-            msg = dc_msg_new(context, 10i32);
+            msg = dc_msg_new(10i32);
             (*msg).text = dc_stock_system_msg(
                 context,
                 64i32,
@@ -218,7 +218,7 @@ pub unsafe fn dc_get_locations(
     mut timestamp_from: time_t,
     mut timestamp_to: time_t,
 ) -> *mut dc_array_t {
-    let mut ret: *mut dc_array_t = dc_array_new_typed(context, 1i32, 500i32 as size_t);
+    let mut ret: *mut dc_array_t = dc_array_new_typed(1i32, 500i32 as size_t);
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     if !(context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint) {
         if timestamp_to == 0i32 as libc::c_long {
@@ -603,7 +603,7 @@ pub unsafe fn dc_kml_parse(
         } else {
             content_nullterminated = dc_null_terminate(content, content_bytes as libc::c_int);
             if !content_nullterminated.is_null() {
-                (*kml).locations = dc_array_new_typed(context, 1, 100 as size_t);
+                (*kml).locations = dc_array_new_typed(1, 100 as size_t);
                 dc_saxparser_init(&mut saxparser, kml as *mut libc::c_void);
                 dc_saxparser_set_tag_handler(
                     &mut saxparser,
@@ -823,7 +823,7 @@ pub unsafe fn dc_job_do_DC_JOB_MAYBE_SEND_LOCATIONS(
         // the easiest way to determine this, is to check for an empty message queue.
         // (might not be 100%, however, as positions are sent combined later
         // and dc_set_location() is typically called periodically, this is ok)
-        let mut msg: *mut dc_msg_t = dc_msg_new(context, 10i32);
+        let mut msg: *mut dc_msg_t = dc_msg_new(10i32);
         (*msg).hidden = 1i32;
         dc_param_set_int((*msg).param, 'S' as i32, 9i32);
         dc_send_msg(context, chat_id, msg);

@@ -275,7 +275,8 @@ unsafe extern "C" fn inbox_thread_entry_point(
 ) -> *mut libc::c_void {
     let mut context: *mut dc_context_t = entry_arg as *mut dc_context_t;
     while 0 != run_threads {
-        dc_perform_imap_jobs(context);
+        // FIXME
+        // dc_perform_imap_jobs(context);
         dc_perform_imap_fetch(context);
         if 0 != run_threads {
             dc_perform_imap_idle(context);
@@ -395,11 +396,11 @@ unsafe extern "C" fn read_cmd() -> *mut libc::c_char {
 #[cfg(not(target_os = "android"))]
 unsafe fn main_0(mut argc: libc::c_int, mut argv: *mut *mut libc::c_char) -> libc::c_int {
     let mut cmd: *mut libc::c_char = 0 as *mut libc::c_char;
-    let mut context: *mut dc_context_t = dc_context_new(
+    let mut context: *mut dc_context_t = &mut dc_context_new(
         receive_event,
         0 as *mut libc::c_void,
         b"CLI\x00" as *const u8 as *const libc::c_char,
-    );
+    ) as *mut _;
     let mut stresstest_only: libc::c_int = 0i32;
     dc_cmdline_skip_auth();
     if argc == 2i32 {
@@ -409,7 +410,13 @@ unsafe fn main_0(mut argc: libc::c_int, mut argv: *mut *mut libc::c_char) -> lib
         ) == 0i32
         {
             stresstest_only = 1i32
-        } else if 0 == dc_open(context, *argv.offset(1isize), 0 as *const libc::c_char) {
+        } else if 0
+            == dc_open(
+                &mut *context,
+                *argv.offset(1isize),
+                0 as *const libc::c_char,
+            )
+        {
             printf(
                 b"ERROR: Cannot open %s.\n\x00" as *const u8 as *const libc::c_char,
                 *argv.offset(1isize),
@@ -455,7 +462,8 @@ unsafe fn main_0(mut argc: libc::c_int, mut argv: *mut *mut libc::c_char) -> lib
                         as *const libc::c_char,
                 );
             } else {
-                dc_perform_imap_jobs(context);
+                // FIXME
+                // dc_perform_imap_jobs(context);
             }
         } else if strcmp(cmd, b"configure\x00" as *const u8 as *const libc::c_char) == 0i32 {
             start_threads(context);

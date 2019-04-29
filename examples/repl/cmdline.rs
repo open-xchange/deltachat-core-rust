@@ -652,7 +652,7 @@ pub unsafe extern "C" fn dc_cmdline(
         } else if strcmp(cmd, b"open\x00" as *const u8 as *const libc::c_char) == 0i32 {
             if !arg1.is_null() {
                 dc_close(context);
-                ret = if 0 != dc_open(context, arg1, 0 as *const libc::c_char) {
+                ret = if 0 != dc_open(&mut *context, arg1, 0 as *const libc::c_char) {
                     2i32 as *mut libc::c_char
                 } else {
                     1i32 as *mut libc::c_char

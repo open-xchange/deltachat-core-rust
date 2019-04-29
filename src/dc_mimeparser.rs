@@ -47,7 +47,6 @@ pub struct dc_mimeparser_t {
     pub e2ee_helper: *mut dc_e2ee_helper_t,
     pub blobdir: *const libc::c_char,
     pub is_forwarded: libc::c_int,
-    pub context: *mut dc_context_t,
     pub reports: *mut carray,
     pub is_system_message: libc::c_int,
     pub location_kml: *mut dc_kml_t,
@@ -60,16 +59,12 @@ pub unsafe fn dc_no_compound_msgs() {
 }
 // deprecated: flag to switch generation of compound messages on and off.
 static mut s_generate_compound_msgs: libc::c_int = 1i32;
-pub unsafe fn dc_mimeparser_new(
-    mut blobdir: *const libc::c_char,
-    mut context: *mut dc_context_t,
-) -> *mut dc_mimeparser_t {
+pub unsafe fn dc_mimeparser_new(mut blobdir: *const libc::c_char) -> *mut dc_mimeparser_t {
     let mut mimeparser: *mut dc_mimeparser_t = 0 as *mut dc_mimeparser_t;
     mimeparser = calloc(1, ::std::mem::size_of::<dc_mimeparser_t>()) as *mut dc_mimeparser_t;
     if mimeparser.is_null() {
         exit(30i32);
     }
-    (*mimeparser).context = context;
     (*mimeparser).parts = carray_new(16i32 as libc::c_uint);
     (*mimeparser).blobdir = blobdir;
     (*mimeparser).reports = carray_new(16i32 as libc::c_uint);
@@ -151,9 +146,10 @@ unsafe fn dc_mimepart_unref(mut mimepart: *mut dc_mimepart_t) {
     free(mimepart as *mut libc::c_void);
 }
 pub unsafe fn dc_mimeparser_parse(
-    mut mimeparser: *mut dc_mimeparser_t,
-    mut body_not_terminated: *const libc::c_char,
-    mut body_bytes: size_t,
+    context: *mut dc_context_t,
+    mimeparser: *mut dc_mimeparser_t,
+    body_not_terminated: *const libc::c_char,
+    body_bytes: size_t,
 ) {
     let mut r: libc::c_int = 0i32;
     let mut index: size_t = 0i32 as size_t;
@@ -166,12 +162,8 @@ pub unsafe fn dc_mimeparser_parse(
         &mut (*mimeparser).mimeroot,
     );
     if !(r != MAILIMF_NO_ERROR as libc::c_int || (*mimeparser).mimeroot.is_null()) {
-        dc_e2ee_decrypt(
-            (*mimeparser).context,
-            (*mimeparser).mimeroot,
-            (*mimeparser).e2ee_helper,
-        );
-        dc_mimeparser_parse_mime_recursive(mimeparser, (*mimeparser).mimeroot);
+        dc_e2ee_decrypt(context, (*mimeparser).mimeroot, (*mimeparser).e2ee_helper);
+        dc_mimeparser_parse_mime_recursive(context, mimeparser, (*mimeparser).mimeroot);
         let mut field: *mut mailimf_field = dc_mimeparser_lookup_field(
             mimeparser,
             b"Subject\x00" as *const u8 as *const libc::c_char,
@@ -512,8 +504,9 @@ pub unsafe fn dc_mimeparser_lookup_optional_field(
     return 0 as *mut mailimf_optional_field;
 }
 unsafe fn dc_mimeparser_parse_mime_recursive(
-    mut mimeparser: *mut dc_mimeparser_t,
-    mut mime: *mut mailmime,
+    context: *mut dc_context_t,
+    mimeparser: *mut dc_mimeparser_t,
+    mime: *mut mailmime,
 ) -> libc::c_int {
     let mut any_part_added: libc::c_int = 0i32;
     let mut cur: *mut clistiter = 0 as *mut clistiter;
@@ -541,7 +534,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
             ) == 0i32
         {
             dc_log_info(
-                (*mimeparser).context,
+                context,
                 0i32,
                 b"Protected headers found in text/rfc822-headers attachment: Will be ignored.\x00"
                     as *const u8 as *const libc::c_char,
@@ -559,7 +552,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                 || (*mimeparser).header_protected.is_null()
             {
                 dc_log_warning(
-                    (*mimeparser).context,
+                    context,
                     0i32,
                     b"Protected headers parsing error.\x00" as *const u8 as *const libc::c_char,
                 );
@@ -567,17 +560,17 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                 hash_header(
                     &mut (*mimeparser).header,
                     (*mimeparser).header_protected,
-                    (*mimeparser).context,
+                    context,
                 );
             }
         } else {
-            dc_log_info((*mimeparser).context, 0i32,
+            dc_log_info(context, 0i32,
                         b"Protected headers found in MIME header: Will be ignored as we already found an outer one.\x00"
                             as *const u8 as *const libc::c_char);
         }
     }
     match (*mime).mm_type {
-        1 => any_part_added = dc_mimeparser_add_single_part_if_known(mimeparser, mime),
+        1 => any_part_added = dc_mimeparser_add_single_part_if_known(context, mimeparser, mime),
         2 => {
             match mailmime_get_mime_type(mime, 0 as *mut libc::c_int, 0 as *mut *mut libc::c_char) {
                 10 => {
@@ -596,7 +589,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                         ) == 30i32
                         {
                             any_part_added =
-                                dc_mimeparser_parse_mime_recursive(mimeparser, childmime);
+                                dc_mimeparser_parse_mime_recursive(context, mimeparser, childmime);
                             break;
                         } else {
                             cur = if !cur.is_null() {
@@ -621,8 +614,11 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                                 0 as *mut *mut libc::c_char,
                             ) == 60i32
                             {
-                                any_part_added =
-                                    dc_mimeparser_parse_mime_recursive(mimeparser, childmime_0);
+                                any_part_added = dc_mimeparser_parse_mime_recursive(
+                                    context,
+                                    mimeparser,
+                                    childmime_0,
+                                );
                                 break;
                             } else {
                                 cur = if !cur.is_null() {
@@ -637,6 +633,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                         cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
                         while !cur.is_null() {
                             if 0 != dc_mimeparser_parse_mime_recursive(
+                                context,
                                 mimeparser,
                                 (if !cur.is_null() {
                                     (*cur).data
@@ -661,6 +658,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                     cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
                     if !cur.is_null() {
                         any_part_added = dc_mimeparser_parse_mime_recursive(
+                            context,
                             mimeparser,
                             (if !cur.is_null() {
                                 (*cur).data
@@ -673,8 +671,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                 40 => {
                     let mut part: *mut dc_mimepart_t = dc_mimepart_new();
                     (*part).type_0 = 10i32;
-                    let mut msg_body: *mut libc::c_char =
-                        dc_stock_str((*mimeparser).context, 29i32);
+                    let mut msg_body: *mut libc::c_char = dc_stock_str(context, 29i32);
                     (*part).msg =
                         dc_mprintf(b"[%s]\x00" as *const u8 as *const libc::c_char, msg_body);
                     (*part).msg_raw = dc_strdup((*part).msg);
@@ -691,6 +688,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                     cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
                     if !cur.is_null() {
                         any_part_added = dc_mimeparser_parse_mime_recursive(
+                            context,
                             mimeparser,
                             (if !cur.is_null() {
                                 (*cur).data
@@ -720,6 +718,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                             );
                         } else {
                             any_part_added = dc_mimeparser_parse_mime_recursive(
+                                context,
                                 mimeparser,
                                 (if !(*(*mime).mm_data.mm_multipart.mm_mp_list).first.is_null() {
                                     (*(*(*mime).mm_data.mm_multipart.mm_mp_list).first).data
@@ -766,7 +765,7 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                         }
                     }
                     if plain_cnt == 1i32 && html_cnt == 1i32 {
-                        dc_log_warning((*mimeparser).context, 0i32,
+                        dc_log_warning(context, 0i32,
                                        b"HACK: multipart/mixed message found with PLAIN and HTML, we\'ll skip the HTML part as this seems to be unwanted.\x00"
                                            as *const u8 as
                                            *const libc::c_char);
@@ -781,7 +780,11 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                         })
                             as *mut mailmime;
                         if childmime_2 != skip_part {
-                            if 0 != dc_mimeparser_parse_mime_recursive(mimeparser, childmime_2) {
+                            if 0 != dc_mimeparser_parse_mime_recursive(
+                                context,
+                                mimeparser,
+                                childmime_2,
+                            ) {
                                 any_part_added = 1i32
                             }
                         }
@@ -800,11 +803,12 @@ unsafe fn dc_mimeparser_parse_mime_recursive(
                 hash_header(
                     &mut (*mimeparser).header,
                     (*mimeparser).header_root,
-                    (*mimeparser).context,
+                    context,
                 );
             }
             if !(*mime).mm_data.mm_message.mm_msg_mime.is_null() {
                 any_part_added = dc_mimeparser_parse_mime_recursive(
+                    context,
                     mimeparser,
                     (*mime).mm_data.mm_message.mm_msg_mime,
                 )
@@ -1137,8 +1141,9 @@ pub unsafe fn mailmime_find_ct_parameter(
     return 0 as *mut mailmime_parameter;
 }
 unsafe fn dc_mimeparser_add_single_part_if_known(
-    mut mimeparser: *mut dc_mimeparser_t,
-    mut mime: *mut mailmime,
+    context: *mut dc_context_t,
+    mimeparser: *mut dc_mimeparser_t,
+    mime: *mut mailmime,
 ) -> libc::c_int {
     let mut current_block: u64;
     let mut part: *mut dc_mimepart_t = 0 as *mut dc_mimepart_t;
@@ -1213,7 +1218,7 @@ unsafe fn dc_mimeparser_add_single_part_if_known(
                                         &mut ret_bytes,
                                     );
                                     if r != MAIL_CHARCONV_NO_ERROR as libc::c_int {
-                                        dc_log_warning((*mimeparser).context,
+                                        dc_log_warning(context,
                                                        0i32,
                                                        b"Cannot convert %i bytes from \"%s\" to \"utf-8\"; errorcode is %i.\x00"
                                                            as *const u8 as
@@ -1408,11 +1413,8 @@ unsafe fn dc_mimeparser_add_single_part_if_known(
                                         4,
                                     ) == 0i32
                                 {
-                                    (*mimeparser).location_kml = dc_kml_parse(
-                                        (*mimeparser).context,
-                                        decoded_data,
-                                        decoded_data_bytes,
-                                    );
+                                    (*mimeparser).location_kml =
+                                        dc_kml_parse(context, decoded_data, decoded_data_bytes);
                                     current_block = 8795901732489102124;
                                 } else if strncmp(
                                     desired_filename,
@@ -1427,15 +1429,13 @@ unsafe fn dc_mimeparser_add_single_part_if_known(
                                         4,
                                     ) == 0i32
                                 {
-                                    (*mimeparser).message_kml = dc_kml_parse(
-                                        (*mimeparser).context,
-                                        decoded_data,
-                                        decoded_data_bytes,
-                                    );
+                                    (*mimeparser).message_kml =
+                                        dc_kml_parse(context, decoded_data, decoded_data_bytes);
                                     current_block = 8795901732489102124;
                                 } else {
                                     dc_replace_bad_utf8_chars(desired_filename);
                                     do_add_single_file_part(
+                                        context,
                                         mimeparser,
                                         msg_type,
                                         mime_type,
@@ -1479,6 +1479,7 @@ unsafe fn dc_mimeparser_add_single_part_if_known(
     };
 }
 unsafe fn do_add_single_file_part(
+    context: *mut dc_context_t,
     mut parser: *mut dc_mimeparser_t,
     mut msg_type: libc::c_int,
     mut mime_type: libc::c_int,
@@ -1491,14 +1492,14 @@ unsafe fn do_add_single_file_part(
     let mut pathNfilename: *mut libc::c_char = 0 as *mut libc::c_char;
     /* create a free file name to use */
     pathNfilename = dc_get_fine_pathNfilename(
-        (*parser).context,
+        context,
         b"$BLOBDIR\x00" as *const u8 as *const libc::c_char,
         desired_filename,
     );
     if !pathNfilename.is_null() {
         /* copy data to file */
         if !(dc_write_file(
-            (*parser).context,
+            context,
             pathNfilename,
             decoded_data as *const libc::c_void,
             decoded_data_bytes,

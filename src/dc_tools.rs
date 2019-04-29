@@ -890,17 +890,17 @@ pub unsafe fn dc_gm2local_offset() -> libc::c_long {
 pub unsafe fn dc_smeared_time(mut context: *mut dc_context_t) -> time_t {
     /* function returns a corrected time(NULL) */
     let mut now: time_t = time(0 as *mut time_t);
-    pthread_mutex_lock(&mut (*context).smear_critical);
+    // pthread_mutex_lock(&mut (*context).smear_critical);
     if (*context).last_smeared_timestamp >= now {
         now = (*context).last_smeared_timestamp + 1i32 as libc::c_long
     }
-    pthread_mutex_unlock(&mut (*context).smear_critical);
+    // pthread_mutex_unlock(&mut (*context).smear_critical);
     return now;
 }
 pub unsafe fn dc_create_smeared_timestamp(mut context: *mut dc_context_t) -> time_t {
     let mut now: time_t = time(0 as *mut time_t);
     let mut ret: time_t = now;
-    pthread_mutex_lock(&mut (*context).smear_critical);
+    // pthread_mutex_lock(&mut (*context).smear_critical);
     if ret <= (*context).last_smeared_timestamp {
         ret = (*context).last_smeared_timestamp + 1i32 as libc::c_long;
         if ret - now > 5i32 as libc::c_long {
@@ -908,7 +908,7 @@ pub unsafe fn dc_create_smeared_timestamp(mut context: *mut dc_context_t) -> tim
         }
     }
     (*context).last_smeared_timestamp = ret;
-    pthread_mutex_unlock(&mut (*context).smear_critical);
+    // pthread_mutex_unlock(&mut (*context).smear_critical);
     return ret;
 }
 pub unsafe fn dc_create_smeared_timestamps(
@@ -919,14 +919,14 @@ pub unsafe fn dc_create_smeared_timestamps(
     let mut now: time_t = time(0 as *mut time_t);
     let mut start: time_t =
         now + (if count < 5i32 { count } else { 5i32 }) as libc::c_long - count as libc::c_long;
-    pthread_mutex_lock(&mut (*context).smear_critical);
+    // pthread_mutex_lock(&mut (*context).smear_critical);
     start = if (*context).last_smeared_timestamp + 1i32 as libc::c_long > start {
         (*context).last_smeared_timestamp + 1i32 as libc::c_long
     } else {
         start
     };
     (*context).last_smeared_timestamp = start + (count - 1i32) as libc::c_long;
-    pthread_mutex_unlock(&mut (*context).smear_critical);
+    // pthread_mutex_unlock(&mut (*context).smear_critical);
     return start;
 }
 /* Message-ID tools */

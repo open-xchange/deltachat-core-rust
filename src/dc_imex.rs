@@ -89,9 +89,15 @@ pub unsafe fn dc_imex_has_backup(
                     dir_name,
                     name,
                 );
-                dc_sqlite3_unref(test_sql);
-                test_sql = dc_sqlite3_new(context);
-                if !test_sql.is_null() && 0 != dc_sqlite3_open(test_sql, curr_pathNfilename, 0x1i32)
+                dc_sqlite3_unref(context, test_sql);
+                test_sql = dc_sqlite3_new();
+                if !test_sql.is_null()
+                    && 0 != dc_sqlite3_open(
+                        (*context).sql,
+                        curr_pathNfilename,
+                        0x1i32,
+                        &mut *context,
+                    )
                 {
                     let mut curr_backup_time: time_t = dc_sqlite3_get_config_int(
                         test_sql,
@@ -113,7 +119,7 @@ pub unsafe fn dc_imex_has_backup(
         closedir(dir_handle);
     }
     free(curr_pathNfilename as *mut libc::c_void);
-    dc_sqlite3_unref(test_sql);
+    dc_sqlite3_unref(context, test_sql);
     return ret;
 }
 pub unsafe fn dc_check_password(
@@ -180,7 +186,7 @@ pub unsafe fn dc_initiate_key_transfer(mut context: *mut dc_context_t) -> *mut l
                     {
                         chat_id = dc_create_chat_by_contact_id(context, 1i32 as uint32_t);
                         if !(chat_id == 0i32 as libc::c_uint) {
-                            msg = dc_msg_new_untyped(context);
+                            msg = dc_msg_new_untyped();
                             (*msg).type_0 = 60i32;
                             dc_param_set((*msg).param, 'f' as i32, setup_file_name);
                             dc_param_set(
@@ -390,7 +396,7 @@ pub unsafe fn dc_continue_key_transfer(
         if msg.is_null()
             || 0 == dc_msg_is_setupmessage(msg)
             || {
-                filename = dc_msg_get_file(msg);
+                filename = dc_msg_get_file(context, msg);
                 filename.is_null()
             }
             || *filename.offset(0isize) as libc::c_int == 0i32
@@ -959,7 +965,7 @@ unsafe fn import_backup(
         );
     } else {
         if 0 != dc_sqlite3_is_open((*context).sql) {
-            dc_sqlite3_close((*context).sql);
+            dc_sqlite3_close(context, (*context).sql);
         }
         dc_delete_file(context, (*context).dbfile);
         if 0 != dc_file_exist(context, (*context).dbfile) {
@@ -972,7 +978,7 @@ unsafe fn import_backup(
         } else if !(0 == dc_copy_file(context, backup_to_import, (*context).dbfile)) {
             /* error already logged */
             /* re-open copied database file */
-            if !(0 == dc_sqlite3_open((*context).sql, (*context).dbfile, 0i32)) {
+            if !(0 == dc_sqlite3_open((*context).sql, (*context).dbfile, 0i32, &mut *context)) {
                 stmt = dc_sqlite3_prepare(
                     (*context).sql,
                     b"SELECT COUNT(*) FROM backup_blobs;\x00" as *const u8 as *const libc::c_char,
@@ -1054,6 +1060,7 @@ unsafe fn import_backup(
                             b"DROP TABLE backup_blobs;\x00" as *const u8 as *const libc::c_char,
                         );
                         dc_sqlite3_try_execute(
+                            context,
                             (*context).sql,
                             b"VACUUM;\x00" as *const u8 as *const libc::c_char,
                         );
@@ -1116,10 +1123,11 @@ unsafe fn export_backup(
     } else {
         dc_housekeeping(context);
         dc_sqlite3_try_execute(
+            context,
             (*context).sql,
             b"VACUUM;\x00" as *const u8 as *const libc::c_char,
         );
-        dc_sqlite3_close((*context).sql);
+        dc_sqlite3_close(context, (*context).sql);
         closed = 1i32;
         dc_log_info(
             context,
@@ -1130,14 +1138,17 @@ unsafe fn export_backup(
         );
         if !(0 == dc_copy_file(context, (*context).dbfile, dest_pathNfilename)) {
             /* error already logged */
-            dc_sqlite3_open((*context).sql, (*context).dbfile, 0i32);
+            dc_sqlite3_open((*context).sql, (*context).dbfile, 0i32, &mut *context);
             closed = 0i32;
             /* add all files as blobs to the database copy (this does not require the source to be locked, neigher the destination as it is used only here) */
             /*for logging only*/
-            dest_sql = dc_sqlite3_new(context);
-            if !(dest_sql.is_null() || 0 == dc_sqlite3_open(dest_sql, dest_pathNfilename, 0i32)) {
+            dest_sql = dc_sqlite3_new();
+            if !(dest_sql.is_null()
+                || 0 == dc_sqlite3_open(dest_sql, dest_pathNfilename, 0i32, &mut *context))
+            {
                 /* error already logged */
                 if 0 == dc_sqlite3_table_exists(
+                    context,
                     dest_sql,
                     b"backup_blobs\x00" as *const u8 as *const libc::c_char,
                 ) {
@@ -1333,11 +1344,11 @@ unsafe fn export_backup(
         closedir(dir_handle);
     }
     if 0 != closed {
-        dc_sqlite3_open((*context).sql, (*context).dbfile, 0i32);
+        dc_sqlite3_open((*context).sql, (*context).dbfile, 0i32, &mut *context);
     }
     sqlite3_finalize(stmt);
-    dc_sqlite3_close(dest_sql);
-    dc_sqlite3_unref(dest_sql);
+    dc_sqlite3_close(context, dest_sql);
+    dc_sqlite3_unref(context, dest_sql);
     if 0 != delete_dest_file {
         dc_delete_file(context, dest_pathNfilename);
     }

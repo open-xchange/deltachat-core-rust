@@ -17,25 +17,24 @@ use crate::x::*;
 #[repr(C)]
 pub struct dc_chatlist_t {
     pub magic: uint32_t,
-    pub context: *mut dc_context_t,
     pub cnt: size_t,
     pub chatNlastmsg_ids: *mut dc_array_t,
 }
 
 // handle chatlists
 pub unsafe fn dc_get_chatlist(
-    mut context: *mut dc_context_t,
+    context: *mut dc_context_t,
     mut listflags: libc::c_int,
     mut query_str: *const libc::c_char,
     mut query_id: uint32_t,
 ) -> *mut dc_chatlist_t {
     let mut success: libc::c_int = 0i32;
-    let mut obj: *mut dc_chatlist_t = dc_chatlist_new(context);
-    if !(context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint) {
-        if !(0 == dc_chatlist_load_from_db(obj, listflags, query_str, query_id)) {
-            success = 1i32
-        }
+    let mut obj: *mut dc_chatlist_t = dc_chatlist_new();
+
+    if !(0 == dc_chatlist_load_from_db(context, obj, listflags, query_str, query_id)) {
+        success = 1i32
     }
+
     if 0 != success {
         return obj;
     } else {
@@ -81,15 +80,14 @@ pub unsafe fn dc_get_chatlist(
  * Rendering the deaddrop in the described way
  * would not add extra work in the UI then.
  */
-pub unsafe fn dc_chatlist_new(mut context: *mut dc_context_t) -> *mut dc_chatlist_t {
+pub unsafe fn dc_chatlist_new() -> *mut dc_chatlist_t {
     let mut chatlist: *mut dc_chatlist_t = 0 as *mut dc_chatlist_t;
     chatlist = calloc(1, ::std::mem::size_of::<dc_chatlist_t>()) as *mut dc_chatlist_t;
     if chatlist.is_null() {
         exit(20i32);
     }
     (*chatlist).magic = 0xc4a71157u32;
-    (*chatlist).context = context;
-    (*chatlist).chatNlastmsg_ids = dc_array_new(context, 128i32 as size_t);
+    (*chatlist).chatNlastmsg_ids = dc_array_new(128i32 as size_t);
     if (*chatlist).chatNlastmsg_ids.is_null() {
         exit(32i32);
     }
@@ -117,6 +115,7 @@ pub unsafe fn dc_chatlist_empty(mut chatlist: *mut dc_chatlist_t) {
  * @private @memberof dc_chatlist_t
  */
 unsafe fn dc_chatlist_load_from_db(
+    context: *mut dc_context_t,
     mut chatlist: *mut dc_chatlist_t,
     mut listflags: libc::c_int,
     mut query__: *const libc::c_char,
@@ -129,8 +128,7 @@ unsafe fn dc_chatlist_load_from_db(
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     let mut strLikeCmd: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut query: *mut libc::c_char = 0 as *mut libc::c_char;
-    if !(chatlist.is_null() || (*chatlist).magic != 0xc4a71157u32 || (*chatlist).context.is_null())
-    {
+    if !(chatlist.is_null() || (*chatlist).magic != 0xc4a71157u32) {
         dc_chatlist_empty(chatlist);
         // select with left join and minimum:
         // - the inner select must use `hidden` and _not_ `m.hidden`
@@ -144,21 +142,20 @@ unsafe fn dc_chatlist_load_from_db(
         // shown at all permanent in the chatlist.
         if 0 != query_contact_id {
             stmt =
-                dc_sqlite3_prepare((*(*chatlist).context).sql,
+                dc_sqlite3_prepare(context, (*context).sql,
                                    b"SELECT c.id, m.id FROM chats c  LEFT JOIN msgs m         ON c.id=m.chat_id        AND m.timestamp=( SELECT MAX(timestamp)   FROM msgs  WHERE chat_id=c.id    AND (hidden=0 OR (hidden=1 AND state=19))) WHERE c.id>9   AND c.blocked=0 AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?)  GROUP BY c.id  ORDER BY IFNULL(m.timestamp,0) DESC, m.id DESC;\x00"
                                        as *const u8 as *const libc::c_char);
             sqlite3_bind_int(stmt, 1i32, query_contact_id as libc::c_int);
             current_block = 3437258052017859086;
         } else if 0 != listflags & 0x1i32 {
             stmt =
-                dc_sqlite3_prepare((*(*chatlist).context).sql,
+                dc_sqlite3_prepare(context, (*context).sql,
                                    b"SELECT c.id, m.id FROM chats c  LEFT JOIN msgs m         ON c.id=m.chat_id        AND m.timestamp=( SELECT MAX(timestamp)   FROM msgs  WHERE chat_id=c.id    AND (hidden=0 OR (hidden=1 AND state=19))) WHERE c.id>9   AND c.blocked=0 AND c.archived=1  GROUP BY c.id  ORDER BY IFNULL(m.timestamp,0) DESC, m.id DESC;\x00"
                                        as *const u8 as *const libc::c_char);
             current_block = 3437258052017859086;
         } else if query__.is_null() {
             if 0 == listflags & 0x2i32 {
-                let mut last_deaddrop_fresh_msg_id: uint32_t =
-                    get_last_deaddrop_fresh_msg((*chatlist).context);
+                let mut last_deaddrop_fresh_msg_id: uint32_t = get_last_deaddrop_fresh_msg(context);
                 if last_deaddrop_fresh_msg_id > 0i32 as libc::c_uint {
                     dc_array_add_id((*chatlist).chatNlastmsg_ids, 1i32 as uint32_t);
                     dc_array_add_id((*chatlist).chatNlastmsg_ids, last_deaddrop_fresh_msg_id);
@@ -166,7 +163,7 @@ unsafe fn dc_chatlist_load_from_db(
                 add_archived_link_item = 1i32
             }
             stmt =
-                dc_sqlite3_prepare((*(*chatlist).context).sql,
+                dc_sqlite3_prepare( context, (*context).sql,
                                    b"SELECT c.id, m.id FROM chats c  LEFT JOIN msgs m         ON c.id=m.chat_id        AND m.timestamp=( SELECT MAX(timestamp)   FROM msgs  WHERE chat_id=c.id    AND (hidden=0 OR (hidden=1 AND state=19))) WHERE c.id>9   AND c.blocked=0 AND c.archived=0  GROUP BY c.id  ORDER BY IFNULL(m.timestamp,0) DESC, m.id DESC;\x00"
                                        as *const u8 as *const libc::c_char);
             current_block = 3437258052017859086;
@@ -179,7 +176,7 @@ unsafe fn dc_chatlist_load_from_db(
             } else {
                 strLikeCmd = dc_mprintf(b"%%%s%%\x00" as *const u8 as *const libc::c_char, query);
                 stmt =
-                    dc_sqlite3_prepare((*(*chatlist).context).sql,
+                    dc_sqlite3_prepare(context,  (*context).sql,
                                        b"SELECT c.id, m.id FROM chats c  LEFT JOIN msgs m         ON c.id=m.chat_id        AND m.timestamp=( SELECT MAX(timestamp)   FROM msgs  WHERE chat_id=c.id    AND (hidden=0 OR (hidden=1 AND state=19))) WHERE c.id>9   AND c.blocked=0 AND c.name LIKE ?  GROUP BY c.id  ORDER BY IFNULL(m.timestamp,0) DESC, m.id DESC;\x00"
                                            as *const u8 as
                                            *const libc::c_char);
@@ -200,7 +197,7 @@ unsafe fn dc_chatlist_load_from_db(
                         sqlite3_column_int(stmt, 1i32) as uint32_t,
                     );
                 }
-                if 0 != add_archived_link_item && dc_get_archived_cnt((*chatlist).context) > 0i32 {
+                if 0 != add_archived_link_item && dc_get_archived_cnt(context) > 0i32 {
                     if dc_array_get_cnt((*chatlist).chatNlastmsg_ids) == 0
                         && 0 != listflags & 0x4i32
                     {
@@ -224,6 +221,7 @@ unsafe fn dc_chatlist_load_from_db(
 pub unsafe fn dc_get_archived_cnt(mut context: *mut dc_context_t) -> libc::c_int {
     let mut ret: libc::c_int = 0i32;
     let mut stmt: *mut sqlite3_stmt = dc_sqlite3_prepare(
+        context,
         (*context).sql,
         b"SELECT COUNT(*) FROM chats WHERE blocked=0 AND archived=1;\x00" as *const u8
             as *const libc::c_char,
@@ -238,7 +236,7 @@ unsafe fn get_last_deaddrop_fresh_msg(mut context: *mut dc_context_t) -> uint32_
     let mut ret: uint32_t = 0i32 as uint32_t;
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     stmt =
-        dc_sqlite3_prepare((*context).sql,
+        dc_sqlite3_prepare(context,  (*context).sql,
                            b"SELECT m.id  FROM msgs m  LEFT JOIN chats c ON c.id=m.chat_id  WHERE m.state=10   AND m.hidden=0    AND c.blocked=2 ORDER BY m.timestamp DESC, m.id DESC;\x00"
                                as *const u8 as *const libc::c_char);
     /* we have an index over the state-column, this should be sufficient as there are typically only few fresh messages */
@@ -284,6 +282,7 @@ pub unsafe fn dc_chatlist_get_msg_id(
     );
 }
 pub unsafe fn dc_chatlist_get_summary(
+    context: *mut dc_context_t,
     mut chatlist: *const dc_chatlist_t,
     mut index: size_t,
     mut chat: *mut dc_chat_t,
@@ -308,9 +307,10 @@ pub unsafe fn dc_chatlist_get_summary(
             index.wrapping_mul(2).wrapping_add(1),
         );
         if chat.is_null() {
-            chat = dc_chat_new((*chatlist).context);
+            chat = dc_chat_new();
             chat_to_delete = chat;
             if 0 == dc_chat_load_from_db(
+                context,
                 chat,
                 dc_array_get_id((*chatlist).chatNlastmsg_ids, index.wrapping_mul(2)),
             ) {
@@ -327,25 +327,21 @@ pub unsafe fn dc_chatlist_get_summary(
             3777403817673069519 => {}
             _ => {
                 if 0 != lastmsg_id {
-                    lastmsg = dc_msg_new_untyped((*chatlist).context);
-                    dc_msg_load_from_db(lastmsg, (*chatlist).context, lastmsg_id);
+                    lastmsg = dc_msg_new_untyped();
+                    dc_msg_load_from_db(lastmsg, context, lastmsg_id);
                     if (*lastmsg).from_id != 1i32 as libc::c_uint
                         && ((*chat).type_0 == 120i32 || (*chat).type_0 == 130i32)
                     {
-                        lastcontact = dc_contact_new((*chatlist).context);
-                        dc_contact_load_from_db(
-                            lastcontact,
-                            (*(*chatlist).context).sql,
-                            (*lastmsg).from_id,
-                        );
+                        lastcontact = dc_contact_new();
+                        dc_contact_load_from_db(context, lastcontact, (*lastmsg).from_id);
                     }
                 }
                 if (*chat).id == 6i32 as libc::c_uint {
                     (*ret).text2 = dc_strdup(0 as *const libc::c_char)
                 } else if lastmsg.is_null() || (*lastmsg).from_id == 0i32 as libc::c_uint {
-                    (*ret).text2 = dc_stock_str((*chatlist).context, 1i32)
+                    (*ret).text2 = dc_stock_str(context, 1i32)
                 } else {
-                    dc_lot_fill(ret, lastmsg, chat, lastcontact, (*chatlist).context);
+                    dc_lot_fill(ret, lastmsg, chat, lastcontact, context);
                 }
             }
         }
@@ -354,10 +350,4 @@ pub unsafe fn dc_chatlist_get_summary(
     dc_contact_unref(lastcontact);
     dc_chat_unref(chat_to_delete);
     return ret;
-}
-pub unsafe fn dc_chatlist_get_context(mut chatlist: *mut dc_chatlist_t) -> *mut dc_context_t {
-    if chatlist.is_null() || (*chatlist).magic != 0xc4a71157u32 {
-        return 0 as *mut dc_context_t;
-    }
-    return (*chatlist).context;
 }

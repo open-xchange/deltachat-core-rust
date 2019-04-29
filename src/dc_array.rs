@@ -5,12 +5,10 @@ use crate::dc_tools::*;
 use crate::types::*;
 use crate::x::*;
 
-/* * the structure behind dc_array_t */
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct dc_array_t {
     pub magic: uint32_t,
-    pub context: *mut dc_context_t,
     pub allocated: size_t,
     pub count: size_t,
     pub type_0: libc::c_int,
@@ -262,14 +260,10 @@ pub unsafe fn dc_array_get_raw(mut array: *const dc_array_t) -> *const uintptr_t
     }
     return (*array).array;
 }
-pub unsafe fn dc_array_new(
-    mut context: *mut dc_context_t,
-    mut initsize: size_t,
-) -> *mut dc_array_t {
-    return dc_array_new_typed(context, 0i32, initsize);
+pub unsafe fn dc_array_new(mut initsize: size_t) -> *mut dc_array_t {
+    return dc_array_new_typed(0i32, initsize);
 }
 pub unsafe extern "C" fn dc_array_new_typed(
-    mut context: *mut dc_context_t,
     mut type_0: libc::c_int,
     mut initsize: size_t,
 ) -> *mut dc_array_t {
@@ -279,7 +273,6 @@ pub unsafe extern "C" fn dc_array_new_typed(
         exit(47i32);
     }
     (*array).magic = 0xa11aai32 as uint32_t;
-    (*array).context = context;
     (*array).count = 0i32 as size_t;
     (*array).allocated = if initsize < 1 { 1 } else { initsize };
     (*array).type_0 = type_0;
@@ -304,7 +297,7 @@ pub unsafe fn dc_array_duplicate(mut array: *const dc_array_t) -> *mut dc_array_
     if array.is_null() || (*array).magic != 0xa11aai32 as libc::c_uint {
         return 0 as *mut dc_array_t;
     }
-    ret = dc_array_new((*array).context, (*array).allocated);
+
     (*ret).count = (*array).count;
     memcpy(
         (*ret).array as *mut libc::c_void,

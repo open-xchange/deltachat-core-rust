@@ -36,7 +36,7 @@ pub unsafe fn dc_check_qr(
     let mut name: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut invitenumber: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut auth: *mut libc::c_char = 0 as *mut libc::c_char;
-    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new(context);
+    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new();
     let mut qr_parsed: *mut dc_lot_t = dc_lot_new();
     let mut chat_id: uint32_t = 0i32 as uint32_t;
     let mut device_msg: *mut libc::c_char = 0 as *mut libc::c_char;

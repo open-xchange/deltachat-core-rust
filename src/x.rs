@@ -5,7 +5,6 @@ use crate::types::*;
 
 pub use crate::imap::*;
 pub use crate::mime::*;
-pub use crate::smtp::*;
 pub use libc::{
     atoi, calloc, close, closedir, exit, fclose, fgets, fopen, fread, free, fseek, ftell, fwrite,
     gmtime, gmtime_r, localtime, localtime_r, malloc, memcmp, memcpy, memmove, memset, mkdir, open,

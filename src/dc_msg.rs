@@ -34,7 +34,6 @@ pub struct dc_msg_t {
     pub timestamp_sent: time_t,
     pub timestamp_rcvd: time_t,
     pub text: *mut libc::c_char,
-    pub context: *mut dc_context_t,
     pub rfc724_mid: *mut libc::c_char,
     pub in_reply_to: *mut libc::c_char,
     pub server_folder: *mut libc::c_char,
@@ -47,17 +46,14 @@ pub struct dc_msg_t {
 }
 
 // handle messages
-pub unsafe fn dc_get_msg_info(
-    mut context: *mut dc_context_t,
-    mut msg_id: uint32_t,
-) -> *mut libc::c_char {
+pub unsafe fn dc_get_msg_info(context: *mut dc_context_t, msg_id: uint32_t) -> *mut libc::c_char {
     let mut e2ee_errors: libc::c_int = 0;
     let mut w: libc::c_int = 0;
     let mut h: libc::c_int = 0;
     let mut duration: libc::c_int = 0;
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
-    let mut msg: *mut dc_msg_t = dc_msg_new_untyped(context);
-    let mut contact_from: *mut dc_contact_t = dc_contact_new(context);
+    let mut msg: *mut dc_msg_t = dc_msg_new_untyped();
+    let mut contact_from: *mut dc_contact_t = dc_contact_new();
     let mut rawtxt: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut p: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut ret: dc_strbuilder_t = dc_strbuilder_t {
@@ -69,7 +65,7 @@ pub unsafe fn dc_get_msg_info(
     dc_strbuilder_init(&mut ret, 0i32);
     if !(context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint) {
         dc_msg_load_from_db(msg, context, msg_id);
-        dc_contact_load_from_db(contact_from, (*context).sql, (*msg).from_id);
+        dc_contact_load_from_db(context, contact_from, (*msg).from_id);
         stmt = dc_sqlite3_prepare(
             (*context).sql,
             b"SELECT txt_raw FROM msgs WHERE id=?;\x00" as *const u8 as *const libc::c_char,
@@ -128,10 +124,10 @@ pub unsafe fn dc_get_msg_info(
                     dc_strbuilder_cat(&mut ret, p);
                     free(p as *mut libc::c_void);
                     dc_strbuilder_cat(&mut ret, b" by \x00" as *const u8 as *const libc::c_char);
-                    let mut contact: *mut dc_contact_t = dc_contact_new(context);
+                    let mut contact: *mut dc_contact_t = dc_contact_new();
                     dc_contact_load_from_db(
+                        context,
                         contact,
-                        (*context).sql,
                         sqlite3_column_int64(stmt, 0i32) as uint32_t,
                     );
                     p = dc_contact_get_name_n_addr(contact);
@@ -199,7 +195,7 @@ pub unsafe fn dc_get_msg_info(
                     );
                     free(p as *mut libc::c_void);
                 }
-                p = dc_msg_get_file(msg);
+                p = dc_msg_get_file(context, msg);
                 if !p.is_null() && 0 != *p.offset(0isize) as libc::c_int {
                     dc_strbuilder_catf(
                         &mut ret as *mut dc_strbuilder_t,
@@ -292,8 +288,8 @@ pub unsafe fn dc_get_msg_info(
     free(rawtxt as *mut libc::c_void);
     return ret.buf;
 }
-pub unsafe fn dc_msg_new_untyped(mut context: *mut dc_context_t) -> *mut dc_msg_t {
-    return dc_msg_new(context, 0i32);
+pub unsafe fn dc_msg_new_untyped() -> *mut dc_msg_t {
+    return dc_msg_new(0i32);
 }
 /* *
  * @class dc_msg_t
@@ -305,16 +301,12 @@ pub unsafe fn dc_msg_new_untyped(mut context: *mut dc_context_t) -> *mut dc_msg_
 // to check if a mail was sent, use dc_msg_is_sent()
 // approx. max. lenght returned by dc_msg_get_text()
 // approx. max. lenght returned by dc_get_msg_info()
-pub unsafe fn dc_msg_new(
-    mut context: *mut dc_context_t,
-    mut viewtype: libc::c_int,
-) -> *mut dc_msg_t {
+pub unsafe fn dc_msg_new(mut viewtype: libc::c_int) -> *mut dc_msg_t {
     let mut msg: *mut dc_msg_t = 0 as *mut dc_msg_t;
     msg = calloc(1, ::std::mem::size_of::<dc_msg_t>()) as *mut dc_msg_t;
     if msg.is_null() {
         exit(15i32);
     }
-    (*msg).context = context;
     (*msg).magic = 0x11561156i32 as uint32_t;
     (*msg).type_0 = viewtype;
     (*msg).state = 0i32;
@@ -422,13 +414,16 @@ pub unsafe fn dc_msg_guess_msgtype_from_suffix(
     free(suffix as *mut libc::c_void);
     free(dummy_buf as *mut libc::c_void);
 }
-pub unsafe fn dc_msg_get_file(mut msg: *const dc_msg_t) -> *mut libc::c_char {
+pub unsafe fn dc_msg_get_file(
+    context: *mut dc_context_t,
+    mut msg: *const dc_msg_t,
+) -> *mut libc::c_char {
     let mut file_rel: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut file_abs: *mut libc::c_char = 0 as *mut libc::c_char;
     if !(msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint) {
         file_rel = dc_param_get((*msg).param, 'f' as i32, 0 as *const libc::c_char);
         if !file_rel.is_null() {
-            file_abs = dc_get_abs_path((*msg).context, file_rel)
+            file_abs = dc_get_abs_path(context, file_rel)
         }
     }
     free(file_rel as *mut libc::c_void);
@@ -522,7 +517,6 @@ pub unsafe fn dc_msg_load_from_db(
         if !(sqlite3_step(stmt) != 100i32) {
             if !(0 == dc_msg_set_from_stmt(msg, stmt, 0i32)) {
                 /* also calls dc_msg_empty() */
-                (*msg).context = context;
                 success = 1i32
             }
         }
@@ -793,7 +787,7 @@ pub unsafe fn dc_star_msgs(
 }
 pub unsafe fn dc_get_msg(mut context: *mut dc_context_t, mut msg_id: uint32_t) -> *mut dc_msg_t {
     let mut success: libc::c_int = 0i32;
-    let mut obj: *mut dc_msg_t = dc_msg_new_untyped(context);
+    let mut obj: *mut dc_msg_t = dc_msg_new_untyped();
     if !(context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint) {
         if !(0 == dc_msg_load_from_db(obj, context, msg_id)) {
             success = 1i32
@@ -877,13 +871,13 @@ pub unsafe fn dc_msg_get_filename(mut msg: *const dc_msg_t) -> *mut libc::c_char
         dc_strdup(0 as *const libc::c_char)
     };
 }
-pub unsafe fn dc_msg_get_filebytes(mut msg: *const dc_msg_t) -> uint64_t {
+pub unsafe fn dc_msg_get_filebytes(context: *mut dc_context_t, msg: *const dc_msg_t) -> uint64_t {
     let mut ret: uint64_t = 0i32 as uint64_t;
     let mut file: *mut libc::c_char = 0 as *mut libc::c_char;
     if !(msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint) {
         file = dc_param_get((*msg).param, 'f' as i32, 0 as *const libc::c_char);
         if !file.is_null() {
-            ret = dc_get_filebytes((*msg).context, file)
+            ret = dc_get_filebytes(context, file)
         }
     }
     free(file as *mut libc::c_void);
@@ -908,7 +902,7 @@ pub unsafe fn dc_msg_get_duration(mut msg: *const dc_msg_t) -> libc::c_int {
     return dc_param_get_int((*msg).param, 'd' as i32, 0i32);
 }
 pub unsafe fn dc_msg_get_showpadlock(mut msg: *const dc_msg_t) -> libc::c_int {
-    if msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint || (*msg).context.is_null() {
+    if msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint {
         return 0i32;
     }
     if dc_param_get_int((*msg).param, 'c' as i32, 0i32) != 0i32 {
@@ -917,8 +911,9 @@ pub unsafe fn dc_msg_get_showpadlock(mut msg: *const dc_msg_t) -> libc::c_int {
     return 0i32;
 }
 pub unsafe fn dc_msg_get_summary(
-    mut msg: *const dc_msg_t,
-    mut chat: *const dc_chat_t,
+    context: *mut dc_context_t,
+    msg: *const dc_msg_t,
+    chat: *const dc_chat_t,
 ) -> *mut dc_lot_t {
     let mut current_block: u64;
     let mut ret: *mut dc_lot_t = dc_lot_new();
@@ -926,7 +921,7 @@ pub unsafe fn dc_msg_get_summary(
     let mut chat_to_delete: *mut dc_chat_t = 0 as *mut dc_chat_t;
     if !(msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint) {
         if chat.is_null() {
-            chat_to_delete = dc_get_chat((*msg).context, (*msg).chat_id);
+            chat_to_delete = dc_get_chat(context, (*msg).chat_id);
             if chat_to_delete.is_null() {
                 current_block = 15204159476013091401;
             } else {
@@ -942,9 +937,9 @@ pub unsafe fn dc_msg_get_summary(
                 if (*msg).from_id != 1i32 as libc::c_uint
                     && ((*chat).type_0 == 120i32 || (*chat).type_0 == 130i32)
                 {
-                    contact = dc_get_contact((*chat).context, (*msg).from_id)
+                    contact = dc_get_contact(context, (*msg).from_id)
                 }
-                dc_lot_fill(ret, msg, chat, contact, (*msg).context);
+                dc_lot_fill(ret, msg, chat, contact, context);
             }
         }
     }
@@ -953,8 +948,9 @@ pub unsafe fn dc_msg_get_summary(
     return ret;
 }
 pub unsafe fn dc_msg_get_summarytext(
-    mut msg: *const dc_msg_t,
-    mut approx_characters: libc::c_int,
+    context: *mut dc_context_t,
+    msg: *const dc_msg_t,
+    approx_characters: libc::c_int,
 ) -> *mut libc::c_char {
     if msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint {
         return dc_strdup(0 as *const libc::c_char);
@@ -964,7 +960,7 @@ pub unsafe fn dc_msg_get_summarytext(
         (*msg).text,
         (*msg).param,
         approx_characters,
-        (*msg).context,
+        context,
     );
 }
 /* the returned value must be free()'d */
@@ -1083,7 +1079,7 @@ pub unsafe fn dc_msg_is_info(mut msg: *const dc_msg_t) -> libc::c_int {
     return 0i32;
 }
 pub unsafe fn dc_msg_is_increation(mut msg: *const dc_msg_t) -> libc::c_int {
-    if msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint || (*msg).context.is_null() {
+    if msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint {
         return 0i32;
     }
     return (((*msg).type_0 == 20i32
@@ -1104,7 +1100,10 @@ pub unsafe fn dc_msg_is_setupmessage(mut msg: *const dc_msg_t) -> libc::c_int {
         0i32
     };
 }
-pub unsafe fn dc_msg_get_setupcodebegin(mut msg: *const dc_msg_t) -> *mut libc::c_char {
+pub unsafe fn dc_msg_get_setupcodebegin(
+    context: *mut dc_context_t,
+    msg: *const dc_msg_t,
+) -> *mut libc::c_char {
     let mut filename: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut buf: *mut libc::c_char = 0 as *mut libc::c_char;
     let mut buf_bytes: size_t = 0i32 as size_t;
@@ -1114,11 +1113,11 @@ pub unsafe fn dc_msg_get_setupcodebegin(mut msg: *const dc_msg_t) -> *mut libc::
     let mut buf_setupcodebegin: *const libc::c_char = 0 as *const libc::c_char;
     let mut ret: *mut libc::c_char = 0 as *mut libc::c_char;
     if !(0 == dc_msg_is_setupmessage(msg)) {
-        filename = dc_msg_get_file(msg);
+        filename = dc_msg_get_file(context, msg);
         if !(filename.is_null() || *filename.offset(0isize) as libc::c_int == 0i32) {
             if !(0
                 == dc_read_file(
-                    (*msg).context,
+                    context,
                     filename,
                     &mut buf as *mut *mut libc::c_char as *mut *mut libc::c_void,
                     &mut buf_bytes,
@@ -1189,10 +1188,11 @@ pub unsafe fn dc_msg_set_duration(mut msg: *mut dc_msg_t, mut duration: libc::c_
     dc_param_set_int((*msg).param, 'd' as i32, duration);
 }
 pub unsafe fn dc_msg_latefiling_mediasize(
-    mut msg: *mut dc_msg_t,
-    mut width: libc::c_int,
-    mut height: libc::c_int,
-    mut duration: libc::c_int,
+    context: *mut dc_context_t,
+    msg: *mut dc_msg_t,
+    width: libc::c_int,
+    height: libc::c_int,
+    duration: libc::c_int,
 ) {
     if !(msg.is_null() || (*msg).magic != 0x11561156i32 as libc::c_uint) {
         if width > 0i32 && height > 0i32 {
@@ -1202,19 +1202,19 @@ pub unsafe fn dc_msg_latefiling_mediasize(
         if duration > 0i32 {
             dc_param_set_int((*msg).param, 'd' as i32, duration);
         }
-        dc_msg_save_param_to_disk(msg);
+        dc_msg_save_param_to_disk(context, msg);
     };
 }
-pub unsafe fn dc_msg_save_param_to_disk(mut msg: *mut dc_msg_t) {
+pub unsafe fn dc_msg_save_param_to_disk(context: *mut dc_context_t, msg: *mut dc_msg_t) {
     if msg.is_null()
         || (*msg).magic != 0x11561156i32 as libc::c_uint
-        || (*msg).context.is_null()
-        || (*(*msg).context).sql.is_null()
+        || context.is_null()
+        || (*context).sql.is_null()
     {
         return;
     }
     let mut stmt: *mut sqlite3_stmt = dc_sqlite3_prepare(
-        (*(*msg).context).sql,
+        (*context).sql,
         b"UPDATE msgs SET param=? WHERE id=?;\x00" as *const u8 as *const libc::c_char,
     );
     sqlite3_bind_text(stmt, 1i32, (*(*msg).param).packed, -1i32, None);
@@ -1222,16 +1222,15 @@ pub unsafe fn dc_msg_save_param_to_disk(mut msg: *mut dc_msg_t) {
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
-pub unsafe fn dc_msg_new_load(
-    mut context: *mut dc_context_t,
-    mut msg_id: uint32_t,
-) -> *mut dc_msg_t {
-    let mut msg: *mut dc_msg_t = dc_msg_new_untyped(context);
+
+pub unsafe fn dc_msg_new_load(context: *mut dc_context_t, msg_id: uint32_t) -> *mut dc_msg_t {
+    let mut msg: *mut dc_msg_t = dc_msg_new_untyped();
     dc_msg_load_from_db(msg, context, msg_id);
-    return msg;
+    msg
 }
-pub unsafe fn dc_delete_msg_from_db(mut context: *mut dc_context_t, mut msg_id: uint32_t) {
-    let mut msg: *mut dc_msg_t = dc_msg_new_untyped(context);
+
+pub unsafe fn dc_delete_msg_from_db(context: *mut dc_context_t, msg_id: uint32_t) {
+    let mut msg: *mut dc_msg_t = dc_msg_new_untyped();
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     if !(0 == dc_msg_load_from_db(msg, context, msg_id)) {
         stmt = dc_sqlite3_prepare(
@@ -1298,11 +1297,11 @@ pub unsafe fn dc_update_msg_move_state(
     sqlite3_finalize(stmt);
 }
 pub unsafe fn dc_set_msg_failed(
-    mut context: *mut dc_context_t,
-    mut msg_id: uint32_t,
-    mut error: *const libc::c_char,
+    context: *mut dc_context_t,
+    msg_id: uint32_t,
+    error: *const libc::c_char,
 ) {
-    let mut msg: *mut dc_msg_t = dc_msg_new_untyped(context);
+    let mut msg: *mut dc_msg_t = dc_msg_new_untyped();
     let mut stmt: *mut sqlite3_stmt = 0 as *mut sqlite3_stmt;
     if !(0 == dc_msg_load_from_db(msg, context, msg_id)) {
         if 18i32 == (*msg).state || 20i32 == (*msg).state || 26i32 == (*msg).state {
@@ -1456,6 +1455,7 @@ pub unsafe fn dc_get_real_msg_cnt(mut context: *mut dc_context_t) -> size_t {
                                    as *const u8 as *const libc::c_char);
         if sqlite3_step(stmt) != 100i32 {
             dc_sqlite3_log_error(
+                context,
                 (*context).sql,
                 b"dc_get_real_msg_cnt() failed.\x00" as *const u8 as *const libc::c_char,
             );

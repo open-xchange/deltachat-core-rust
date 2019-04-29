@@ -9,7 +9,6 @@ use crate::dc_log::*;
 use crate::dc_loginparam::*;
 use crate::dc_oauth2::*;
 use crate::dc_saxparser::*;
-use crate::dc_smtp::*;
 use crate::dc_sqlite3::*;
 use crate::dc_strencode::*;
 use crate::dc_tools::*;
@@ -81,12 +80,13 @@ pub unsafe fn dc_has_ongoing(mut context: *mut dc_context_t) -> libc::c_int {
         0i32
     };
 }
-pub unsafe fn dc_is_configured(mut context: *const dc_context_t) -> libc::c_int {
+pub unsafe fn dc_is_configured(context: *mut dc_context_t) -> libc::c_int {
     if context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint {
         return 0i32;
     }
     return if 0
         != dc_sqlite3_get_config_int(
+            context,
             (*context).sql,
             b"configured\x00" as *const u8 as *const libc::c_char,
             0i32,
@@ -140,11 +140,11 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                         as *const libc::c_char,
                 );
             } else {
-                dc_imap_disconnect((*context).inbox);
-                dc_imap_disconnect((*context).sentbox_thread.imap);
-                dc_imap_disconnect((*context).mvbox_thread.imap);
-                dc_smtp_disconnect((*context).smtp);
-                (*(*context).smtp).log_connect_errors = 1i32;
+                dc_imap_disconnect(context, (*context).inbox);
+                dc_imap_disconnect(context, (*context).sentbox_thread.imap);
+                dc_imap_disconnect(context, (*context).mvbox_thread.imap);
+                (*context).smtp.lock().unwrap().disconnect();
+
                 (*(*context).inbox).log_connect_errors = 1i32;
                 (*(*context).sentbox_thread.imap).log_connect_errors = 1i32;
                 (*(*context).mvbox_thread.imap).log_connect_errors = 1i32;
@@ -206,6 +206,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                     free((*param).addr as *mut libc::c_void);
                                     (*param).addr = oauth2_addr;
                                     dc_sqlite3_set_config(
+                                        context,
                                         (*context).sql,
                                         b"addr\x00" as *const u8 as *const libc::c_char,
                                         (*param).addr,
@@ -835,6 +836,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                         );
                                                         free(r_0 as *mut libc::c_void);
                                                         if 0 != dc_imap_connect(
+                                                            context,
                                                             (*context).inbox,
                                                             param,
                                                         ) {
@@ -882,6 +884,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                         );
                                                         free(r_1 as *mut libc::c_void);
                                                         if 0 != dc_imap_connect(
+                                                            context,
                                                             (*context).inbox,
                                                             param,
                                                         ) {
@@ -923,6 +926,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                         );
                                                         free(r_2 as *mut libc::c_void);
                                                         if 0 != dc_imap_connect(
+                                                            context,
                                                             (*context).inbox,
                                                             param,
                                                         ) {
@@ -991,10 +995,12 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                                     0i32 as uintptr_t,
                                                                 );
                                                                 /* try to connect to SMTP - if we did not got an autoconfig, the first try was SSL-465 and we do a second try with STARTTLS-587 */
-                                                                if 0 == dc_smtp_connect(
-                                                                    (*context).smtp,
-                                                                    param,
-                                                                ) {
+                                                                if 0 == (*context)
+                                                                    .smtp
+                                                                    .lock()
+                                                                    .unwrap()
+                                                                    .connect(context, param)
+                                                                {
                                                                     if !param_autoconfig.is_null() {
                                                                         current_block =
                                                                             2927484062889439186;
@@ -1046,10 +1052,12 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                                         free(r_3
                                                                              as
                                                                              *mut libc::c_void);
-                                                                        if 0 == dc_smtp_connect(
-                                                                            (*context).smtp,
-                                                                            param,
-                                                                        ) {
+                                                                        if 0 == (*context)
+                                                                            .smtp
+                                                                            .lock()
+                                                                            .unwrap()
+                                                                            .connect(context, param)
+                                                                        {
                                                                             if 0 != (*context)
                                                                                 .shall_stop_ongoing
                                                                             {
@@ -1104,10 +1112,14 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                                                 free(r_4
                                                                                      as
                                                                                      *mut libc::c_void);
-                                                                                if 0
-                                                                                    ==
-                                                                                    dc_smtp_connect((*context).smtp,
-                                                                                                    param)
+                                                                                if 0 == (*context)
+                                                                                    .smtp
+                                                                                    .lock()
+                                                                                    .unwrap()
+                                                                                    .connect(
+                                                                                        context,
+                                                                                        param,
+                                                                                    )
                                                                                 {
                                                                                     current_block
                                                                                         =
@@ -1159,7 +1171,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                                                 =
                                                                                 if 0
                                                                                 !=
-                                                                                dc_sqlite3_get_config_int((*context).sql,
+                                                                                dc_sqlite3_get_config_int(context, (*context).sql,
                                                                                                           b"mvbox_watch\x00"
                                                                                                           as
                                                                                                           *const u8
@@ -1169,7 +1181,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                                                 ||
                                                                                 0
                                                                                 !=
-                                                                                dc_sqlite3_get_config_int((*context).sql,
+                                                                                dc_sqlite3_get_config_int(context, (*context).sql,
                                                                                                           b"mvbox_move\x00"
                                                                                                           as
                                                                                                           *const u8
@@ -1209,14 +1221,14 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
                                                                                                                                   0i32
                                                                                                                                   as
                                                                                                                                   uintptr_t);
-                                                                                dc_loginparam_write(param,
+                                                                                dc_loginparam_write(context, param,
                                                                                                     (*context).sql,
                                                                                                     b"configured_\x00"
                                                                                                     as
                                                                                                     *const u8
                                                                                                     as
                                                                                                     *const libc::c_char);
-                                                                                dc_sqlite3_set_config_int((*context).sql,
+                                                                                dc_sqlite3_set_config_int(context, (*context).sql,
                                                                                                           b"configured\x00"
                                                                                                           as
                                                                                                           *const u8
@@ -1304,10 +1316,10 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: *mut dc_context_t, _job: 
         }
     }
     if 0 != imap_connected_here {
-        dc_imap_disconnect((*context).inbox);
+        dc_imap_disconnect(context, (*context).inbox);
     }
     if 0 != smtp_connected_here {
-        dc_smtp_disconnect((*context).smtp);
+        (*context).smtp.lock().unwrap().disconnect();
     }
     dc_loginparam_unref(param);
     dc_loginparam_unref(param_autoconfig);
@@ -1332,9 +1344,9 @@ pub unsafe fn dc_free_ongoing(mut context: *mut dc_context_t) {
     (*context).shall_stop_ongoing = 1i32;
 }
 pub unsafe fn dc_configure_folders(
-    mut context: *mut dc_context_t,
-    mut imap: *mut dc_imap_t,
-    mut flags: libc::c_int,
+    context: *mut dc_context_t,
+    imap: *mut dc_imap_t,
+    flags: libc::c_int,
 ) {
     let mut folder_list: *mut clist = 0 as *mut clist;
     let mut iter: *mut clistiter = 0 as *mut clistiter;
@@ -1347,7 +1359,7 @@ pub unsafe fn dc_configure_folders(
             0i32,
             b"Configuring IMAP-folders.\x00" as *const u8 as *const libc::c_char,
         );
-        folder_list = list_folders(imap);
+        folder_list = list_folders(context, imap);
         fallback_folder = dc_mprintf(
             b"INBOX%c%s\x00" as *const u8 as *const libc::c_char,
             (*imap).imap_delimiter as libc::c_int,
@@ -1392,7 +1404,7 @@ pub unsafe fn dc_configure_folders(
                 (*imap).etpan,
                 b"DeltaChat\x00" as *const u8 as *const libc::c_char,
             );
-            if 0 != dc_imap_is_error(imap, r) {
+            if 0 != dc_imap_is_error(context, imap, r) {
                 dc_log_warning(
                     context,
                     0i32,
@@ -1400,7 +1412,7 @@ pub unsafe fn dc_configure_folders(
                         as *const libc::c_char,
                 );
                 r = mailimap_create((*imap).etpan, fallback_folder);
-                if 0 != dc_imap_is_error(imap, r) {
+                if 0 != dc_imap_is_error(context, imap, r) {
                     dc_log_warning(
                         context,
                         0i32,
@@ -1426,16 +1438,19 @@ pub unsafe fn dc_configure_folders(
             mailimap_subscribe((*imap).etpan, mvbox_folder);
         }
         dc_sqlite3_set_config_int(
+            context,
             (*context).sql,
             b"folders_configured\x00" as *const u8 as *const libc::c_char,
             3i32,
         );
         dc_sqlite3_set_config(
+            context,
             (*context).sql,
             b"configured_mvbox_folder\x00" as *const u8 as *const libc::c_char,
             mvbox_folder,
         );
         dc_sqlite3_set_config(
+            context,
             (*context).sql,
             b"configured_sentbox_folder\x00" as *const u8 as *const libc::c_char,
             sentbox_folder,
@@ -1467,7 +1482,7 @@ unsafe fn free_folders(mut folders: *mut clist) {
         clist_free(folders);
     };
 }
-unsafe fn list_folders(mut imap: *mut dc_imap_t) -> *mut clist {
+unsafe fn list_folders(context: *mut dc_context_t, imap: *mut dc_imap_t) -> *mut clist {
     let mut imap_list: *mut clist = 0 as *mut clist;
     let mut iter1: *mut clistiter = 0 as *mut clistiter;
     let mut ret_list: *mut clist = clist_new();
@@ -1489,16 +1504,16 @@ unsafe fn list_folders(mut imap: *mut dc_imap_t) -> *mut clist {
                 &mut imap_list,
             )
         }
-        if 0 != dc_imap_is_error(imap, r) || imap_list.is_null() {
+        if 0 != dc_imap_is_error(context, imap, r) || imap_list.is_null() {
             imap_list = 0 as *mut clist;
             dc_log_warning(
-                (*imap).context,
+                context,
                 0i32,
                 b"Cannot get folder list.\x00" as *const u8 as *const libc::c_char,
             );
         } else if (*imap_list).count <= 0i32 {
             dc_log_warning(
-                (*imap).context,
+                context,
                 0i32,
                 b"Folder list is empty.\x00" as *const u8 as *const libc::c_char,
             );
@@ -2097,31 +2112,32 @@ pub unsafe fn dc_connect_to_configured_imap(
     let mut param: *mut dc_loginparam_t = dc_loginparam_new();
     if context.is_null() || (*context).magic != 0x11a11807i32 as libc::c_uint || imap.is_null() {
         dc_log_warning(
-            (*imap).context,
+            context,
             0i32,
             b"Cannot connect to IMAP: Bad parameters.\x00" as *const u8 as *const libc::c_char,
         );
     } else if 0 != dc_imap_is_connected(imap) {
         ret_connected = 1i32
     } else if dc_sqlite3_get_config_int(
-        (*(*imap).context).sql,
+        context,
+        (*context).sql,
         b"configured\x00" as *const u8 as *const libc::c_char,
         0i32,
     ) == 0i32
     {
         dc_log_warning(
-            (*imap).context,
+            context,
             0i32,
             b"Not configured, cannot connect.\x00" as *const u8 as *const libc::c_char,
         );
     } else {
         dc_loginparam_read(
             param,
-            (*(*imap).context).sql,
+            (*context).sql,
             b"configured_\x00" as *const u8 as *const libc::c_char,
         );
         /*the trailing underscore is correct*/
-        if !(0 == dc_imap_connect(imap, param)) {
+        if !(0 == dc_imap_connect(context, imap, param)) {
             ret_connected = 2i32
         }
     }

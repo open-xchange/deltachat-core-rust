@@ -15,12 +15,6 @@ use crate::x::*;
 /* misc. */
 pub unsafe fn dc_pgp_init() {}
 pub unsafe fn dc_pgp_exit() {}
-pub unsafe fn dc_pgp_rand_seed(
-    _context: *mut dc_context_t,
-    _buf: *const libc::c_void,
-    _bytes: size_t,
-) {
-}
 
 pub unsafe fn dc_split_armored_data(
     mut buf: *mut libc::c_char,

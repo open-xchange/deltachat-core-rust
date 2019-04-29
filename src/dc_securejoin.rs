@@ -202,11 +202,11 @@ pub unsafe fn dc_join_securejoin(
             } else if !(0 != (*context).shall_stop_ongoing) {
                 join_vg = ((*qr_scan).state == 202i32) as libc::c_int;
                 (*context).bobs_status = 0i32;
-                pthread_mutex_lock(&mut (*context).bobs_qr_critical);
+                // pthread_mutex_lock(&mut (*context).bobs_qr_critical);
                 qr_locked = 1i32;
                 (*context).bobs_qr_scan = qr_scan;
                 if 0 != qr_locked {
-                    pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
+                    // pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
                     qr_locked = 0i32
                 }
                 if 0 != fingerprint_equals_sender(context, (*qr_scan).fingerprint, contact_chat_id)
@@ -276,11 +276,11 @@ pub unsafe fn dc_join_securejoin(
             ret_chat_id = contact_chat_id as libc::c_int
         }
     }
-    pthread_mutex_lock(&mut (*context).bobs_qr_critical);
+    // pthread_mutex_lock(&mut (*context).bobs_qr_critical);
     qr_locked = 1i32;
     (*context).bobs_qr_scan = 0 as *mut dc_lot_t;
     if 0 != qr_locked {
-        pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
+        // pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
         qr_locked = 0i32
     }
     dc_lot_unref(qr_scan);
@@ -297,7 +297,7 @@ unsafe fn send_handshake_msg(
     mut fingerprint: *const libc::c_char,
     mut grpid: *const libc::c_char,
 ) {
-    let mut msg: *mut dc_msg_t = dc_msg_new_untyped(context);
+    let mut msg: *mut dc_msg_t = dc_msg_new_untyped();
     (*msg).type_0 = 10i32;
     (*msg).text = dc_mprintf(
         b"Secure-Join: %s\x00" as *const u8 as *const libc::c_char,
@@ -344,16 +344,12 @@ unsafe fn fingerprint_equals_sender(
 ) -> libc::c_int {
     let mut fingerprint_equal: libc::c_int = 0i32;
     let mut contacts: *mut dc_array_t = dc_get_chat_contacts(context, contact_chat_id);
-    let mut contact: *mut dc_contact_t = dc_contact_new(context);
-    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new(context);
+    let mut contact: *mut dc_contact_t = dc_contact_new();
+    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new();
     let mut fingerprint_normalized: *mut libc::c_char = 0 as *mut libc::c_char;
     if !(dc_array_get_cnt(contacts) != 1) {
         if !(0
-            == dc_contact_load_from_db(
-                contact,
-                (*context).sql,
-                dc_array_get_id(contacts, 0i32 as size_t),
-            )
+            == dc_contact_load_from_db(context, contact, dc_array_get_id(contacts, 0i32 as size_t))
             || 0 == dc_apeerstate_load_by_addr(peerstate, (*context).sql, (*contact).addr))
         {
             fingerprint_normalized = dc_normalize_fingerprint(fingerprint);
@@ -478,7 +474,7 @@ pub unsafe fn dc_handle_securejoin_handshake(
                     b"vc-auth-required\x00" as *const u8 as *const libc::c_char,
                 ) == 0i32
             {
-                pthread_mutex_lock(&mut (*context).bobs_qr_critical);
+                // pthread_mutex_lock(&mut (*context).bobs_qr_critical);
                 qr_locked = 1i32;
                 if (*context).bobs_qr_scan.is_null()
                     || (*context).bob_expects != 2i32
@@ -500,10 +496,11 @@ pub unsafe fn dc_handle_securejoin_handshake(
                         grpid = dc_strdup((*(*context).bobs_qr_scan).text2)
                     }
                     if 0 != qr_locked {
-                        pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
+                        // pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
                         qr_locked = 0i32
                     }
-                    if 0 == encrypted_and_signed(mimeparser, scanned_fingerprint_of_alice) {
+                    if 0 == encrypted_and_signed(context, mimeparser, scanned_fingerprint_of_alice)
+                    {
                         could_not_establish_secure_connection(
                             context,
                             contact_chat_id,
@@ -586,7 +583,7 @@ pub unsafe fn dc_handle_securejoin_handshake(
                         b"Fingerprint not provided.\x00" as *const u8 as *const libc::c_char,
                     );
                     current_block = 4378276786830486580;
-                } else if 0 == encrypted_and_signed(mimeparser, fingerprint) {
+                } else if 0 == encrypted_and_signed(context, mimeparser, fingerprint) {
                     could_not_establish_secure_connection(
                         context,
                         contact_chat_id,
@@ -723,7 +720,7 @@ pub unsafe fn dc_handle_securejoin_handshake(
                     );
                     current_block = 4378276786830486580;
                 } else {
-                    pthread_mutex_lock(&mut (*context).bobs_qr_critical);
+                    // pthread_mutex_lock(&mut (*context).bobs_qr_critical);
                     qr_locked = 1i32;
                     if (*context).bobs_qr_scan.is_null()
                         || 0 != join_vg && (*(*context).bobs_qr_scan).state != 202i32
@@ -742,7 +739,7 @@ pub unsafe fn dc_handle_securejoin_handshake(
                             grpid = dc_strdup((*(*context).bobs_qr_scan).text2)
                         }
                         if 0 != qr_locked {
-                            pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
+                            // pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
                             qr_locked = 0i32
                         }
                         let mut vg_expect_encrypted: libc::c_int = 1i32;
@@ -759,7 +756,11 @@ pub unsafe fn dc_handle_securejoin_handshake(
                             }
                         }
                         if 0 != vg_expect_encrypted {
-                            if 0 == encrypted_and_signed(mimeparser, scanned_fingerprint_of_alice) {
+                            if 0 == encrypted_and_signed(
+                                context,
+                                mimeparser,
+                                scanned_fingerprint_of_alice,
+                            ) {
                                 could_not_establish_secure_connection(
                                     context,
                                     contact_chat_id,
@@ -849,7 +850,7 @@ pub unsafe fn dc_handle_securejoin_handshake(
                 ====  Step 8 in "Out-of-band verified groups" protocol  ====
                 ============================================================ */
                 contact = dc_get_contact(context, contact_id);
-                if contact.is_null() || 0 == dc_contact_is_verified(contact) {
+                if contact.is_null() || 0 == dc_contact_is_verified(context, contact) {
                     dc_log_warning(
                         context,
                         0i32,
@@ -886,7 +887,7 @@ pub unsafe fn dc_handle_securejoin_handshake(
         }
     }
     if 0 != qr_locked {
-        pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
+        // pthread_mutex_unlock(&mut (*context).bobs_qr_critical);
         qr_locked = 0i32
     }
     dc_contact_unref(contact);
@@ -975,12 +976,12 @@ unsafe fn mark_peer_as_verified(
     mut fingerprint: *const libc::c_char,
 ) -> libc::c_int {
     let mut success: libc::c_int = 0i32;
-    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new(context);
+    let mut peerstate: *mut dc_apeerstate_t = dc_apeerstate_new();
     if !(0 == dc_apeerstate_load_by_fingerprint(peerstate, (*context).sql, fingerprint)) {
         if !(0 == dc_apeerstate_set_verified(peerstate, 1i32, fingerprint, 2i32)) {
             (*peerstate).prefer_encrypt = 1i32;
             (*peerstate).to_save |= 0x2i32;
-            dc_apeerstate_save_to_db(peerstate, (*context).sql, 0i32);
+            dc_apeerstate_save_to_db(context, peerstate, 0i32);
             success = 1i32
         }
     }
@@ -991,12 +992,13 @@ unsafe fn mark_peer_as_verified(
  * Tools: Misc.
  ******************************************************************************/
 unsafe fn encrypted_and_signed(
-    mut mimeparser: *mut dc_mimeparser_t,
-    mut expected_fingerprint: *const libc::c_char,
+    context: *mut dc_context_t,
+    mimeparser: *mut dc_mimeparser_t,
+    expected_fingerprint: *const libc::c_char,
 ) -> libc::c_int {
     if 0 == (*(*mimeparser).e2ee_helper).encrypted {
         dc_log_warning(
-            (*mimeparser).context,
+            context,
             0i32,
             b"Message not encrypted.\x00" as *const u8 as *const libc::c_char,
         );
@@ -1004,7 +1006,7 @@ unsafe fn encrypted_and_signed(
     }
     if (*(*(*mimeparser).e2ee_helper).signatures).count <= 0i32 {
         dc_log_warning(
-            (*mimeparser).context,
+            context,
             0i32,
             b"Message not signed.\x00" as *const u8 as *const libc::c_char,
         );
@@ -1012,7 +1014,7 @@ unsafe fn encrypted_and_signed(
     }
     if expected_fingerprint.is_null() {
         dc_log_warning(
-            (*mimeparser).context,
+            context,
             0i32,
             b"Fingerprint for comparison missing.\x00" as *const u8 as *const libc::c_char,
         );
@@ -1026,7 +1028,7 @@ unsafe fn encrypted_and_signed(
     .is_null()
     {
         dc_log_warning(
-            (*mimeparser).context,
+            context,
             0i32,
             b"Message does not match expected fingerprint %s.\x00" as *const u8
                 as *const libc::c_char,

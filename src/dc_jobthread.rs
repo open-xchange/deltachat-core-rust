@@ -17,40 +17,40 @@ pub struct dc_jobthread_t {
     pub name: *mut libc::c_char,
     pub folder_config_name: *mut libc::c_char,
     pub imap: *mut dc_imap_t,
-    pub mutex: pthread_mutex_t,
-    pub idle_cond: pthread_cond_t,
-    pub idle_condflag: libc::c_int,
+    // pub mutex: pthread_mutex_t,
+    // pub idle_cond: pthread_cond_t,
+    // pub idle_condflag: libc::c_int,
     pub jobs_needed: libc::c_int,
     pub suspended: libc::c_int,
     pub using_handle: libc::c_int,
 }
 
 pub unsafe fn dc_jobthread_init(
-    mut jobthread: *mut dc_jobthread_t,
-    mut context: *mut dc_context_t,
-    mut name: *const libc::c_char,
-    mut folder_config_name: *const libc::c_char,
-) {
-    if jobthread.is_null() || context.is_null() || name.is_null() {
-        return;
+    context: *mut dc_context_t,
+    name: *const libc::c_char,
+    folder_config_name: *const libc::c_char,
+) -> dc_jobthread_t {
+    assert!(!name.is_null());
+    dc_jobthread_t {
+        context,
+        name: dc_strdup(name),
+        folder_config_name: dc_strdup(folder_config_name),
+        imap: 0 as *mut dc_imap_t,
+        //pthread_mutex_init(&mut (*jobthread).mutex, 0 as *const pthread_mutexattr_t),
+        // pthread_cond_init(&mut (*jobthread).idle_cond, 0 as *const pthread_condattr_t),
+        // idle_condflag: 0i32,
+        jobs_needed: 0i32,
+        suspended: 0i32,
+        using_handle: 0i32,
     }
-    (*jobthread).context = context;
-    (*jobthread).name = dc_strdup(name);
-    (*jobthread).folder_config_name = dc_strdup(folder_config_name);
-    (*jobthread).imap = 0 as *mut dc_imap_t;
-    pthread_mutex_init(&mut (*jobthread).mutex, 0 as *const pthread_mutexattr_t);
-    pthread_cond_init(&mut (*jobthread).idle_cond, 0 as *const pthread_condattr_t);
-    (*jobthread).idle_condflag = 0i32;
-    (*jobthread).jobs_needed = 0i32;
-    (*jobthread).suspended = 0i32;
-    (*jobthread).using_handle = 0i32;
 }
+
 pub unsafe fn dc_jobthread_exit(mut jobthread: *mut dc_jobthread_t) {
     if jobthread.is_null() {
         return;
     }
-    pthread_cond_destroy(&mut (*jobthread).idle_cond);
-    pthread_mutex_destroy(&mut (*jobthread).mutex);
+    // pthread_cond_destroy(&mut (*jobthread).idle_cond);
+    // pthread_mutex_destroy(&mut (*jobthread).mutex);
     free((*jobthread).name as *mut libc::c_void);
     (*jobthread).name = 0 as *mut libc::c_char;
     free((*jobthread).folder_config_name as *mut libc::c_void);
@@ -67,17 +67,17 @@ pub unsafe fn dc_jobthread_suspend(mut jobthread: *mut dc_jobthread_t, mut suspe
             b"Suspending %s-thread.\x00" as *const u8 as *const libc::c_char,
             (*jobthread).name,
         );
-        pthread_mutex_lock(&mut (*jobthread).mutex);
+        // pthread_mutex_lock(&mut (*jobthread).mutex);
         (*jobthread).suspended = 1i32;
-        pthread_mutex_unlock(&mut (*jobthread).mutex);
+        // pthread_mutex_unlock(&mut (*jobthread).mutex);
         dc_jobthread_interrupt_idle(jobthread);
         loop {
-            pthread_mutex_lock(&mut (*jobthread).mutex);
+            // pthread_mutex_lock(&mut (*jobthread).mutex);
             if (*jobthread).using_handle == 0i32 {
-                pthread_mutex_unlock(&mut (*jobthread).mutex);
+                // pthread_mutex_unlock(&mut (*jobthread).mutex);
                 return;
             }
-            pthread_mutex_unlock(&mut (*jobthread).mutex);
+            // pthread_mutex_unlock(&mut (*jobthread).mutex);
             usleep((300i32 * 1000i32) as useconds_t);
         }
     } else {
@@ -87,20 +87,20 @@ pub unsafe fn dc_jobthread_suspend(mut jobthread: *mut dc_jobthread_t, mut suspe
             b"Unsuspending %s-thread.\x00" as *const u8 as *const libc::c_char,
             (*jobthread).name,
         );
-        pthread_mutex_lock(&mut (*jobthread).mutex);
+        // pthread_mutex_lock(&mut (*jobthread).mutex);
         (*jobthread).suspended = 0i32;
-        (*jobthread).idle_condflag = 1i32;
-        pthread_cond_signal(&mut (*jobthread).idle_cond);
-        pthread_mutex_unlock(&mut (*jobthread).mutex);
+        // (*jobthread).idle_condflag = 1i32;
+        // pthread_cond_signal(&mut (*jobthread).idle_cond);
+        // pthread_mutex_unlock(&mut (*jobthread).mutex);
     };
 }
 pub unsafe extern "C" fn dc_jobthread_interrupt_idle(mut jobthread: *mut dc_jobthread_t) {
     if jobthread.is_null() {
         return;
     }
-    pthread_mutex_lock(&mut (*jobthread).mutex);
+    // pthread_mutex_lock(&mut (*jobthread).mutex);
     (*jobthread).jobs_needed = 1i32;
-    pthread_mutex_unlock(&mut (*jobthread).mutex);
+    // pthread_mutex_unlock(&mut (*jobthread).mutex);
     dc_log_info(
         (*jobthread).context,
         0i32,
@@ -110,33 +110,37 @@ pub unsafe extern "C" fn dc_jobthread_interrupt_idle(mut jobthread: *mut dc_jobt
     if !(*jobthread).imap.is_null() {
         dc_imap_interrupt_idle((*jobthread).imap);
     }
-    pthread_mutex_lock(&mut (*jobthread).mutex);
-    (*jobthread).idle_condflag = 1i32;
-    pthread_cond_signal(&mut (*jobthread).idle_cond);
-    pthread_mutex_unlock(&mut (*jobthread).mutex);
+    // pthread_mutex_lock(&mut (*jobthread).mutex);
+    //(*jobthread).idle_condflag = 1i32;
+    // pthread_cond_signal(&mut (*jobthread).idle_cond);
+    // pthread_mutex_unlock(&mut (*jobthread).mutex);
 }
-pub unsafe fn dc_jobthread_fetch(mut jobthread: *mut dc_jobthread_t, mut use_network: libc::c_int) {
+pub unsafe fn dc_jobthread_fetch(
+    context: *mut dc_context_t,
+    jobthread: *mut dc_jobthread_t,
+    use_network: libc::c_int,
+) {
     let mut start: libc::clock_t = 0;
     if jobthread.is_null() {
         return;
     }
-    pthread_mutex_lock(&mut (*jobthread).mutex);
+    // pthread_mutex_lock(&mut (*jobthread).mutex);
     if 0 != (*jobthread).suspended {
-        pthread_mutex_unlock(&mut (*jobthread).mutex);
+        // pthread_mutex_unlock(&mut (*jobthread).mutex);
         return;
     }
     (*jobthread).using_handle = 1i32;
-    pthread_mutex_unlock(&mut (*jobthread).mutex);
+    // pthread_mutex_unlock(&mut (*jobthread).mutex);
     if !(0 == use_network || (*jobthread).imap.is_null()) {
         start = clock();
-        if !(0 == connect_to_imap(jobthread)) {
+        if !(0 == connect_to_imap(context, jobthread)) {
             dc_log_info(
                 (*jobthread).context,
                 0i32,
                 b"%s-fetch started...\x00" as *const u8 as *const libc::c_char,
                 (*jobthread).name,
             );
-            dc_imap_fetch((*jobthread).imap);
+            dc_imap_fetch(context, (*jobthread).imap);
             if 0 != (*(*jobthread).imap).should_reconnect {
                 dc_log_info(
                     (*jobthread).context,
@@ -144,7 +148,7 @@ pub unsafe fn dc_jobthread_fetch(mut jobthread: *mut dc_jobthread_t, mut use_net
                     b"%s-fetch aborted, starting over...\x00" as *const u8 as *const libc::c_char,
                     (*jobthread).name,
                 );
-                dc_imap_fetch((*jobthread).imap);
+                dc_imap_fetch(context, (*jobthread).imap);
             }
             dc_log_info(
                 (*jobthread).context,
@@ -156,14 +160,17 @@ pub unsafe fn dc_jobthread_fetch(mut jobthread: *mut dc_jobthread_t, mut use_net
             );
         }
     }
-    pthread_mutex_lock(&mut (*jobthread).mutex);
+    // pthread_mutex_lock(&mut (*jobthread).mutex);
     (*jobthread).using_handle = 0i32;
-    pthread_mutex_unlock(&mut (*jobthread).mutex);
+    // pthread_mutex_unlock(&mut (*jobthread).mutex);
 }
 /* ******************************************************************************
  * the typical fetch, idle, interrupt-idle
  ******************************************************************************/
-unsafe fn connect_to_imap(mut jobthread: *mut dc_jobthread_t) -> libc::c_int {
+unsafe fn connect_to_imap(
+    context: *mut dc_context_t,
+    jobthread: *mut dc_jobthread_t,
+) -> libc::c_int {
     let mut ret_connected: libc::c_int = 0i32;
     let mut mvbox_name: *mut libc::c_char = 0 as *mut libc::c_char;
     if 0 != dc_imap_is_connected((*jobthread).imap) {
@@ -185,7 +192,7 @@ unsafe fn connect_to_imap(mut jobthread: *mut dc_jobthread_t) -> libc::c_int {
                 0 as *const libc::c_char,
             );
             if mvbox_name.is_null() {
-                dc_imap_disconnect((*jobthread).imap);
+                dc_imap_disconnect(context, (*jobthread).imap);
                 ret_connected = 0i32
             } else {
                 dc_imap_set_watch_folder((*jobthread).imap, mvbox_name);
@@ -195,11 +202,15 @@ unsafe fn connect_to_imap(mut jobthread: *mut dc_jobthread_t) -> libc::c_int {
     free(mvbox_name as *mut libc::c_void);
     return ret_connected;
 }
-pub unsafe fn dc_jobthread_idle(mut jobthread: *mut dc_jobthread_t, mut use_network: libc::c_int) {
+pub unsafe fn dc_jobthread_idle(
+    context: *mut dc_context_t,
+    jobthread: *mut dc_jobthread_t,
+    use_network: libc::c_int,
+) {
     if jobthread.is_null() {
         return;
     }
-    pthread_mutex_lock(&mut (*jobthread).mutex);
+    // pthread_mutex_lock(&mut (*jobthread).mutex);
     if 0 != (*jobthread).jobs_needed {
         dc_log_info(
             (*jobthread).context,
@@ -209,44 +220,44 @@ pub unsafe fn dc_jobthread_idle(mut jobthread: *mut dc_jobthread_t, mut use_netw
             (*jobthread).name,
         );
         (*jobthread).jobs_needed = 0i32;
-        pthread_mutex_unlock(&mut (*jobthread).mutex);
+        // pthread_mutex_unlock(&mut (*jobthread).mutex);
         return;
     }
     if 0 != (*jobthread).suspended {
-        while (*jobthread).idle_condflag == 0i32 {
-            pthread_cond_wait(&mut (*jobthread).idle_cond, &mut (*jobthread).mutex);
-        }
-        (*jobthread).idle_condflag = 0i32;
-        pthread_mutex_unlock(&mut (*jobthread).mutex);
+        // while (*jobthread).idle_condflag == 0i32 {
+        // pthread_cond_wait(&mut (*jobthread).idle_cond, &mut (*jobthread).mutex);
+        // }
+        // (*jobthread).idle_condflag = 0i32;
+        // pthread_mutex_unlock(&mut (*jobthread).mutex);
         return;
     }
     (*jobthread).using_handle = 1i32;
-    pthread_mutex_unlock(&mut (*jobthread).mutex);
-    if 0 == use_network || (*jobthread).imap.is_null() {
-        pthread_mutex_lock(&mut (*jobthread).mutex);
-        (*jobthread).using_handle = 0i32;
-        while (*jobthread).idle_condflag == 0i32 {
-            pthread_cond_wait(&mut (*jobthread).idle_cond, &mut (*jobthread).mutex);
-        }
-        (*jobthread).idle_condflag = 0i32;
-        pthread_mutex_unlock(&mut (*jobthread).mutex);
-        return;
-    }
-    connect_to_imap(jobthread);
+    // pthread_mutex_unlock(&mut (*jobthread).mutex);
+    // if 0 == use_network || (*jobthread).imap.is_null() {
+    //     pthread_mutex_lock(&mut (*jobthread).mutex);
+    //     (*jobthread).using_handle = 0i32;
+    //     while (*jobthread).idle_condflag == 0i32 {
+    //         pthread_cond_wait(&mut (*jobthread).idle_cond, &mut (*jobthread).mutex);
+    //     }
+    //     (*jobthread).idle_condflag = 0i32;
+    //     pthread_mutex_unlock(&mut (*jobthread).mutex);
+    //     return;
+    // }
+    connect_to_imap(context, jobthread);
     dc_log_info(
         (*jobthread).context,
         0i32,
         b"%s-IDLE started...\x00" as *const u8 as *const libc::c_char,
         (*jobthread).name,
     );
-    dc_imap_idle((*jobthread).imap);
+    dc_imap_idle(context, (*jobthread).imap);
     dc_log_info(
         (*jobthread).context,
         0i32,
         b"%s-IDLE ended.\x00" as *const u8 as *const libc::c_char,
         (*jobthread).name,
     );
-    pthread_mutex_lock(&mut (*jobthread).mutex);
+    //pthread_mutex_lock(&mut (*jobthread).mutex);
     (*jobthread).using_handle = 0i32;
-    pthread_mutex_unlock(&mut (*jobthread).mutex);
+    // pthread_mutex_unlock(&mut (*jobthread).mutex);
 }
