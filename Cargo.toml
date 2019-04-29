@@ -21,6 +21,7 @@ libsqlite3-sys = { version = "0.14.0", features = ["bundled"] }
 reqwest = "0.9.15"
 num-derive = "0.2.5"
 num-traits = "0.2.6"
+base64 = "0.10.1"
 
 [dev-dependencies]
 tempfile = "3.0.7"

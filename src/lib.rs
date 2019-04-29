@@ -22,7 +22,10 @@ extern crate failure;
 #[macro_use]
 extern crate num_derive;
 
+mod imap;
+mod mime;
 mod pgp;
+mod smtp;
 
 pub mod dc_aheader;
 pub mod dc_apeerstate;
