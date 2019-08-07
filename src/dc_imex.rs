@@ -514,7 +514,7 @@ pub unsafe fn dc_normalize_setup_code(
 
 #[allow(non_snake_case)]
 pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) {
-    let mut ok_to_continue1 = true;
+    let mut key_exists = true;
     let mut success: libc::c_int = 0;
     let mut ongoing_allocated_here: libc::c_int = 0;
     let what: libc::c_int;
@@ -541,12 +541,12 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                             0,
                             "Import/export: Cannot create private key or private key not available.",
                         );
-                        ok_to_continue1 = false;
+                        key_exists = false;
                     } else {
                         dc_create_folder(context, param1.as_ptr());
                     }
                 }
-                if ok_to_continue1 {
+                if key_exists {
                     match what {
                         1 => {
                             if 0 == export_self_keys(context, param1.as_ptr()) {
