@@ -786,7 +786,7 @@ pub unsafe fn dc_msg_get_summary<'a>(
     msg: *mut dc_msg_t<'a>,
     mut chat: *const Chat<'a>,
 ) -> *mut dc_lot_t {
-    let mut ok_to_continue = true;
+    let mut chat_exists = true;
     let ret: *mut dc_lot_t = dc_lot_new();
     let mut chat_to_delete: *mut Chat = 0 as *mut Chat;
 
@@ -794,12 +794,12 @@ pub unsafe fn dc_msg_get_summary<'a>(
         if chat.is_null() {
             chat_to_delete = dc_get_chat((*msg).context, (*msg).chat_id);
             if chat_to_delete.is_null() {
-                ok_to_continue = false;
+                chat_exists = false;
             } else {
                 chat = chat_to_delete;
             }
         }
-        if ok_to_continue {
+        if chat_exists {
             let contact = if (*msg).from_id != DC_CONTACT_ID_SELF as libc::c_uint
                 && ((*chat).type_0 == 120 || (*chat).type_0 == 130)
             {
