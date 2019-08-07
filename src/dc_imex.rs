@@ -514,7 +514,6 @@ pub unsafe fn dc_normalize_setup_code(
 
 #[allow(non_snake_case)]
 pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) {
-    let mut current_block: u64;
     let mut ok_to_continue1 = true;
     let mut success: libc::c_int = 0;
     let mut ongoing_allocated_here: libc::c_int = 0;
@@ -551,59 +550,31 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                     match what {
                         1 => {
                                     if 0 == export_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
                                     } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                            match current_block {
-                                3568988166330621280 => {}
-                                _ => {
                                     info!(context, 0, "Import/export completed.",);
                                     success = 1
-                                }
-                            }
+                                    }
                         }
                         2 => {
                                     if 0 == import_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
                                     } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                            match current_block {
-                                3568988166330621280 => {}
-                                _ => {
                                     info!(context, 0, "Import/export completed.",);
                                     success = 1
-                                }
-                            }
+                                    }
                         }
                         11 => {
                                     if 0 == export_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
                                     } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                            match current_block {
-                                3568988166330621280 => {}
-                                _ => {
                                     info!(context, 0, "Import/export completed.",);
                                     success = 1
-                                }
-                            }
+                                    }
                         }
                         12 => {
                                     if 0 == import_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
                                     } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                            match current_block {
-                                3568988166330621280 => {}
-                                _ => {
                                     info!(context, 0, "Import/export completed.",);
                                     success = 1
-                                }
-                            }
+                                    }
                         }
                         _ => {}
                     }
