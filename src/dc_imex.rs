@@ -550,37 +550,11 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                 if ok_to_continue1 {
                     match what {
                         1 => {
-                            current_block = 10991094515395304355;
-                            match current_block {
-                                2973387206439775448 => {
-                                    if 0 == import_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                11250025114629486028 => {
-                                    if 0 == import_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                12669919903773909120 => {
-                                    if 0 == export_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                _ => {
                                     if 0 == export_self_keys(context, param1.as_ptr()) {
                                         current_block = 3568988166330621280;
                                     } else {
                                         current_block = 1118134448028020070;
                                     }
-                                }
-                            }
                             match current_block {
                                 3568988166330621280 => {}
                                 _ => {
@@ -590,37 +564,11 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                             }
                         }
                         2 => {
-                            current_block = 11250025114629486028;
-                            match current_block {
-                                2973387206439775448 => {
-                                    if 0 == import_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                11250025114629486028 => {
                                     if 0 == import_self_keys(context, param1.as_ptr()) {
                                         current_block = 3568988166330621280;
                                     } else {
                                         current_block = 1118134448028020070;
                                     }
-                                }
-                                12669919903773909120 => {
-                                    if 0 == export_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                _ => {
-                                    if 0 == export_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                            }
                             match current_block {
                                 3568988166330621280 => {}
                                 _ => {
@@ -630,37 +578,11 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                             }
                         }
                         11 => {
-                            current_block = 12669919903773909120;
-                            match current_block {
-                                2973387206439775448 => {
-                                    if 0 == import_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                11250025114629486028 => {
-                                    if 0 == import_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                12669919903773909120 => {
                                     if 0 == export_backup(context, param1.as_ptr()) {
                                         current_block = 3568988166330621280;
                                     } else {
                                         current_block = 1118134448028020070;
                                     }
-                                }
-                                _ => {
-                                    if 0 == export_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                            }
                             match current_block {
                                 3568988166330621280 => {}
                                 _ => {
@@ -670,37 +592,11 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                             }
                         }
                         12 => {
-                            current_block = 2973387206439775448;
-                            match current_block {
-                                2973387206439775448 => {
                                     if 0 == import_backup(context, param1.as_ptr()) {
                                         current_block = 3568988166330621280;
                                     } else {
                                         current_block = 1118134448028020070;
                                     }
-                                }
-                                11250025114629486028 => {
-                                    if 0 == import_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                12669919903773909120 => {
-                                    if 0 == export_backup(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                                _ => {
-                                    if 0 == export_self_keys(context, param1.as_ptr()) {
-                                        current_block = 3568988166330621280;
-                                    } else {
-                                        current_block = 1118134448028020070;
-                                    }
-                                }
-                            }
                             match current_block {
                                 3568988166330621280 => {}
                                 _ => {
