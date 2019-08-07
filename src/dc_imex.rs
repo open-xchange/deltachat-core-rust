@@ -515,6 +515,7 @@ pub unsafe fn dc_normalize_setup_code(
 #[allow(non_snake_case)]
 pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) {
     let mut current_block: u64;
+    let mut ok_to_continue1 = true;
     let mut success: libc::c_int = 0;
     let mut ongoing_allocated_here: libc::c_int = 0;
     let what: libc::c_int;
@@ -541,17 +542,13 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                             0,
                             "Import/export: Cannot create private key or private key not available.",
                         );
-                        current_block = 3568988166330621280;
+                        ok_to_continue1 = false;
                     } else {
                         dc_create_folder(context, param1.as_ptr());
-                        current_block = 4495394744059808450;
                     }
-                } else {
-                    current_block = 4495394744059808450;
                 }
-                match current_block {
-                    3568988166330621280 => {}
-                    _ => match what {
+                if ok_to_continue1 {
+                    match what {
                         1 => {
                             current_block = 10991094515395304355;
                             match current_block {
@@ -713,7 +710,7 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                             }
                         }
                         _ => {}
-                    },
+                    }
                 }
             }
         }
