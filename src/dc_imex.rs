@@ -549,29 +549,25 @@ pub unsafe fn dc_job_do_DC_JOB_IMEX_IMAP(context: &Context, job: *mut dc_job_t) 
                 if key_exists {
                     match what {
                         1 => {
-                            if 0 == export_self_keys(context, param1.as_ptr()) {
-                            } else {
+                            if 0 != export_self_keys(context, param1.as_ptr()) {
                                 info!(context, 0, "Import/export completed.",);
                                 success = 1
                             }
                         }
                         2 => {
-                            if 0 == import_self_keys(context, param1.as_ptr()) {
-                            } else {
+                            if 0 != import_self_keys(context, param1.as_ptr()) {
                                 info!(context, 0, "Import/export completed.",);
                                 success = 1
                             }
                         }
                         11 => {
-                            if 0 == export_backup(context, param1.as_ptr()) {
-                            } else {
+                            if 0 != export_backup(context, param1.as_ptr()) {
                                 info!(context, 0, "Import/export completed.",);
                                 success = 1
                             }
                         }
                         12 => {
-                            if 0 == import_backup(context, param1.as_ptr()) {
-                            } else {
+                            if 0 != import_backup(context, param1.as_ptr()) {
                                 info!(context, 0, "Import/export completed.",);
                                 success = 1
                             }
