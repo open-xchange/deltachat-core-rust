@@ -772,23 +772,22 @@ pub unsafe fn dc_create_outgoing_rfc724_mid (context: &Context, grpid: *const li
     let chatconf: Option<String>;
     let chatm: String;
     let mut at_hostname: *const libc::c_char = strchr(from_addr, '@' as i32);
-    if at_hostname.is_null () {at_hostname = b"@nohost\x00" as *const u8 as *const libc::c_char}
+    if at_hostname.is_null () {
+        at_hostname = b"@nohost\x00" as *const u8 as *const libc::c_char
+    }
     chatconf = Context :: get_config (context, Config :: ChatMode);
     if chatconf.is_none () {chatm = "Follow".to_string ();} else {chatm = chatconf.unwrap().to_string ();}
     if ! grpid.is_null () {
 	if chatm == "on".to_string () {
             ret = dc_mprintf (b"chat$group.%s.%s.%s%s\x00" as *const u8 as *const libc::c_char, grpid, rand1, rand2, at_hostname,);
-	}
-	else {
+	} else {
             ret = dc_mprintf (b"Gr.%s.%s%s\x00" as *const u8 as *const libc::c_char, grpid, rand2, at_hostname,);
 	}
-    }
-    else {
+    } else {
         rand1 = dc_create_id().strdup ();
 	if chatm == "on".to_string () {
             ret = dc_mprintf (b"chat$%s.%s%s\x00" as *const u8 as *const libc::c_char, rand1, rand2, at_hostname,);
-	}
-	else {
+	} else {
             ret = dc_mprintf (b"Mr.%s.%s%s\x00" as *const u8 as *const libc::c_char, rand1, rand2, at_hostname,);
 	}
     }
