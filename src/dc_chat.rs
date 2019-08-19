@@ -505,6 +505,7 @@ unsafe fn prepare_msg_raw(
         } else {
             let from_c = CString::yolo(from.unwrap());
             new_rfc724_mid = dc_create_outgoing_rfc724_mid(
+	        context,
                 if (*chat).type_0 == 120 || (*chat).type_0 == 130 {
                     (*chat).grpid
                 } else {
@@ -2221,6 +2222,7 @@ pub fn dc_add_device_msg(context: &Context, chat_id: uint32_t, text: *const libc
     }
     let rfc724_mid = unsafe {
         dc_create_outgoing_rfc724_mid(
+	    context,
             0 as *const libc::c_char,
             b"@device\x00" as *const u8 as *const libc::c_char,
         )

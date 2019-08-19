@@ -330,6 +330,7 @@ pub unsafe fn dc_mimefactory_load_mdn(
                     load_from(factory);
                     (*factory).timestamp = dc_create_smeared_timestamp((*factory).context);
                     (*factory).rfc724_mid = dc_create_outgoing_rfc724_mid(
+		        (*factory).context,
                         0 as *const libc::c_char,
                         (*factory).from_addr,
                     );

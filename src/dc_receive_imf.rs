@@ -159,12 +159,12 @@ pub unsafe fn dc_receive_imf(
                     );
                 }
             }
-            field = dc_mimeparser_lookup_field(&mime_parser, "Message-ID");
-            if !field.is_null() && (*field).fld_type == MAILIMF_FIELD_MESSAGE_ID as libc::c_int {
+            field = dc_mimeparser_lookup_field (&mime_parser, "Message-ID");
+            if ! field.is_null () && (*field).fld_type == MAILIMF_FIELD_MESSAGE_ID as libc::c_int {
                 let fld_message_id: *mut mailimf_message_id = (*field).fld_data.fld_message_id;
-                if !fld_message_id.is_null() {
-                    rfc724_mid = dc_strdup((*fld_message_id).mid_value)
-                }
+                if ! fld_message_id.is_null () {
+		    rfc724_mid = dc_strdup ((*fld_message_id).mid_value);
+		}
             }
             if rfc724_mid.is_null() {
                 rfc724_mid = dc_create_incoming_rfc724_mid(sent_timestamp, from_id, to_ids);
