@@ -1,5 +1,3 @@
-#![feature(try_blocks)]
-
 use std::ffi::CString;
 use std::net;
 use std::sync::{
@@ -572,7 +570,7 @@ impl Imap {
         }
 
         let teardown = (|| {
-            let caps = self.session.lock().unwrap().capabilities()?;
+            let caps = (*self.session.lock().unwrap()).as_mut()?.capabilities().ok()?;
             if !context.sql.is_open() {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
                 None
@@ -1666,7 +1664,7 @@ impl Imap {
         where S: std::fmt::Debug
     {
         info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
-        ()
+        Ok(())
     }
 
     pub fn is_coi_supported(&self) -> bool {
