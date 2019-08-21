@@ -1,3 +1,5 @@
+#![feature(try_blocks)]
+
 use std::ffi::CString;
 use std::net;
 use std::sync::{
@@ -319,8 +321,22 @@ struct ImapConfig {
     pub selected_folder_needs_expunge: bool,
     pub can_idle: bool,
     pub has_xlist: bool,
+    pub has_coi: bool,
+    pub has_webpush: bool,
     pub imap_delimiter: char,
     pub watch_folder: Option<String>,
+}
+
+pub enum MetadataDepth {
+    Zero,
+    One,
+    Infinity,
+}
+
+#[derive(Debug)]
+pub struct Metadata<'a> {
+    entry: &'a str,
+    value: &'a str,
 }
 
 impl Default for ImapConfig {
@@ -337,6 +353,8 @@ impl Default for ImapConfig {
             selected_folder_needs_expunge: false,
             can_idle: false,
             has_xlist: false,
+            has_coi: false,
+            has_webpush: false,
             imap_delimiter: '.',
             watch_folder: None,
         };
@@ -553,47 +571,40 @@ impl Imap {
             return false;
         }
 
-        let (teardown, can_idle, has_xlist) = match &mut *self.session.lock().unwrap() {
-            Some(ref mut session) => {
-                if let Ok(caps) = session.capabilities() {
-                    if !context.sql.is_open() {
-                        warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user,);
-                        (true, false, false)
-                    } else {
-                        let can_idle = caps.has("IDLE");
-                        let has_xlist = caps.has("XLIST");
-                        let caps_list = caps.iter().fold(String::new(), |mut s, c| {
-                            s += " ";
-                            s += c;
-                            s
-                        });
-                        log_event!(
-                            context,
-                            Event::IMAP_CONNECTED,
-                            0,
-                            "IMAP-LOGIN as {}, capabilities: {}",
-                            lp.mail_user,
-                            caps_list,
-                        );
-                        (false, can_idle, has_xlist)
-                    }
-                } else {
-                    (true, false, false)
-                }
+        let teardown = (|| {
+            let caps = self.session.lock().unwrap().capabilities()?;
+            if !context.sql.is_open() {
+                warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
+                None
+            } else {
+                let caps_list = caps.iter().fold(String::new(), |mut s, c| {
+                    s += " ";
+                    s += c;
+                    s
+                });
+                log_event!(
+                    context,
+                    Event::IMAP_CONNECTED,
+                    0,
+                    "IMAP-LOGIN as {}, capabilities: {}",
+                    lp.mail_user,
+                    caps_list,
+                );
+                let mut config = self.config.write().unwrap();
+                config.can_idle = caps.has("IDLE");
+                config.has_xlist = caps.has("XLIST");
+                config.has_coi = caps.has("COI");
+                config.has_webpush = caps.has("WEBPUSH");
+                *self.connected.lock().unwrap() = true;
+                Some(())
             }
-            None => (true, false, false),
-        };
+        })().is_none();
 
         if teardown {
             self.unsetup_handle(context);
             self.free_connect_params();
-            false
-        } else {
-            self.config.write().unwrap().can_idle = can_idle;
-            self.config.write().unwrap().has_xlist = has_xlist;
-            *self.connected.lock().unwrap() = true;
-            true
         }
+        !teardown
     }
 
     pub fn disconnect(&self, context: &Context) {
@@ -1639,6 +1650,31 @@ impl Imap {
         } else {
             None
         }
+    }
+
+    pub fn get_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, key: &[S],
+                                       depth: MetadataDepth, max_size: Option<usize>)
+        -> crate::error::Result<Vec<Metadata>>
+        where S: std::fmt::Debug
+    {
+        info!(context, 0, "get metadata: \"{:?}\", \"{:?}\"", mbox, key);
+        Ok(vec![])
+    }
+
+    pub fn set_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, keyval: &[Metadata])
+        -> crate::error::Result<()>
+        where S: std::fmt::Debug
+    {
+        info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
+        ()
+    }
+
+    pub fn is_coi_supported(&self) -> bool {
+        self.config.read().unwrap().has_coi
+    }
+
+    pub fn is_webpush_supported(&self) -> bool {
+        self.config.read().unwrap().has_webpush
     }
 }
 

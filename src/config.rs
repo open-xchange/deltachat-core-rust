@@ -57,6 +57,8 @@ pub enum Config {
     ConfiguredSendSecurity,
     ConfiguredE2EEEnabled,
     Configured,
+    VapidKey,
+    PushSubscription,
     // Deprecated
     #[strum(serialize = "sys.version")]
     SysVersion,

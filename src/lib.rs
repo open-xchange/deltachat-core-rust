@@ -25,6 +25,7 @@ pub mod error;
 mod aheader;
 pub mod chat;
 pub mod chatlist;
+pub mod coi;
 pub mod config;
 pub mod configure;
 pub mod constants;
@@ -46,6 +47,7 @@ mod smtp;
 pub mod sql;
 mod stock;
 pub mod types;
+pub mod webpush;
 pub mod x;
 
 pub mod dc_array;
