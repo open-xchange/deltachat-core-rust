@@ -10,6 +10,7 @@ use crate::constants::*;
 use crate::context::Context;
 use crate::dc_loginparam::*;
 use crate::dc_tools::CStringExt;
+use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
 
@@ -24,6 +25,12 @@ const DC_FAILED: usize = 0;
 const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 const FETCH_FLAGS: &str = "(FLAGS)";
+
+enum CoiFilterMode {
+    None,
+    Active,
+    Seen,
+}
 
 pub struct Imap {
     config: Arc<RwLock<ImapConfig>>,
@@ -590,38 +597,44 @@ impl Imap {
         }
 
         let teardown = (|| {
-            let caps = (*self.session.lock().unwrap()).as_mut()?.capabilities().ok()?;
+            let caps = (*self.session.lock().unwrap()).as_mut().ok_or_else(|| format_err!("No session"))?.capabilities()?;
             if !context.sql.is_open() {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
-                None
-            } else {
-                let can_idle = caps.has("IDLE");
-                let has_xlist= caps.has("XLIST");
-                let (coi, webpush) = self.query_metadata(context, caps.has("COI"), caps.has("WEBPUSH"));
-
-                let caps_list = caps.iter().fold(String::new(), |mut s, c| {
-                    s += " ";
-                    s += c;
-                    s
-                });
-                log_event!(
-                    context,
-                    Event::IMAP_CONNECTED,
-                    0,
-                    "IMAP-LOGIN as {}, capabilities: {}",
-                    lp.mail_user,
-                    caps_list,
-                );
-
-                let mut config = self.config.write().unwrap();
-                config.can_idle = can_idle;
-                config.has_xlist = has_xlist;
-                config.coi = coi;
-                config.webpush = webpush;
-                *self.connected.lock().unwrap() = true;
-                Some(())
+                return Err(format_err!("Failed to open database"));
             }
-        })().is_none();
+            let can_idle = caps.has("IDLE");
+            let has_xlist= caps.has("XLIST");
+            let (coi, webpush) = self.query_metadata(context, caps.has("COI"), caps.has("WEBPUSH"));
+
+            let caps_list = caps.iter().cloned().collect::<Vec<&str>>().join(" ");
+            log_event!(
+                context,
+                Event::IMAP_CONNECTED,
+                0,
+                "IMAP-LOGIN as {}, capabilities: {}",
+                lp.mail_user,
+                caps_list,
+            );
+
+            let coi_feature = if has_coi {
+                if self.query_is_coi_enabled(context)? {
+                    CoiFeature::Enabled
+                } else {
+                    CoiFeature::Disabled
+                }
+            } else {
+                CoiFeature::Unsupported
+            };
+
+            let mut config = self.config.write().unwrap();
+            config.can_idle = can_idle;
+            config.has_xlist = has_xlist;
+            config.coi = coi;
+            config.webpush = webpush;
+            *self.connected.lock().unwrap() = true;
+            Ok(())
+
+        })().is_err();
 
         if teardown {
             self.unsetup_handle(context);
@@ -660,7 +673,9 @@ impl Imap {
                             coi.as_mut().unwrap().enabled = meta.value == "yes";
                         }
                     },
-                    "/private/vendor/vendor.dovecot/coi/config/message-filter" => {},
+                    "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
+
+                    },
                     "/private/vendor/vendor.dovecot/webpush/vapid" => {
                         if webpush.is_some() {
                             webpush.as_mut().unwrap().vapid = meta.value.to_string();
@@ -1722,18 +1737,29 @@ impl Imap {
         }
     }
 
-    pub fn get_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, key: &[S],
-                                       depth: MetadataDepth, max_size: Option<usize>)
-        -> crate::error::Result<Vec<Metadata>>
-        where S: std::fmt::Debug
+    pub fn get_metadata<S: AsRef<str>>(
+        &self,
+        context: &Context,
+        mbox: S,
+        key: &[S],
+        depth: MetadataDepth,
+        max_size: Option<usize>,
+    ) -> crate::error::Result<Vec<Metadata>>
+    where
+        S: std::fmt::Debug,
     {
         info!(context, 0, "get metadata: \"{:?}\", \"{:?}\"", mbox, key);
         Ok(vec![])
     }
 
-    pub fn set_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, keyval: &[Metadata])
-        -> crate::error::Result<()>
-        where S: std::fmt::Debug
+    pub fn set_metadata<S>(
+        &self,
+        context: &Context,
+        mbox: S,
+        keyval: &[Metadata],
+    ) -> crate::error::Result<()>
+    where
+        S: AsRef<str> + std::fmt::Debug,
     {
         info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
         Ok(())
@@ -1741,6 +1767,37 @@ impl Imap {
 
     pub fn get_coi_config(&self) -> Option<CoiConfig> {
         self.config.read().unwrap().coi.clone()
+    }
+
+    fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
+        self.set_metadata(
+            context,
+            "",
+            &[Metadata {
+                entry: "/private/vendor/vendor.dovecot/config/coi/enabled",
+                value: "yes",
+            }],
+        )
+    }
+
+    fn set_coi_filter_mode(
+        &self,
+        context: &Context,
+        mode: CoiFilterMode,
+    ) -> crate::error::Result<()> {
+        let filter_mode = match mode {
+            CoiFilterMode::None => "none",
+            CoiFilterMode::Active => "active",
+            CoiFilterMode::Seen => "seen",
+        };
+        self.set_metadata(
+            context,
+            "",
+            &[Metadata {
+                entry: "/private/vendor/vendor.dovecot/coi/config/message-filter",
+                value: filter_mode,
+            }],
+        )
     }
 
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
