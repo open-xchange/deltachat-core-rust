@@ -20,6 +20,15 @@ pub enum FilterMode {
     CoiMoveAfterRead,
 }
 
+impl FilterMode {
+    pub fn requires_coi(&self) -> bool {
+        match self {
+            Self::CoiActive | Self::CoiMoveAfterRead => true,
+            _ => false,
+        }
+    }
+}
+
 impl Default for FilterMode {
     fn default() -> Self {
         Self::Deltachat
