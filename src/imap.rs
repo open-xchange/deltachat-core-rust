@@ -10,6 +10,7 @@ use crate::constants::*;
 use crate::context::Context;
 use crate::dc_loginparam::*;
 use crate::dc_tools::CStringExt;
+use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
 
@@ -24,6 +25,12 @@ const DC_FAILED: usize = 0;
 const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 const FETCH_FLAGS: &str = "(FLAGS)";
+
+enum CoiFilterMode {
+    None,
+    Active,
+    Seen,
+}
 
 pub struct Imap {
     config: Arc<RwLock<ImapConfig>>,
@@ -570,33 +577,50 @@ impl Imap {
         }
 
         let teardown = (|| {
-            let caps = (*self.session.lock().unwrap()).as_mut()?.capabilities().ok()?;
+            let caps = (*self.session.lock().unwrap()).as_mut().ok_or_else(|| format_err!("No session"))?.capabilities()?;
             if !context.sql.is_open() {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
-                None
-            } else {
-                let caps_list = caps.iter().fold(String::new(), |mut s, c| {
-                    s += " ";
-                    s += c;
-                    s
-                });
-                log_event!(
-                    context,
-                    Event::IMAP_CONNECTED,
-                    0,
-                    "IMAP-LOGIN as {}, capabilities: {}",
-                    lp.mail_user,
-                    caps_list,
-                );
-                let mut config = self.config.write().unwrap();
-                config.can_idle = caps.has("IDLE");
-                config.has_xlist = caps.has("XLIST");
-                config.has_coi = caps.has("COI");
-                config.has_webpush = caps.has("WEBPUSH");
-                *self.connected.lock().unwrap() = true;
-                Some(())
+                return Err(format_err!("Failed to open database"));
             }
-        })().is_none();
+
+            let caps_list = caps.iter().cloned().collect::<Vec<&str>>().join(" ");
+
+            // We do these validations before triggering the IMAP_CONNECTED event.
+            if caps.has("COI") {
+                let coi_filter_mode = match get_filter_mode(context) {
+                    FilterMode::None | FilterMode::Deltachat => CoiFilterMode::None,
+                    FilterMode::CoiActive => CoiFilterMode::Active,
+                    FilterMode::CoiMoveAfterRead => CoiFilterMode::Seen,
+                };
+                // If COI is supported, we unconditionally enable COI for that server, regardless
+                // of the configured filter mode.
+                self.enable_coi(context)?;
+                self.set_coi_filter_mode(context, coi_filter_mode)?;
+            } else if get_filter_mode(context).requires_coi() {
+                warn!(
+                    context,
+                    0, "IMAP-LOGIN as {} ok, but config requires COI server (capabilities: {}). ABORTING", lp.mail_user, caps_list);
+                return Err(format_err!("Configuration requires COI server"));
+            }
+
+           log_event!(
+                context,
+                Event::IMAP_CONNECTED,
+                0,
+                "IMAP-LOGIN as {}, capabilities: {}",
+                lp.mail_user,
+                caps_list,
+            );
+
+            let mut config = self.config.write().unwrap();
+            config.can_idle = caps.has("IDLE");
+            config.has_xlist = caps.has("XLIST");
+            config.has_coi = caps.has("COI");
+            config.has_webpush = caps.has("WEBPUSH");
+            *self.connected.lock().unwrap() = true;
+
+            Ok(())
+        })().is_err();
 
         if teardown {
             self.unsetup_handle(context);
@@ -1650,21 +1674,63 @@ impl Imap {
         }
     }
 
-    pub fn get_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, key: &[S],
-                                       depth: MetadataDepth, max_size: Option<usize>)
-        -> crate::error::Result<Vec<Metadata>>
-        where S: std::fmt::Debug
+    pub fn get_metadata<S: AsRef<str>>(
+        &self,
+        context: &Context,
+        mbox: S,
+        key: &[S],
+        depth: MetadataDepth,
+        max_size: Option<usize>,
+    ) -> crate::error::Result<Vec<Metadata>>
+    where
+        S: std::fmt::Debug,
     {
         info!(context, 0, "get metadata: \"{:?}\", \"{:?}\"", mbox, key);
         Ok(vec![])
     }
 
-    pub fn set_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, keyval: &[Metadata])
-        -> crate::error::Result<()>
-        where S: std::fmt::Debug
+    pub fn set_metadata<S>(
+        &self,
+        context: &Context,
+        mbox: S,
+        keyval: &[Metadata],
+    ) -> crate::error::Result<()>
+    where
+        S: AsRef<str> + std::fmt::Debug,
     {
         info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
         Ok(())
+    }
+
+    fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
+        self.set_metadata(
+            context,
+            "",
+            &[Metadata {
+                entry: "/private/vendor/vendor.dovecot/config/coi/enabled",
+                value: "yes",
+            }],
+        )
+    }
+
+    fn set_coi_filter_mode(
+        &self,
+        context: &Context,
+        mode: CoiFilterMode,
+    ) -> crate::error::Result<()> {
+        let filter_mode = match mode {
+            CoiFilterMode::None => "none",
+            CoiFilterMode::Active => "active",
+            CoiFilterMode::Seen => "seen",
+        };
+        self.set_metadata(
+            context,
+            "",
+            &[Metadata {
+                entry: "/private/vendor/vendor.dovecot/coi/config/message-filter",
+                value: filter_mode,
+            }],
+        )
     }
 
     pub fn is_coi_supported(&self) -> bool {
