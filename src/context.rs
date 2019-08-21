@@ -21,6 +21,7 @@ use crate::webpush::*;
 use crate::x::*;
 use std::ptr;
 
+use crate::filter_mode::get_filter_mode;
 use std::path::PathBuf;
 
 pub struct Context {
@@ -392,10 +393,7 @@ pub unsafe fn dc_get_info(context: &Context) -> *mut libc::c_char {
         .sql
         .get_config_int(context, "mvbox_watch")
         .unwrap_or_else(|| 1);
-    let mvbox_move = context
-        .sql
-        .get_config_int(context, "mvbox_move")
-        .unwrap_or_else(|| 1);
+    let mvbox_move = get_filter_mode(context);
     let folders_configured = context
         .sql
         .get_config_int(context, "folders_configured")
@@ -464,7 +462,7 @@ pub unsafe fn dc_get_info(context: &Context) -> *mut libc::c_char {
         inbox_watch,
         sentbox_watch,
         mvbox_watch,
-        mvbox_move,
+        mvbox_move.as_ref(),
         folders_configured,
         configured_sentbox_folder,
         configured_mvbox_folder,
