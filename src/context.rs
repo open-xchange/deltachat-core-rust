@@ -16,6 +16,7 @@ use crate::param::Params;
 use crate::smtp::*;
 use crate::sql::Sql;
 use crate::types::*;
+use crate::webpush::*;
 use crate::x::*;
 use std::ptr;
 
@@ -42,6 +43,7 @@ pub struct Context {
     pub running_state: Arc<RwLock<RunningState>>,
     /// Mutex to avoid generating the key for the user more than once.
     pub generating_key_mutex: Mutex<()>,
+    pub webpush_config: Option<WebPushConfig>,
 }
 
 unsafe impl std::marker::Send for Context {}
@@ -165,6 +167,7 @@ pub fn dc_context_new(
         probe_imap_network: Arc::new(RwLock::new(false)),
         perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
         generating_key_mutex: Mutex::new(()),
+        webpush_config: None,
     }
 }
 
