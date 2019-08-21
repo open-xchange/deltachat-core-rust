@@ -65,6 +65,7 @@ mod dc_simplify;
 mod dc_strencode;
 mod dc_token;
 pub mod dc_tools;
+mod filter_mode;
 
 #[cfg(test)]
 mod test_utils;
