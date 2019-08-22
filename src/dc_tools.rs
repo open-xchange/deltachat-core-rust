@@ -759,8 +759,6 @@ pub unsafe fn dc_create_incoming_rfc724_mid(
 }
 
 
-// Juha-Petri Tyrkkö 2019 08 19: Support for prefix mode switch (Config placeholder ChatMode)
-
 pub unsafe fn dc_create_outgoing_rfc724_mid (context: &Context, grpid: *const libc::c_char, from_addr: *const libc::c_char,) -> *mut libc::c_char {
     /* Function generates a Message-ID that can be used for a new outgoing message.
     - this function is called for all outgoing messages.
@@ -775,30 +773,26 @@ pub unsafe fn dc_create_outgoing_rfc724_mid (context: &Context, grpid: *const li
     if at_hostname.is_null () {
         at_hostname = b"@nohost\x00" as *const u8 as *const libc::c_char
     }
-    chatconf = Context :: get_config (context, Config :: ChatMode);
+    chatconf = context.get_config (Config :: ChatMode);
     if chatconf.is_none () {chatm = "Follow".to_string ();} else {chatm = chatconf.unwrap().to_string ();}
     if ! grpid.is_null () {
-	if chatm == "on".to_string () {
+        if chatm == "on".to_string () {
             ret = dc_mprintf (b"chat$group.%s.%s.%s%s\x00" as *const u8 as *const libc::c_char, grpid, rand1, rand2, at_hostname,);
-	} else {
+        } else {
             ret = dc_mprintf (b"Gr.%s.%s%s\x00" as *const u8 as *const libc::c_char, grpid, rand2, at_hostname,);
-	}
+        }
     } else {
         rand1 = dc_create_id().strdup ();
-	if chatm == "on".to_string () {
+        if chatm == "on".to_string () {
             ret = dc_mprintf (b"chat$%s.%s%s\x00" as *const u8 as *const libc::c_char, rand1, rand2, at_hostname,);
-	} else {
+        } else {
             ret = dc_mprintf (b"Mr.%s.%s%s\x00" as *const u8 as *const libc::c_char, rand1, rand2, at_hostname,);
-	}
+        }
     }
     free(rand1 as *mut libc::c_void);
     free(rand2 as *mut libc::c_void);
     ret
 }
-
-// End of Juha-Petri Tyrkkö 2019 08 19
-
-// Juha-Petri Tyrkkö 2019 08 19: Recognition of all group prefixes
 
 /// Extract the group id (grpid) from a message id (mid)
 ///
@@ -821,25 +815,22 @@ pub fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
     if mid.len () < 9 {return None;}
     let gcat;
     let pfxlen;
-    let pfx_old = "Gr.";
-    let pfx_new = "chat$group.";
+    const PFX_OLD: &str = "Gr.";
+    const PFX_NEW: &str = "chat$group.";
     let lenok: bool;
-    if      mid.starts_with (pfx_old) {gcat = GrpidCat :: GrpidOld;  pfxlen = pfx_old.len ();}
-    else if mid.starts_with (pfx_new) {gcat = GrpidCat :: GrpidNew;  pfxlen = pfx_new.len ();}
+    if      mid.starts_with (PFX_OLD) {gcat = GrpidCat :: GrpidOld;  pfxlen = PFX_OLD.len ();}
+    else if mid.starts_with (PFX_NEW) {gcat = GrpidCat :: GrpidNew;  pfxlen = PFX_NEW.len ();}
     else                              {return None;}
-    if let Some (mid_without_offset) = mid.get (pfxlen ..) {
-       if let Some (grpid_len) = mid_without_offset.find ('.') {
-           match gcat {
-	       GrpidCat :: GrpidOld => lenok = grpid_len == 11 || grpid_len == 16,
-               GrpidCat :: GrpidNew => lenok = grpid_len >= 12,
-           }
-           if lenok {return Some (mid_without_offset.get (0 .. grpid_len).unwrap ())}
-       }
-   }
-   None
+    let mid_without_offset = &mid [pfxlen ..];
+    if let Some (grpid_len) = mid_without_offset.find ('.') {
+        match gcat {
+            GrpidCat :: GrpidOld => lenok = grpid_len == 11 || grpid_len == 16,
+            GrpidCat :: GrpidNew => lenok = grpid_len >= 12,
+        }
+        if lenok {return Some (&mid_without_offset [ .. grpid_len])}
+    }
+    None
 }
-
-// End of Juha-Petri Tyrkkö 2019 08 19
 
 pub unsafe fn dc_extract_grpid_from_rfc724_mid_list(list: *const clist) -> *mut libc::c_char {
     if !list.is_null() {
