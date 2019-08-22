@@ -227,6 +227,8 @@ char*           dc_get_info                  (dc_context_t*);
 char*           dc_get_oauth2_url            (dc_context_t*, const char* addr, const char* redirect);
 char*           dc_get_version_str           (void);
 
+int             dc_is_coi_supported          (dc_context_t*);
+int             dc_is_webpush_supported      (dc_context_t*);
 
 // connect
 void            dc_configure                 (dc_context_t*);
