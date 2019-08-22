@@ -442,6 +442,8 @@ char*           dc_get_info                  (dc_context_t* context);
 char*           dc_get_oauth2_url            (dc_context_t* context, const char* addr, const char* redirect_uri);
 
 
+int             dc_is_coi_supported          (dc_context_t*);
+int             dc_is_webpush_supported      (dc_context_t*);
 
 // connect
 
