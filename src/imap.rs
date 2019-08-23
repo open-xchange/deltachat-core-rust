@@ -307,24 +307,6 @@ impl Session {
     }
 }
 
-struct ImapConfig {
-    pub addr: String,
-    pub imap_server: String,
-    pub imap_port: u16,
-    pub imap_user: String,
-    pub imap_pw: String,
-    pub server_flags: usize,
-    pub selected_folder: Option<String>,
-    pub selected_mailbox: Option<imap::types::Mailbox>,
-    pub selected_folder_needs_expunge: bool,
-    pub can_idle: bool,
-    pub has_xlist: bool,
-    pub has_coi: bool,
-    pub has_webpush: bool,
-    pub imap_delimiter: char,
-    pub watch_folder: Option<String>,
-}
-
 pub enum MetadataDepth {
     Zero,
     One,
@@ -337,9 +319,55 @@ pub struct Metadata<'a> {
     value: &'a str,
 }
 
+#[derive(Clone)]
+pub struct CoiConfig {
+    enabled: bool,
+    mailbox_root: String,
+}
+
+impl Default for CoiConfig {
+    fn default() -> Self {
+        CoiConfig {
+            enabled: false,
+            mailbox_root: "COI".into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WebPushConfig {
+    vapid: String,
+}
+
+impl Default for WebPushConfig {
+    fn default() -> Self {
+        WebPushConfig {
+            vapid: "".into(),
+        }
+    }
+}
+
+struct ImapConfig {
+    pub addr: String,
+    pub imap_server: String,
+    pub imap_port: u16,
+    pub imap_user: String,
+    pub imap_pw: String,
+    pub server_flags: usize,
+    pub selected_folder: Option<String>,
+    pub selected_mailbox: Option<imap::types::Mailbox>,
+    pub selected_folder_needs_expunge: bool,
+    pub can_idle: bool,
+    pub has_xlist: bool,
+    pub imap_delimiter: char,
+    pub watch_folder: Option<String>,
+    pub coi: Option<CoiConfig>,
+    pub webpush: Option<WebPushConfig>,
+}
+
 impl Default for ImapConfig {
     fn default() -> Self {
-        let cfg = ImapConfig {
+        ImapConfig {
             addr: "".into(),
             imap_server: "".into(),
             imap_port: 0,
@@ -351,13 +379,11 @@ impl Default for ImapConfig {
             selected_folder_needs_expunge: false,
             can_idle: false,
             has_xlist: false,
-            has_coi: false,
-            has_webpush: false,
             imap_delimiter: '.',
             watch_folder: None,
-        };
-
-        cfg
+            coi: None,
+            webpush: None,
+        }
     }
 }
 
@@ -569,6 +595,10 @@ impl Imap {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
                 None
             } else {
+                let can_idle = caps.has("IDLE");
+                let has_xlist= caps.has("XLIST");
+                let (coi, webpush) = self.query_metadata(context, caps.has("COI"), caps.has("WEBPUSH"));
+
                 let caps_list = caps.iter().fold(String::new(), |mut s, c| {
                     s += " ";
                     s += c;
@@ -582,11 +612,12 @@ impl Imap {
                     lp.mail_user,
                     caps_list,
                 );
+
                 let mut config = self.config.write().unwrap();
-                config.can_idle = caps.has("IDLE");
-                config.has_xlist = caps.has("XLIST");
-                config.has_coi = caps.has("COI");
-                config.has_webpush = caps.has("WEBPUSH");
+                config.can_idle = can_idle;
+                config.has_xlist = has_xlist;
+                config.coi = coi;
+                config.webpush = webpush;
                 *self.connected.lock().unwrap() = true;
                 Some(())
             }
@@ -597,6 +628,53 @@ impl Imap {
             self.free_connect_params();
         }
         !teardown
+    }
+
+    fn query_metadata(&self, context: &Context, has_coi: bool, has_webpush: bool)
+        -> (Option<CoiConfig>, Option<WebPushConfig>)
+    {
+        if !has_coi && !has_webpush { return (None, None); }
+
+        let mut keys = vec![];
+        let mut coi = None;
+        let mut webpush = None;
+        if has_coi {
+            keys.push("/private/vendor/vendor.dovecot/coi/config");
+            coi = Some(CoiConfig::default());
+        }
+        if has_webpush {
+            keys.push("/private/vendor/vendor.dovecot/webpush");
+            webpush = Some(WebPushConfig::default());
+        }
+        let metadata = self.get_metadata(context, "", &keys, MetadataDepth::One, None);
+        if let Ok(metadata) = metadata {
+            for meta in metadata {
+                match meta.entry {
+                    "/private/vendor/vendor.dovecot/coi/config/mailbox-root" => {
+                        if coi.is_some() {
+                            coi.as_mut().unwrap().mailbox_root = meta.value.to_string();
+                        }
+                    },
+                    "/private/vendor/vendor.dovecot/coi/config/enabled" => {
+                        if coi.is_some() {
+                            coi.as_mut().unwrap().enabled = meta.value == "yes";
+                        }
+                    },
+                    "/private/vendor/vendor.dovecot/coi/config/message-filter" => {},
+                    "/private/vendor/vendor.dovecot/webpush/vapid" => {
+                        if webpush.is_some() {
+                            webpush.as_mut().unwrap().vapid = meta.value.to_string();
+                        }
+                    },
+                    _ => {
+                        info!(context, 0, "Unknown metadata: {} = {}", meta.entry, meta.value);
+                    },
+                }
+            }
+        } else if let Err(error) = metadata {
+            warn!(context, 0, "Error while retrieving metadata: {}", error);
+        }
+        (coi, webpush)
     }
 
     pub fn disconnect(&self, context: &Context) {
@@ -1661,12 +1739,12 @@ impl Imap {
         Ok(())
     }
 
-    pub fn is_coi_supported(&self) -> bool {
-        self.config.read().unwrap().has_coi
+    pub fn get_coi_config(&self) -> Option<CoiConfig> {
+        self.config.read().unwrap().coi.clone()
     }
 
-    pub fn is_webpush_supported(&self) -> bool {
-        self.config.read().unwrap().has_webpush
+    pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
+        self.config.read().unwrap().webpush.clone()
     }
 }
 

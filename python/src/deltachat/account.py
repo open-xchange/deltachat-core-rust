@@ -128,6 +128,12 @@ class Account(object):
         """
         return lib.dc_is_coi_supported(self._dc_context)
 
+    def is_webpush_supported(self):
+        """ determine if COI if connected to a COI-compliant server
+        :return: True if COI is supported by the server
+        """
+        return lib.dc_is_coi_supported(self._dc_context)
+
     def get_infostring(self):
         """ return info of the configured account. """
         self.check_is_configured()
