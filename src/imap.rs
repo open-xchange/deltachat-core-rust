@@ -6,11 +6,12 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime};
 
+use crate::coi_feature::CoiFeature;
+use crate::coi_message_filter::CoiMessageFilter;
 use crate::constants::*;
 use crate::context::Context;
 use crate::dc_loginparam::*;
 use crate::dc_tools::CStringExt;
-use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
 
@@ -26,14 +27,12 @@ const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 const FETCH_FLAGS: &str = "(FLAGS)";
 
-enum CoiFilterMode {
-    None,
-    Active,
-    Seen,
-}
+const COI_METADATA_ENABLED: &str = "/private/vendor/vendor.dovecot/config/coi/enabled";
+const COI_METADATA_MESSAGE_FILTER: &str =
+    "/private/vendor/vendor.dovecot/coi/config/message-filter";
 
 pub struct Imap {
-    config: Arc<RwLock<ImapConfig>>,
+    pub config: Arc<RwLock<ImapConfig>>,
     watch: Arc<(Mutex<bool>, Condvar)>,
 
     get_config: dc_get_config_t,
@@ -314,7 +313,7 @@ impl Session {
     }
 }
 
-struct ImapConfig {
+pub struct ImapConfig {
     pub addr: String,
     pub imap_server: String,
     pub imap_port: u16,
@@ -330,6 +329,7 @@ struct ImapConfig {
     pub has_webpush: bool,
     pub imap_delimiter: char,
     pub watch_folder: Option<String>,
+    pub coi_feature: CoiFeature,
 }
 
 pub enum MetadataDepth {
@@ -362,6 +362,7 @@ impl Default for ImapConfig {
             has_webpush: false,
             imap_delimiter: '.',
             watch_folder: None,
+            coi_feature: CoiFeature::Unsupported,
         };
 
         cfg
@@ -577,7 +578,10 @@ impl Imap {
         }
 
         let teardown = (|| {
-            let caps = (*self.session.lock().unwrap()).as_mut().ok_or_else(|| format_err!("No session"))?.capabilities()?;
+            let caps = (*self.session.lock().unwrap())
+                .as_mut()
+                .ok_or_else(|| format_err!("No session"))?
+                .capabilities()?;
             if !context.sql.is_open() {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
                 return Err(format_err!("Failed to open database"));
@@ -585,25 +589,17 @@ impl Imap {
 
             let caps_list = caps.iter().cloned().collect::<Vec<&str>>().join(" ");
 
-            // We do these validations before triggering the IMAP_CONNECTED event.
-            if caps.has("COI") {
-                let coi_filter_mode = match get_filter_mode(context) {
-                    FilterMode::None | FilterMode::Deltachat => CoiFilterMode::None,
-                    FilterMode::CoiActive => CoiFilterMode::Active,
-                    FilterMode::CoiMoveAfterRead => CoiFilterMode::Seen,
-                };
-                // If COI is supported, we unconditionally enable COI for that server, regardless
-                // of the configured filter mode.
-                self.enable_coi(context)?;
-                self.set_coi_filter_mode(context, coi_filter_mode)?;
-            } else if get_filter_mode(context).requires_coi() {
-                warn!(
-                    context,
-                    0, "IMAP-LOGIN as {} ok, but config requires COI server (capabilities: {}). ABORTING", lp.mail_user, caps_list);
-                return Err(format_err!("Configuration requires COI server"));
-            }
+            let coi_feature = if caps.has("COI") {
+                if self.query_is_coi_enabled(context)? {
+                    CoiFeature::Enabled
+                } else {
+                    CoiFeature::Disabled
+                }
+            } else {
+                CoiFeature::Unsupported
+            };
 
-           log_event!(
+            log_event!(
                 context,
                 Event::IMAP_CONNECTED,
                 0,
@@ -617,10 +613,12 @@ impl Imap {
             config.has_xlist = caps.has("XLIST");
             config.has_coi = caps.has("COI");
             config.has_webpush = caps.has("WEBPUSH");
+            config.coi_feature = coi_feature;
             *self.connected.lock().unwrap() = true;
 
             Ok(())
-        })().is_err();
+        })()
+        .is_err();
 
         if teardown {
             self.unsetup_handle(context);
@@ -1702,33 +1700,69 @@ impl Imap {
         Ok(())
     }
 
+    fn query_is_coi_enabled(&self, context: &Context) -> crate::error::Result<bool> {
+        self.get_metadata(
+            context,
+            "",
+            &[COI_METADATA_ENABLED],
+            MetadataDepth::Zero,
+            None,
+        )
+        .map(|a| {
+            a.iter()
+                .any(|metadata| metadata.entry == COI_METADATA_ENABLED && metadata.value == "yes")
+        })
+    }
+
     fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
         self.set_metadata(
             context,
             "",
             &[Metadata {
-                entry: "/private/vendor/vendor.dovecot/config/coi/enabled",
+                entry: COI_METADATA_ENABLED,
                 value: "yes",
             }],
         )
     }
 
-    fn set_coi_filter_mode(
+    fn query_coi_message_filter(
         &self,
         context: &Context,
-        mode: CoiFilterMode,
+    ) -> crate::error::Result<CoiMessageFilter> {
+        use std::str::FromStr;
+        match self
+            .get_metadata(
+                context,
+                "",
+                &[COI_METADATA_MESSAGE_FILTER],
+                MetadataDepth::Zero,
+                None,
+            )?
+            .as_slice()
+        {
+            &[ref metadata] => {
+                if metadata.entry == COI_METADATA_MESSAGE_FILTER {
+                    CoiMessageFilter::from_str(metadata.value)
+                        .map_err(|_| format_err!("ParseError"))
+                } else {
+                    Err(format_err!("Missing metadata entry"))
+                }
+            }
+            _ => Err(format_err!("Received invalid number of Metadata items")),
+        }
+    }
+
+    fn set_coi_message_filter(
+        &self,
+        context: &Context,
+        filter_mode: CoiMessageFilter,
     ) -> crate::error::Result<()> {
-        let filter_mode = match mode {
-            CoiFilterMode::None => "none",
-            CoiFilterMode::Active => "active",
-            CoiFilterMode::Seen => "seen",
-        };
         self.set_metadata(
             context,
             "",
             &[Metadata {
-                entry: "/private/vendor/vendor.dovecot/coi/config/message-filter",
-                value: filter_mode,
+                entry: COI_METADATA_MESSAGE_FILTER,
+                value: &filter_mode.to_string(),
             }],
         )
     }

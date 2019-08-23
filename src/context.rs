@@ -1,4 +1,4 @@
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Condvar, Mutex, RwLock};
 
 use crate::chat::*;
 use crate::constants::*;
@@ -19,10 +19,8 @@ use crate::sql::Sql;
 use crate::types::*;
 use crate::webpush::*;
 use crate::x::*;
-use std::ptr;
-
-use crate::filter_mode::get_filter_mode;
 use std::path::PathBuf;
+use std::ptr;
 
 pub struct Context {
     pub userdata: *mut libc::c_void,
@@ -46,6 +44,8 @@ pub struct Context {
     /// Mutex to avoid generating the key for the user more than once.
     pub generating_key_mutex: Mutex<()>,
     pub webpush_config: Option<WebPushConfig>,
+
+    is_coi_enabled: AtomicBool,
 }
 
 unsafe impl std::marker::Send for Context {}
@@ -81,6 +81,31 @@ impl Context {
             unsafe { cb(self, event, data1, data2) }
         } else {
             0
+        }
+    }
+
+    pub fn set_coi_enabled(&self, value: bool) {
+        self.is_coi_enabled.store(value, Ordering::Release);
+    }
+
+    pub fn is_coi_enabled(&self) -> bool {
+        self.is_coi_enabled.load(Ordering::Acquire)
+    }
+
+    /// DCC will move messages depending on two settings:
+    ///
+    /// * `mvbox_move` has to be enabled (set to "1") in the config.
+    ///
+    /// * `Context::is_coi_enabled` MUST NOT be set to `true`. In case a COI enabled server is
+    ///   detected, deltachat is disabled from moving messages automatically.
+    pub fn is_deltachat_move_enabled(&self) -> bool {
+        if self.is_coi_enabled() {
+            false
+        } else {
+            self.sql
+                .get_config_int(self, "mvbox_move")
+                .map(|value| value == 1)
+                .unwrap_or(true)
         }
     }
 }
@@ -170,6 +195,7 @@ pub fn dc_context_new(
         perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
         generating_key_mutex: Mutex::new(()),
         webpush_config: None,
+        is_coi_enabled: AtomicBool::new(false),
     }
 }
 
@@ -393,7 +419,10 @@ pub unsafe fn dc_get_info(context: &Context) -> *mut libc::c_char {
         .sql
         .get_config_int(context, "mvbox_watch")
         .unwrap_or_else(|| 1);
-    let mvbox_move = get_filter_mode(context);
+    let mvbox_move = context
+        .sql
+        .get_config_int(context, "mvbox_move")
+        .unwrap_or(1);
     let folders_configured = context
         .sql
         .get_config_int(context, "folders_configured")
@@ -462,7 +491,7 @@ pub unsafe fn dc_get_info(context: &Context) -> *mut libc::c_char {
         inbox_watch,
         sentbox_watch,
         mvbox_watch,
-        mvbox_move.as_ref(),
+        mvbox_move,
         folders_configured,
         configured_sentbox_folder,
         configured_mvbox_folder,
