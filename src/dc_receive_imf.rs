@@ -19,7 +19,6 @@ use crate::dc_securejoin::*;
 use crate::dc_strencode::*;
 use crate::dc_tools::*;
 use crate::error::Result;
-use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::job::*;
 use crate::location;
 use crate::message::*;
@@ -910,9 +909,7 @@ unsafe fn handle_reports(
                 let mut param = Params::new();
                 param.set(Param::ServerFolder, server_folder.as_ref());
                 param.set_int(Param::ServerUid, server_uid as i32);
-                if mime_parser.is_send_by_messenger != 0
-                    && get_filter_mode(context) == FilterMode::Deltachat
-                {
+                if mime_parser.is_send_by_messenger != 0 && context.is_deltachat_move_enabled() {
                     param.set_int(Param::AlsoMove, 1);
                 }
                 job_add(context, Action::MarkseenMdnOnImap, 0, param, 0);
