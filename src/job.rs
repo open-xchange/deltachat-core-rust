@@ -6,6 +6,7 @@ use deltachat_derive::{FromSql, ToSql};
 use rand::{thread_rng, Rng};
 
 use crate::chat;
+use crate::coi_feature::CoiFeature;
 use crate::configure::*;
 use crate::constants::*;
 use crate::context::Context;
@@ -997,7 +998,17 @@ fn suspend_smtp_thread(context: &Context, suspend: bool) {
 fn connect_to_inbox(context: &Context, inbox: &Imap) -> libc::c_int {
     let ret_connected = dc_connect_to_configured_imap(context, inbox);
     if 0 != ret_connected {
-        inbox.set_watch_folder("INBOX".into());
+        // If COI is unsupported or disabled, we poll from INBOX and do not override the
+        // `mvbox_move` settings. Otherwise we use "Coi/Chats" and "disable" `mvbox_move`, i.e.
+        // let the server do the moving of messages.
+        let (coi_enabled, inbox_folder) = match inbox.config.read().unwrap().coi_feature {
+            CoiFeature::Unsupported => (false, "INBOX"),
+            CoiFeature::Disabled => (false, "INBOX"),
+            CoiFeature::Enabled => (true, "COI/Chats"), // XXX: use ${MAILBOX-ROOT}/Chats
+        };
+
+        context.set_coi_enabled(coi_enabled);
+        inbox.set_watch_folder(inbox_folder.into());
     }
     ret_connected
 }

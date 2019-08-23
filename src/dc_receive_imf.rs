@@ -908,16 +908,16 @@ unsafe fn handle_reports(
                 }
             }
 
-            if 0 != mime_parser.is_send_by_messenger || 0 != mdn_consumed {
+            /* Move the MDN away to the chats folder.  We do this for:
+            - Consumed or not consumed MDNs from other messengers
+            - Consumed MDNs from normal MUAs
+            Unconsumed MDNs from normal MUAs are _not_ moved.
+            NB: we do not delete the MDN as it may be used by other clients */
+            if mime_parser.is_send_by_messenger != 0 || mdn_consumed != 0 {
                 let mut param = Params::new();
                 param.set(Param::ServerFolder, server_folder.as_ref());
                 param.set_int(Param::ServerUid, server_uid as i32);
-                if 0 != mime_parser.is_send_by_messenger
-                    && 0 != context
-                        .sql
-                        .get_config_int(context, "mvbox_move")
-                        .unwrap_or_else(|| 1)
-                {
+                if mime_parser.is_send_by_messenger != 0 && context.is_deltachat_move_enabled() {
                     param.set_int(Param::AlsoMove, 1);
                 }
                 job_add(context, Action::MarkseenMdnOnImap, 0, param, 0);

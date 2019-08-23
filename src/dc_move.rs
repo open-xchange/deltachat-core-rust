@@ -5,15 +5,9 @@ use crate::message::*;
 use crate::param::Params;
 
 pub unsafe fn dc_do_heuristics_moves(context: &Context, folder: &str, msg_id: u32) {
-    if context
-        .sql
-        .get_config_int(context, "mvbox_move")
-        .unwrap_or_else(|| 1)
-        == 0
-    {
+    if !context.is_deltachat_move_enabled() {
         return;
     }
-
     if !dc_is_inbox(context, folder) && !dc_is_sentbox(context, folder) {
         return;
     }

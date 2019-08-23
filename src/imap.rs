@@ -6,6 +6,8 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime};
 
+use crate::coi_feature::CoiFeature;
+use crate::coi_message_filter::CoiMessageFilter;
 use crate::constants::*;
 use crate::context::Context;
 use crate::dc_loginparam::*;
@@ -25,8 +27,12 @@ const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 const FETCH_FLAGS: &str = "(FLAGS)";
 
+const COI_METADATA_ENABLED: &str = "/private/vendor/vendor.dovecot/config/coi/enabled";
+const COI_METADATA_MESSAGE_FILTER: &str =
+    "/private/vendor/vendor.dovecot/coi/config/message-filter";
+
 pub struct Imap {
-    config: Arc<RwLock<ImapConfig>>,
+    pub config: Arc<RwLock<ImapConfig>>,
     watch: Arc<(Mutex<bool>, Condvar)>,
 
     get_config: dc_get_config_t,
@@ -307,7 +313,7 @@ impl Session {
     }
 }
 
-struct ImapConfig {
+pub struct ImapConfig {
     pub addr: String,
     pub imap_server: String,
     pub imap_port: u16,
@@ -323,6 +329,7 @@ struct ImapConfig {
     pub has_webpush: bool,
     pub imap_delimiter: char,
     pub watch_folder: Option<String>,
+    pub coi_feature: CoiFeature,
 }
 
 pub enum MetadataDepth {
@@ -355,6 +362,7 @@ impl Default for ImapConfig {
             has_webpush: false,
             imap_delimiter: '.',
             watch_folder: None,
+            coi_feature: CoiFeature::Unsupported,
         };
 
         cfg
@@ -570,33 +578,47 @@ impl Imap {
         }
 
         let teardown = (|| {
-            let caps = (*self.session.lock().unwrap()).as_mut()?.capabilities().ok()?;
+            let caps = (*self.session.lock().unwrap())
+                .as_mut()
+                .ok_or_else(|| format_err!("No session"))?
+                .capabilities()?;
             if !context.sql.is_open() {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
-                None
-            } else {
-                let caps_list = caps.iter().fold(String::new(), |mut s, c| {
-                    s += " ";
-                    s += c;
-                    s
-                });
-                log_event!(
-                    context,
-                    Event::IMAP_CONNECTED,
-                    0,
-                    "IMAP-LOGIN as {}, capabilities: {}",
-                    lp.mail_user,
-                    caps_list,
-                );
-                let mut config = self.config.write().unwrap();
-                config.can_idle = caps.has("IDLE");
-                config.has_xlist = caps.has("XLIST");
-                config.has_coi = caps.has("COI");
-                config.has_webpush = caps.has("WEBPUSH");
-                *self.connected.lock().unwrap() = true;
-                Some(())
+                return Err(format_err!("Failed to open database"));
             }
-        })().is_none();
+
+            let caps_list = caps.iter().cloned().collect::<Vec<&str>>().join(" ");
+
+            let coi_feature = if caps.has("COI") {
+                if self.query_is_coi_enabled(context)? {
+                    CoiFeature::Enabled
+                } else {
+                    CoiFeature::Disabled
+                }
+            } else {
+                CoiFeature::Unsupported
+            };
+
+            log_event!(
+                context,
+                Event::IMAP_CONNECTED,
+                0,
+                "IMAP-LOGIN as {}, capabilities: {}",
+                lp.mail_user,
+                caps_list,
+            );
+
+            let mut config = self.config.write().unwrap();
+            config.can_idle = caps.has("IDLE");
+            config.has_xlist = caps.has("XLIST");
+            config.has_coi = caps.has("COI");
+            config.has_webpush = caps.has("WEBPUSH");
+            config.coi_feature = coi_feature;
+            *self.connected.lock().unwrap() = true;
+
+            Ok(())
+        })()
+        .is_err();
 
         if teardown {
             self.unsetup_handle(context);
@@ -1650,21 +1672,99 @@ impl Imap {
         }
     }
 
-    pub fn get_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, key: &[S],
-                                       depth: MetadataDepth, max_size: Option<usize>)
-        -> crate::error::Result<Vec<Metadata>>
-        where S: std::fmt::Debug
+    pub fn get_metadata<S: AsRef<str>>(
+        &self,
+        context: &Context,
+        mbox: S,
+        key: &[S],
+        depth: MetadataDepth,
+        max_size: Option<usize>,
+    ) -> crate::error::Result<Vec<Metadata>>
+    where
+        S: std::fmt::Debug,
     {
         info!(context, 0, "get metadata: \"{:?}\", \"{:?}\"", mbox, key);
         Ok(vec![])
     }
 
-    pub fn set_metadata<S: AsRef<str>>(&self, context: &Context, mbox: S, keyval: &[Metadata])
-        -> crate::error::Result<()>
-        where S: std::fmt::Debug
+    pub fn set_metadata<S>(
+        &self,
+        context: &Context,
+        mbox: S,
+        keyval: &[Metadata],
+    ) -> crate::error::Result<()>
+    where
+        S: AsRef<str> + std::fmt::Debug,
     {
         info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
         Ok(())
+    }
+
+    fn query_is_coi_enabled(&self, context: &Context) -> crate::error::Result<bool> {
+        self.get_metadata(
+            context,
+            "",
+            &[COI_METADATA_ENABLED],
+            MetadataDepth::Zero,
+            None,
+        )
+        .map(|a| {
+            a.iter()
+                .any(|metadata| metadata.entry == COI_METADATA_ENABLED && metadata.value == "yes")
+        })
+    }
+
+    fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
+        self.set_metadata(
+            context,
+            "",
+            &[Metadata {
+                entry: COI_METADATA_ENABLED,
+                value: "yes",
+            }],
+        )
+    }
+
+    fn query_coi_message_filter(
+        &self,
+        context: &Context,
+    ) -> crate::error::Result<CoiMessageFilter> {
+        use std::str::FromStr;
+        match self
+            .get_metadata(
+                context,
+                "",
+                &[COI_METADATA_MESSAGE_FILTER],
+                MetadataDepth::Zero,
+                None,
+            )?
+            .as_slice()
+        {
+            &[ref metadata] => {
+                if metadata.entry == COI_METADATA_MESSAGE_FILTER {
+                    CoiMessageFilter::from_str(metadata.value)
+                        .map_err(|_| format_err!("ParseError"))
+                } else {
+                    Err(format_err!("Missing metadata entry"))
+                }
+            }
+            _ => Err(format_err!("Received invalid number of Metadata items")),
+        }
+    }
+
+    fn set_coi_message_filter(
+        &self,
+        context: &Context,
+        filter_mode: CoiMessageFilter,
+    ) -> crate::error::Result<()> {
+        self.set_metadata(
+            context,
+            "",
+            &[Metadata {
+                entry: COI_METADATA_MESSAGE_FILTER,
+                value: &filter_mode.to_string(),
+            }],
+        )
     }
 
     pub fn is_coi_supported(&self) -> bool {

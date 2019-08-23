@@ -1,6 +1,6 @@
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use crate::constants::Event;
+use crate::constants::{Event, DC_CREATE_MVBOX};
 use crate::context::Context;
 use crate::dc_e2ee::*;
 use crate::dc_loginparam::*;
@@ -81,7 +81,6 @@ pub fn dc_stop_ongoing_process(context: &Context) {
 // the other dc_job_do_DC_JOB_*() functions are declared static in the c-file
 #[allow(non_snake_case, unused_must_use)]
 pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context, _job: &Job) {
-    let flags: libc::c_int;
     let mut success = false;
     let mut imap_connected_here = false;
     let mut smtp_connected_here = false;
@@ -554,17 +553,14 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context, _job: &Job) {
                                                 smtp_connected_here = true;
                                                 if !s.shall_stop_ongoing {
                                                     progress!(context, 900);
-                                                    flags = if 0
-                                                        != context
-                                                            .sql
-                                                            .get_config_int(context, "mvbox_watch")
-                                                            .unwrap_or_else(|| 1)
-                                                        || 0 != context
-                                                            .sql
-                                                            .get_config_int(context, "mvbox_move")
-                                                            .unwrap_or_else(|| 1)
+                                                    let flags = if context
+                                                        .sql
+                                                        .get_config_int(context, "mvbox_watch")
+                                                        .unwrap_or(1)
+                                                        != 0
+                                                        || context.is_deltachat_move_enabled()
                                                     {
-                                                        0x1
+                                                        DC_CREATE_MVBOX as i32
                                                     } else {
                                                         0
                                                     };
