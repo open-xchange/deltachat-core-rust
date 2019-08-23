@@ -13,6 +13,7 @@ use crate::dc_loginparam::*;
 use crate::dc_tools::CStringExt;
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
+use std::str::FromStr;
 
 const DC_IMAP_SEEN: usize = 0x0001;
 const DC_REGENERATE: usize = 0x01;
@@ -328,6 +329,7 @@ pub struct Metadata<'a> {
 pub struct CoiConfig {
     pub enabled: bool,
     pub mailbox_root: String,
+    pub message_filter: CoiMessageFilter,
 }
 
 impl Default for CoiConfig {
@@ -335,6 +337,7 @@ impl Default for CoiConfig {
         CoiConfig {
             enabled: false,
             mailbox_root: "COI".into(),
+            message_filter: CoiMessageFilter::default(),
         }
     }
 }
@@ -346,9 +349,7 @@ pub struct WebPushConfig {
 
 impl Default for WebPushConfig {
     fn default() -> Self {
-        WebPushConfig {
-            vapid: "".into(),
-        }
+        WebPushConfig { vapid: "".into() }
     }
 }
 
@@ -604,7 +605,7 @@ impl Imap {
                 return Err(format_err!("Failed to open database"));
             }
             let can_idle = caps.has("IDLE");
-            let has_xlist= caps.has("XLIST");
+            let has_xlist = caps.has("XLIST");
             let (coi, webpush) = self.query_metadata(context, caps.has("COI"), caps.has("WEBPUSH"));
 
             let caps_list = caps.iter().cloned().collect::<Vec<&str>>().join(" ");
@@ -625,8 +626,8 @@ impl Imap {
             config.webpush = webpush;
             *self.connected.lock().unwrap() = true;
             Ok(())
-
-        })().is_err();
+        })()
+        .is_err();
 
         if teardown {
             self.unsetup_handle(context);
@@ -635,10 +636,15 @@ impl Imap {
         !teardown
     }
 
-    fn query_metadata(&self, context: &Context, has_coi: bool, has_webpush: bool)
-        -> (Option<CoiConfig>, Option<WebPushConfig>)
-    {
-        if !has_coi && !has_webpush { return (None, None); }
+    fn query_metadata(
+        &self,
+        context: &Context,
+        has_coi: bool,
+        has_webpush: bool,
+    ) -> (Option<CoiConfig>, Option<WebPushConfig>) {
+        if !has_coi && !has_webpush {
+            return (None, None);
+        }
 
         let mut keys = vec![];
         let mut coi = None;
@@ -659,23 +665,30 @@ impl Imap {
                         if coi.is_some() {
                             coi.as_mut().unwrap().mailbox_root = meta.value.to_string();
                         }
-                    },
+                    }
                     "/private/vendor/vendor.dovecot/coi/config/enabled" => {
                         if coi.is_some() {
                             coi.as_mut().unwrap().enabled = meta.value == "yes";
                         }
-                    },
+                    }
                     "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
-
-                    },
+                        if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value) {
+                            if let Some(ref mut c) = coi {
+                                c.message_filter = message_filter;
+                            }
+                        }
+                    }
                     "/private/vendor/vendor.dovecot/webpush/vapid" => {
                         if webpush.is_some() {
                             webpush.as_mut().unwrap().vapid = meta.value.to_string();
                         }
-                    },
+                    }
                     _ => {
-                        info!(context, 0, "Unknown metadata: {} = {}", meta.entry, meta.value);
-                    },
+                        info!(
+                            context,
+                            0, "Unknown metadata: {} = {}", meta.entry, meta.value
+                        );
+                    }
                 }
             }
         } else if let Err(error) = metadata {
@@ -1761,7 +1774,7 @@ impl Imap {
         self.config.read().unwrap().coi.clone()
     }
 
-    fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
+    pub fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
         self.set_metadata(
             context,
             "",
@@ -1772,34 +1785,7 @@ impl Imap {
         )
     }
 
-    fn query_coi_message_filter(
-        &self,
-        context: &Context,
-    ) -> crate::error::Result<CoiMessageFilter> {
-        use std::str::FromStr;
-        match self
-            .get_metadata(
-                context,
-                "",
-                &[COI_METADATA_MESSAGE_FILTER],
-                MetadataDepth::Zero,
-                None,
-            )?
-            .as_slice()
-        {
-            &[ref metadata] => {
-                if metadata.entry == COI_METADATA_MESSAGE_FILTER {
-                    CoiMessageFilter::from_str(metadata.value)
-                        .map_err(|_| format_err!("ParseError"))
-                } else {
-                    Err(format_err!("Missing metadata entry"))
-                }
-            }
-            _ => Err(format_err!("Received invalid number of Metadata items")),
-        }
-    }
-
-    fn set_coi_message_filter(
+    pub fn set_coi_message_filter(
         &self,
         context: &Context,
         filter_mode: CoiMessageFilter,

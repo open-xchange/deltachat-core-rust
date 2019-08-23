@@ -8,6 +8,12 @@ pub enum CoiMessageFilter {
     Seen,
 }
 
+impl Default for CoiMessageFilter {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

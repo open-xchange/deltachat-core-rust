@@ -6,6 +6,7 @@ use deltachat_derive::{FromSql, ToSql};
 use rand::{thread_rng, Rng};
 
 use crate::chat;
+use crate::coi_message_filter::CoiMessageFilter;
 use crate::configure::*;
 use crate::constants::*;
 use crate::context::Context;
@@ -1002,16 +1003,44 @@ fn connect_to_inbox(context: &Context, inbox: &Imap) -> libc::c_int {
     let ret_connected = dc_connect_to_configured_imap(context, inbox);
     if 0 != ret_connected {
         // If COI is unsupported or disabled, we poll from INBOX and do not override the
-        // `mvbox_move` settings. Otherwise we use "Coi/Chats" and "disable" `mvbox_move`, i.e.
+        // `mvbox_move` settings. Otherwise we use "${MAILBOX_ROOT}/Chats" and "disable" `mvbox_move`, i.e.
         // let the server do the moving of messages.
         let (coi_enabled, inbox_folder) = match context.get_coi_config() {
-            None => (false, "INBOX"),
-            Some(CoiConfig { enabled: false, .. }) => (false, "INBOX"),
-            Some(CoiConfig { enabled: true, mailbox_root }) => (true, "COI/Chats"), // XXX: use ${MAILBOX-ROOT}/Chats
+            // COI is not supported.
+            None => (false, "INBOX".into()),
+
+            // COI is supported, but not enabled.
+            Some(CoiConfig { enabled: false, .. }) => (false, "INBOX".into()),
+
+            // COI is supported and enabled, but COI message filter is set to "none". Messages as
+            // such will not be moved automatically from the INBOX, but DeltaChat is free to do so.
+            Some(CoiConfig {
+                enabled: true,
+                message_filter: CoiMessageFilter::None,
+                ..
+            }) => (false, "INBOX".into()),
+
+            // COI is supported and enabled, message filter is set to "seen".
+            // The server will move the messages from INBOX to COI/Chats once they are
+            // marked as seen. We have to listen on INBOX. XXX: We also have to change
+            // the "configured_mvbox_folder" to point to "COI/Chats".
+            Some(CoiConfig {
+                enabled: true,
+                message_filter: CoiMessageFilter::Seen,
+                ..
+            }) => (true, "INBOX".into()),
+
+            // Active COI message filter. The server will move messages.
+            Some(CoiConfig {
+                enabled: true,
+                message_filter: CoiMessageFilter::Active,
+                mailbox_root,
+            }) => (true, format!("{}/Chats", mailbox_root)),
         };
 
+        // If `coi_enabled` is true, this will disable Deltachat from moving messages.
         context.set_coi_enabled(coi_enabled);
-        inbox.set_watch_folder(inbox_folder.into());
+        inbox.set_watch_folder(inbox_folder);
     }
     ret_connected
 }

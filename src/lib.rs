@@ -52,7 +52,6 @@ pub mod types;
 pub mod webpush;
 pub mod x;
 
-mod coi_feature;
 mod coi_message_filter;
 pub mod dc_array;
 mod dc_dehtml;
