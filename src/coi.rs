@@ -1,7 +1,8 @@
 use crate::context::*;
+use crate::imap::*;
 
 impl Context {
-    pub fn is_coi_supported(&self) -> bool {
-        self.inbox.read().unwrap().is_coi_supported()
+    pub fn get_coi_config(&self) -> Option<CoiConfig> {
+        self.inbox.read().unwrap().get_coi_config()
     }
 }

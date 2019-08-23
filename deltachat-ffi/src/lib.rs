@@ -166,13 +166,25 @@ pub unsafe extern "C" fn dc_get_oauth2_url(
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_coi_supported(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    (*context).is_coi_supported() as libc::c_int
+    (*context).get_coi_config().is_some() as libc::c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_is_coi_enabled(context: *mut dc_context_t) -> libc::c_int {
+    assert!(!context.is_null());
+    (*context).get_coi_config().map(|c| c.enabled).unwrap_or(false) as libc::c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_webpush_supported(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    (*context).is_webpush_supported() as libc::c_int
+    (*context).get_webpush_config().is_some() as libc::c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_webpush_vapid_key(context: *mut dc_context_t) -> *const libc::c_char {
+    assert!(!context.is_null());
+    (*context).get_webpush_config().map(|w| w.vapid).unwrap_or("".into()).as_ref()
 }
 
 #[no_mangle]
