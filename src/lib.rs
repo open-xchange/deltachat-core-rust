@@ -50,6 +50,8 @@ pub mod types;
 pub mod webpush;
 pub mod x;
 
+mod coi_feature;
+mod coi_message_filter;
 pub mod dc_array;
 mod dc_dehtml;
 mod dc_e2ee;
@@ -65,7 +67,6 @@ mod dc_simplify;
 mod dc_strencode;
 mod dc_token;
 pub mod dc_tools;
-mod filter_mode;
 
 #[cfg(test)]
 mod test_utils;

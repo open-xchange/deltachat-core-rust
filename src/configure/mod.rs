@@ -5,7 +5,6 @@ use crate::context::Context;
 use crate::dc_e2ee::*;
 use crate::dc_loginparam::*;
 use crate::dc_tools::*;
-use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::imap::*;
 use crate::job::*;
 use crate::oauth2::*;
@@ -559,8 +558,7 @@ pub unsafe fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context, _job: &Job) {
                                                         .get_config_int(context, "mvbox_watch")
                                                         .unwrap_or(1)
                                                         != 0
-                                                        || get_filter_mode(context)
-                                                            == FilterMode::Deltachat
+                                                        || context.is_deltachat_move_enabled()
                                                     {
                                                         DC_CREATE_MVBOX as i32
                                                     } else {

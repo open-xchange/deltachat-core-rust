@@ -1,19 +1,13 @@
 use crate::constants::*;
 use crate::context::*;
-use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::job::*;
 use crate::message::*;
 use crate::param::Params;
 
 pub unsafe fn dc_do_heuristics_moves(context: &Context, folder: &str, msg_id: u32) {
-    match get_filter_mode(context) {
-        FilterMode::Deltachat => {}
-        _ => {
-            // either filtering is disabled (None) or filtering is performed by the COI server.
-            return;
-        }
+    if !context.is_deltachat_move_enabled() {
+        return;
     }
-
     if !dc_is_inbox(context, folder) && !dc_is_sentbox(context, folder) {
         return;
     }
