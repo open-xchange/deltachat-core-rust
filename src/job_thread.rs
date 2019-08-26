@@ -4,11 +4,17 @@ use crate::configure::*;
 use crate::context::Context;
 use crate::imap::Imap;
 
+#[derive(Copy, Clone)]
+pub enum JobThreadKind {
+    SentBox,
+    MoveBox,
+}
+
 pub struct JobThread {
-    pub name: &'static str,
-    pub folder_config_name: &'static str,
+    name: &'static str,
+    job_thread_kind: JobThreadKind,
     pub imap: Imap,
-    pub state: Arc<(Mutex<JobState>, Condvar)>,
+    state: Arc<(Mutex<JobState>, Condvar)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -20,10 +26,14 @@ pub struct JobState {
 }
 
 impl JobThread {
-    pub fn new(name: &'static str, folder_config_name: &'static str, imap: Imap) -> Self {
+    pub fn new(job_thread_kind: JobThreadKind, imap: Imap) -> Self {
+        let name = match job_thread_kind {
+            JobThreadKind::SentBox => "SENTBOX",
+            JobThreadKind::MoveBox => "MVBOX",
+        };
         JobThread {
             name,
-            folder_config_name,
+            job_thread_kind,
             imap,
             state: Arc::new((Mutex::new(Default::default()), Condvar::new())),
         }
@@ -106,6 +116,26 @@ impl JobThread {
         self.state.0.lock().unwrap().using_handle = false;
     }
 
+    fn get_watch_folder(&self, context: &Context) -> Option<String> {
+        let folder_config_name = match self.job_thread_kind {
+            JobThreadKind::SentBox => "configured_sentbox_folder",
+            JobThreadKind::MoveBox => "configured_mvbox_folder",
+        };
+        {
+            let arc = context.configured_mvbox_folder_override.clone();
+            let mutex_guard = arc.lock().unwrap();
+            if let Some(ref mvbox_folder_override) = *mutex_guard {
+                return Some(mvbox_folder_override.into());
+            }
+        }
+ 
+        if let Some(mvbox_name) = context.sql.get_config(context, folder_config_name) {
+            Some(mvbox_name)
+        } else {
+            None
+        }
+    }
+
     fn connect_to_imap(&self, context: &Context) -> bool {
         if self.imap.is_connected() {
             return true;
@@ -123,7 +153,7 @@ impl JobThread {
                 self.imap.configure_folders(context, 0x1);
             }
 
-            if let Some(mvbox_name) = context.sql.get_config(context, self.folder_config_name) {
+            if let Some(mvbox_name) = self.get_watch_folder(context) {
                 self.imap.set_watch_folder(mvbox_name);
             } else {
                 self.imap.disconnect(context);
