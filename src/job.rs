@@ -999,48 +999,67 @@ fn suspend_smtp_thread(context: &Context, suspend: bool) {
     }
 }
 
+struct DeltachatMode {
+    coi_enabled: bool,
+    inbox_folder: String,
+    configured_mvbox_folder_override: Option<String>,
+}
+
+fn determine_deltachat_mode(coi_config: &Option<CoiConfig>) -> DeltachatMode {
+    // If COI is unsupported or disabled, we poll from INBOX and do not override the `mvbox_move`
+    // settings. Otherwise we use "${MAILBOX_ROOT}/Chats" and "disable" `mvbox_move`, i.e.  let the
+    // server do the moving of messages.
+    match coi_config {
+        // COI is not supported.
+        | None
+
+        // COI is supported, but not enabled.
+        | Some(CoiConfig { enabled: false, .. })
+
+        // COI is supported and enabled, but COI message filter is set to "none". Messages as
+        // such will not be moved automatically from the INBOX, but DeltaChat is free to do so.
+        | Some(CoiConfig {
+            enabled: true,
+            message_filter: CoiMessageFilter::None,
+            ..
+        }) => DeltachatMode {
+            coi_enabled: false,
+            inbox_folder: "INBOX".into(),
+            configured_mvbox_folder_override: None},
+
+        // COI is supported and enabled, message filter is set to "seen".  The server will move the
+        // messages from INBOX to COI/Chats once they are marked as seen. We have to listen on
+        // INBOX. XXX: We also have to change the "configured_mvbox_folder" to point to
+        // "COI/Chats".
+        | Some(CoiConfig {
+            enabled: true,
+            message_filter: CoiMessageFilter::Seen,
+            mailbox_root
+        }) => DeltachatMode {
+            coi_enabled: true,
+            inbox_folder: "INBOX".into(),
+            configured_mvbox_folder_override: Some(format!("{}/Chats", mailbox_root))},
+
+        // Active COI message filter. The server will move messages.
+        Some(CoiConfig {
+            enabled: true,
+            message_filter: CoiMessageFilter::Active,
+            mailbox_root,
+        }) => DeltachatMode {
+            coi_enabled: true,
+            inbox_folder: format!("{}/Chats", mailbox_root),
+            configured_mvbox_folder_override: Some(format!("{}/Chats", mailbox_root))},
+    }
+}
+
 fn connect_to_inbox(context: &Context, inbox: &Imap) -> libc::c_int {
     let ret_connected = dc_connect_to_configured_imap(context, inbox);
     if 0 != ret_connected {
-        // If COI is unsupported or disabled, we poll from INBOX and do not override the
-        // `mvbox_move` settings. Otherwise we use "${MAILBOX_ROOT}/Chats" and "disable" `mvbox_move`, i.e.
-        // let the server do the moving of messages.
-        let (coi_enabled, inbox_folder) = match context.get_coi_config() {
-            // COI is not supported.
-            None => (false, "INBOX".into()),
-
-            // COI is supported, but not enabled.
-            Some(CoiConfig { enabled: false, .. }) => (false, "INBOX".into()),
-
-            // COI is supported and enabled, but COI message filter is set to "none". Messages as
-            // such will not be moved automatically from the INBOX, but DeltaChat is free to do so.
-            Some(CoiConfig {
-                enabled: true,
-                message_filter: CoiMessageFilter::None,
-                ..
-            }) => (false, "INBOX".into()),
-
-            // COI is supported and enabled, message filter is set to "seen".
-            // The server will move the messages from INBOX to COI/Chats once they are
-            // marked as seen. We have to listen on INBOX. XXX: We also have to change
-            // the "configured_mvbox_folder" to point to "COI/Chats".
-            Some(CoiConfig {
-                enabled: true,
-                message_filter: CoiMessageFilter::Seen,
-                ..
-            }) => (true, "INBOX".into()),
-
-            // Active COI message filter. The server will move messages.
-            Some(CoiConfig {
-                enabled: true,
-                message_filter: CoiMessageFilter::Active,
-                mailbox_root,
-            }) => (true, format!("{}/Chats", mailbox_root)),
-        };
+        let deltachat_mode = determine_deltachat_mode(&context.get_coi_config());
 
         // If `coi_enabled` is true, this will disable Deltachat from moving messages.
-        context.set_coi_enabled(coi_enabled);
-        inbox.set_watch_folder(inbox_folder);
+        context.set_coi_enabled(deltachat_mode.coi_enabled);
+        inbox.set_watch_folder(deltachat_mode.inbox_folder);
     }
     ret_connected
 }
