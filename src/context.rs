@@ -8,7 +8,7 @@ use crate::dc_receive_imf::*;
 use crate::dc_tools::*;
 use crate::imap::*;
 use crate::job::*;
-use crate::job_thread::JobThread;
+use crate::job_thread::{JobThread, JobThreadKind};
 use crate::key::*;
 use crate::lot::Lot;
 use crate::message::*;
@@ -44,6 +44,8 @@ pub struct Context {
     pub webpush_config: Option<WebPushConfig>,
 
     is_coi_enabled: AtomicBool,
+
+    pub configured_mvbox_folder_override: Arc<Mutex<Option<String>>>, 
 }
 
 unsafe impl std::marker::Send for Context {}
@@ -170,8 +172,7 @@ pub fn dc_context_new(
         last_smeared_timestamp: Arc::new(RwLock::new(0)),
         cmdline_sel_chat_id: Arc::new(RwLock::new(0)),
         sentbox_thread: Arc::new(RwLock::new(JobThread::new(
-            "SENTBOX",
-            "configured_sentbox_folder",
+            JobThreadKind::SentBox,
             Imap::new(
                 cb_get_config,
                 cb_set_config,
@@ -180,8 +181,7 @@ pub fn dc_context_new(
             ),
         ))),
         mvbox_thread: Arc::new(RwLock::new(JobThread::new(
-            "MVBOX",
-            "configured_mvbox_folder",
+            JobThreadKind::MoveBox,
             Imap::new(
                 cb_get_config,
                 cb_set_config,
@@ -194,6 +194,8 @@ pub fn dc_context_new(
         generating_key_mutex: Mutex::new(()),
         webpush_config: None,
         is_coi_enabled: AtomicBool::new(false),
+
+        configured_mvbox_folder_override: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -593,13 +595,20 @@ pub fn dc_is_sentbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
     }
 }
 
-pub fn dc_is_mvbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
-    let mvbox_name = context.sql.get_config(context, "configured_mvbox_folder");
-
-    if let Some(name) = mvbox_name {
-        name == folder_name.as_ref()
+pub(crate) fn dc_is_mvbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
+    let arc = context.configured_mvbox_folder_override.clone();
+    let mutex_guard = arc.lock().unwrap();
+    if let Some(ref mvbox_folder_override) = *mutex_guard {
+        mvbox_folder_override == folder_name.as_ref()
     } else {
-        false
+        // no override
+        let mvbox_name = context.sql.get_config(context, "configured_mvbox_folder");
+
+        if let Some(name) = mvbox_name {
+            name == folder_name.as_ref()
+        } else {
+            false
+        }
     }
 }
 
