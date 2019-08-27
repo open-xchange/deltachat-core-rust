@@ -1809,15 +1809,23 @@ impl Imap {
         self.config.read().unwrap().coi.clone()
     }
 
-    pub fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
+    fn toggle_coi(&self, context: &Context, enabled: &str) -> crate::error::Result<()> {
         self.set_metadata(
             context,
             "",
             &[Metadata {
                 entry: COI_METADATA_ENABLED.into(),
-                value: "yes".into(),
+                value: enabled.into(),
             }],
         )
+    }
+
+    pub fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
+        self.toggle_coi(context, "yes")
+    }
+
+    pub fn disable_coi(&self, context: &Context) -> crate::error::Result<()> {
+        self.toggle_coi(context, "no")
     }
 
     pub fn set_coi_message_filter(

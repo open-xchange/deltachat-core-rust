@@ -16,6 +16,7 @@ use std::convert::TryInto;
 use std::ptr;
 use std::str::FromStr;
 
+use deltachat::coi_message_filter::CoiMessageFilter;
 use deltachat::contact::Contact;
 use deltachat::dc_tools::{as_str, StrExt};
 use deltachat::*;
@@ -172,7 +173,80 @@ pub unsafe extern "C" fn dc_is_coi_supported(context: *mut dc_context_t) -> libc
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_coi_enabled(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    (*context).get_coi_config().map(|c| c.enabled).unwrap_or(false) as libc::c_int
+    (*context)
+        .get_coi_config()
+        .map(|c| c.enabled)
+        .unwrap_or(false) as libc::c_int
+}
+
+/// Returns "none" if message filter is set to None.
+/// Returns "active" if message filter is set to Active
+/// Returns "seen" if message filter is set to Seen.
+/// Otherwise, returns NULL.
+///
+/// Caller has to free the returned string.
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_coi_message_filter(
+    context: *mut dc_context_t,
+) -> *mut libc::c_char {
+    assert!(!context.is_null());
+    (*context)
+        .get_coi_config()
+        .map(|c| {
+            match c.message_filter {
+                CoiMessageFilter::None => "none",
+                CoiMessageFilter::Active => "active",
+                CoiMessageFilter::Seen => "seen",
+            }
+            .strdup()
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Enables COI.
+/// The caller should reconnect after calling this method!
+#[no_mangle]
+pub unsafe extern "C" fn dc_enable_coi(context: *mut dc_context_t) -> libc::c_int {
+    assert!(!context.is_null());
+    (*context)
+        .enable_coi()
+        .map(|_| 1 /* success */)
+        .unwrap_or(0 /* error */)
+}
+
+/// Disables COI.
+/// The caller should reconnect after calling this method!
+#[no_mangle]
+pub unsafe extern "C" fn dc_disable_coi(context: *mut dc_context_t) -> libc::c_int {
+    assert!(!context.is_null());
+    (*context)
+        .disable_coi()
+        .map(|_| 1 /* success */)
+        .unwrap_or(0 /* error */)
+}
+
+/// mode: "none" | "active" | "seen"
+#[no_mangle]
+pub unsafe extern "C" fn dc_set_coi_message_filter(
+    context: *mut dc_context_t,
+    mode: *const libc::c_char,
+) -> libc::c_int {
+    assert!(!context.is_null());
+
+    let message_filter = if libc::strcmp(mode, "none\0".as_ptr() as *const libc::c_char) == 0 {
+        CoiMessageFilter::None
+    } else if libc::strcmp(mode, "active\0".as_ptr() as *const libc::c_char) == 0 {
+        CoiMessageFilter::Active
+    } else if libc::strcmp(mode, "seen\0".as_ptr() as *const libc::c_char) == 0 {
+        CoiMessageFilter::Seen
+    } else {
+        return 0; /* error */
+    };
+
+    (*context)
+        .set_coi_message_filter(message_filter)
+        .map(|_| 1 /* success */)
+        .unwrap_or(0 /* error */)
 }
 
 #[no_mangle]
@@ -184,12 +258,12 @@ pub unsafe extern "C" fn dc_is_webpush_supported(context: *mut dc_context_t) -> 
 #[no_mangle]
 pub unsafe extern "C" fn dc_get_webpush_vapid_key(
     context: *mut dc_context_t,
-) -> *const libc::c_char {
+) -> *mut libc::c_char {
     assert!(!context.is_null());
     (*context)
         .get_webpush_config()
         .map(|w| w.vapid.strdup())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| "".strdup())
 }
 
 #[no_mangle]
