@@ -226,9 +226,14 @@ pub unsafe extern "C" fn dc_is_webpush_supported(context: *mut dc_context_t) -> 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_get_webpush_vapid_key(context: *mut dc_context_t) -> *const libc::c_char {
+pub unsafe extern "C" fn dc_get_webpush_vapid_key(
+    context: *mut dc_context_t,
+) -> *const libc::c_char {
     assert!(!context.is_null());
-    (*context).get_webpush_config().map(|w| w.vapid).unwrap_or("".into()).as_ref()
+    (*context)
+        .get_webpush_config()
+        .map(|w| w.vapid.strdup())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
