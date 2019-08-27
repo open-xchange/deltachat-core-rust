@@ -15,6 +15,9 @@ use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
 use std::str::FromStr;
 
+use imap::extensions::metadata::{MetadataDepth, get_metadata, set_metadata};
+use imap_proto::types::{Metadata, Capability};
+
 const DC_IMAP_SEEN: usize = 0x0001;
 const DC_REGENERATE: usize = 0x01;
 
@@ -311,18 +314,30 @@ impl Session {
             Session::Insecure(i) => i.uid_copy(uid_set, mailbox_name),
         }
     }
-}
 
-pub enum MetadataDepth {
-    Zero,
-    One,
-    Infinity,
-}
+    pub fn get_metadata<S: AsRef<str>>(
+        &mut self,
+        mbox: S,
+        key: &[S],
+        depth: MetadataDepth,
+        max_size: Option<usize>,
+    ) -> imap::error::Result<Vec<Metadata>> {
+        match self {
+            Session::Secure(i) => get_metadata(i, mbox, key, depth, max_size),
+            Session::Insecure(i) => get_metadata(i, mbox, key, depth, max_size),
+        }
+    }
 
-#[derive(Debug)]
-pub struct Metadata<'a> {
-    entry: &'a str,
-    value: &'a str,
+    pub fn set_metadata<S: AsRef<str>>(
+        &mut self,
+        mbox: S,
+        keyval: &[Metadata],
+    ) -> imap::error::Result<()> {
+        match self {
+            Session::Secure(i) => set_metadata(i, mbox, keyval),
+            Session::Insecure(i) => set_metadata(i, mbox, keyval),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -610,11 +625,13 @@ impl Imap {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
                 return Err(format_err!("Failed to open database"));
             }
-            let can_idle = caps.has("IDLE");
-            let has_xlist = caps.has("XLIST");
-            let (coi, webpush) = self.query_metadata(context, caps.has("COI"), caps.has("WEBPUSH"));
+            let can_idle = caps.has(&Capability::Atom("IDLE"));
+            let has_xlist = caps.has(&Capability::Atom("XLIST"));
+            let (coi, webpush) = self.query_metadata(context,
+                                                     caps.has(&Capability::Atom("COI")),
+                                                     caps.has(&Capability::Atom("WEBPUSH")));
 
-            let caps_list = caps.iter().cloned().collect::<Vec<&str>>().join(" ");
+            let caps_list = caps.iter().map(|cap| format!("{:?}", cap)).collect::<Vec<String>>().join(" ");
 
             log_event!(
                 context,
@@ -663,10 +680,12 @@ impl Imap {
             keys.push("/private/vendor/vendor.dovecot/webpush");
             webpush = Some(WebPushConfig::default());
         }
+
         let metadata = self.get_metadata(context, "", &keys, MetadataDepth::One, None);
+
         if let Ok(metadata) = metadata {
             for meta in metadata {
-                match meta.entry {
+                match meta.entry.as_str() {
                     "/private/vendor/vendor.dovecot/coi/config/mailbox-root" => {
                         if coi.is_some() {
                             coi.as_mut().unwrap().mailbox_root = meta.value.to_string();
@@ -678,7 +697,7 @@ impl Imap {
                         }
                     }
                     "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
-                        if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value) {
+                        if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.as_str()) {
                             if let Some(ref mut c) = coi {
                                 c.message_filter = message_filter;
                             }
@@ -1760,7 +1779,12 @@ impl Imap {
         S: std::fmt::Debug,
     {
         info!(context, 0, "get metadata: \"{:?}\", \"{:?}\"", mbox, key);
-        Ok(vec![])
+
+        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
+            Ok(session.get_metadata(mbox, key, depth, max_size)?)
+        } else {
+            Err(format_err!("Cannot acquire session"))
+        }
     }
 
     pub fn set_metadata<S>(
@@ -1773,7 +1797,12 @@ impl Imap {
         S: AsRef<str> + std::fmt::Debug,
     {
         info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
-        Ok(())
+
+        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
+            Ok(session.set_metadata(mbox, keyval)?)
+        } else {
+            Err(format_err!("Cannot acquire session"))
+        }
     }
 
     pub fn get_coi_config(&self) -> Option<CoiConfig> {
@@ -1785,8 +1814,8 @@ impl Imap {
             context,
             "",
             &[Metadata {
-                entry: COI_METADATA_ENABLED,
-                value: "yes",
+                entry: COI_METADATA_ENABLED.into(),
+                value: "yes".into(),
             }],
         )
     }
@@ -1800,8 +1829,8 @@ impl Imap {
             context,
             "",
             &[Metadata {
-                entry: COI_METADATA_MESSAGE_FILTER,
-                value: &filter_mode.to_string(),
+                entry: COI_METADATA_MESSAGE_FILTER.into(),
+                value: filter_mode.to_string(),
             }],
         )
     }
