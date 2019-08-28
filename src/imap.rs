@@ -340,6 +340,14 @@ impl Session {
     }
 }
 
+fn cap_to_str<'a>(cap: &'a Capability) -> &'a str {
+    match cap {
+        Capability::Imap4rev1 => "IMAP4REV1",
+        Capability::Auth(s) => s,
+        Capability::Atom(s) => s,
+    }
+}
+
 #[derive(Clone)]
 pub struct CoiConfig {
     pub enabled: bool,
@@ -625,7 +633,11 @@ impl Imap {
                                                      caps.has(&Capability::Atom("COI")),
                                                      caps.has(&Capability::Atom("WEBPUSH")));
 
-            let caps_list = caps.iter().map(|cap| format!("{:?}", cap)).collect::<Vec<String>>().join(" ");
+            let caps_list = caps
+                .iter()
+                .map(|cap| cap_to_str(cap))
+                .collect::<Vec<&str>>()
+                .join(" ");
 
             log_event!(
                 context,
