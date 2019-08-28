@@ -19,6 +19,7 @@ use std::str::FromStr;
 use deltachat::coi_message_filter::CoiMessageFilter;
 use deltachat::contact::Contact;
 use deltachat::dc_tools::{as_str, StrExt};
+use deltachat::webpush::WebPushConfig;
 use deltachat::*;
 
 // TODO: constants
@@ -260,10 +261,11 @@ pub unsafe extern "C" fn dc_get_webpush_vapid_key(
     context: *mut dc_context_t,
 ) -> *mut libc::c_char {
     assert!(!context.is_null());
-    (*context)
-        .get_webpush_config()
-        .map(|w| w.vapid.strdup())
-        .unwrap_or_else(|| "".strdup())
+    if let Some(WebPushConfig { vapid: Some(v) }) = (*context).get_webpush_config() {
+        v.strdup()
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 #[no_mangle]

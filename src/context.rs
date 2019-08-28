@@ -17,6 +17,7 @@ use crate::param::Params;
 use crate::smtp::*;
 use crate::sql::Sql;
 use crate::types::*;
+use crate::webpush::WebPushConfig;
 use crate::x::*;
 use std::path::PathBuf;
 use std::ptr;

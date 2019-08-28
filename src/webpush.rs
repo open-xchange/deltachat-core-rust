@@ -1,5 +1,15 @@
 use crate::context::*;
-use crate::imap::*;
+
+#[derive(Clone)]
+pub struct WebPushConfig {
+    pub vapid: Option<String>,
+}
+
+impl Default for WebPushConfig {
+    fn default() -> Self {
+        WebPushConfig { vapid: None }
+    }
+}
 
 impl Context {
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {

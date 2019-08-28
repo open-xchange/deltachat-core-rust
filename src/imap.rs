@@ -13,6 +13,7 @@ use crate::dc_loginparam::*;
 use crate::dc_tools::CStringExt;
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
+use crate::webpush::WebPushConfig;
 use std::str::FromStr;
 
 use imap::extensions::metadata::{MetadataDepth, get_metadata, set_metadata};
@@ -365,17 +366,6 @@ impl Default for CoiConfig {
     }
 }
 
-#[derive(Clone)]
-pub struct WebPushConfig {
-    pub vapid: String,
-}
-
-impl Default for WebPushConfig {
-    fn default() -> Self {
-        WebPushConfig { vapid: "".into() }
-    }
-}
-
 struct ImapConfig {
     pub addr: String,
     pub imap_server: String,
@@ -717,7 +707,7 @@ impl Imap {
                     }
                     "/private/vendor/vendor.dovecot/webpush/vapid" => {
                         if webpush.is_some() {
-                            webpush.as_mut().unwrap().vapid = meta.value.to_string();
+                            webpush.as_mut().unwrap().vapid = Some(meta.value.to_string());
                         }
                     }
                     _ => {
