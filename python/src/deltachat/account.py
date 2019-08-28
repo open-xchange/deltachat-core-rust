@@ -123,16 +123,23 @@ class Account(object):
             raise ValueError("need to configure first")
 
     def is_coi_supported(self):
-        """ determine if COI if connected to a COI-compliant server
+        """ determine whether connected to a COI-compliant server
         :return: True if COI is supported by the server
         """
-        return lib.dc_is_coi_supported(self._dc_context)
+        return lib.dc_is_coi_supported(self._dc_context) == 1
 
     def is_webpush_supported(self):
-        """ determine if COI if connected to a COI-compliant server
-        :return: True if COI is supported by the server
+        """ determine whether connected to a WebPush-compliant server
+        :return: True if WebPush is supported by the server
         """
-        return lib.dc_is_coi_supported(self._dc_context)
+        return lib.dc_is_webpush_supported(self._dc_context) == 1
+
+    def get_webpush_vapid_key(self):
+        """ get the server's VAPID key for authentication with push services
+        :return: The VAPID key of the server as a string
+        """
+        res = lib.dc_get_webpush_vapid_key(self._dc_context)
+        return None if res == ffi.NULL else from_dc_charpointer(res)
 
     def get_infostring(self):
         """ return info of the configured account. """
