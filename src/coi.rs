@@ -22,4 +22,11 @@ impl Context {
             .unwrap()
             .set_coi_message_filter(self, message_filter)
     }
+
+    pub fn get_coi_message_filter(&self) -> Result<CoiMessageFilter, Error> {
+        self.inbox
+            .write()
+            .unwrap()
+            .get_coi_message_filter(self)
+    }
 }

@@ -1855,6 +1855,31 @@ impl Imap {
         )
     }
 
+    pub fn get_coi_message_filter(
+        &self,
+        context: &Context
+    ) -> crate::error::Result<CoiMessageFilter> {
+        let metadata = self.get_metadata(
+            context,
+            "",
+            &[COI_METADATA_MESSAGE_FILTER.into()],
+            MetadataDepth::Zero,
+            None
+        )?;
+        for meta in metadata {
+            match meta.entry.as_str() {
+                "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
+                    if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.as_str()) {
+                        return Ok(message_filter);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Err(format_err!("No COI message-filter metadata"));
+    }
+
+
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
         self.config.read().unwrap().webpush.clone()
     }

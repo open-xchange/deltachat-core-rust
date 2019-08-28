@@ -22,6 +22,7 @@ use deltachat::sql;
 use deltachat::types::*;
 use deltachat::x::*;
 use num_traits::FromPrimitive;
+use deltachat::coi_message_filter::CoiMessageFilter;
 
 /// Reset database tables. This function is called from Core cmdline.
 /// Argument is a bitmask, executing single or multiple actions in one call.
@@ -449,6 +450,11 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                  contactinfo <contact-id>\n\
                  delcontact <contact-id>\n\
                  cleanupcontacts\n\
+                 ======================================Coi====\n\
+                 coi-enable\n\
+                 coi-disable\n\
+                 coi-set-message-filter [none | active | seen]\n\
+                 coi-get-message-filter\n\
                  ======================================Misc.==\n\
                  getqr [<chat-id>]\n\
                  getbadqr\n\
@@ -1068,6 +1074,36 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 println!("width={}, height={}", width, height);
             } else {
                 bail!("Command failed.");
+            }
+        }
+        "coi-enable" => {
+            match context.enable_coi() {
+                Ok(_) => println!("Command succeeded"),
+                Err(e) => bail!("Command failed. {:?}", e)
+            }
+        }
+        "coi-disable" => {
+            match context.disable_coi() {
+                Ok(_) => println!("Command succeeded"),
+                Err(e) => bail!("Command failed. {:?}", e)
+            }
+        }
+        "coi-set-message-filter" => {
+            ensure!(!arg1.is_empty(), "Argument <message-filter> missing.");
+            if let Ok(message_filter) = CoiMessageFilter::from_str(&arg1) {
+                match context.set_coi_message_filter(message_filter) {
+                    Ok(_) => println!("Command succeeded"),
+                    Err(e) => bail!("Command failed. {:?}", e)
+                }
+            }
+            else {
+                bail!("Invalid message-filter argument. Requires: none, active or seen");
+            }
+        }
+        "coi-get-message-filter" => {
+            match context.get_coi_message_filter() {
+                Ok(message_filter) => println!("COI message filter: {:?}", message_filter),
+                Err(e) => bail!("Command failed. {:?}", e)
             }
         }
         "" => (),
