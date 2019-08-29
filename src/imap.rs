@@ -31,7 +31,7 @@ const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 const FETCH_FLAGS: &str = "(FLAGS)";
 
-const COI_METADATA_ENABLED: &str = "/private/vendor/vendor.dovecot/config/coi/enabled";
+const COI_METADATA_ENABLED: &str = "/private/vendor/vendor.dovecot/coi/config/enabled";
 const COI_METADATA_MESSAGE_FILTER: &str =
     "/private/vendor/vendor.dovecot/coi/config/message-filter";
 
