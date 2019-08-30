@@ -16,8 +16,9 @@ use crate::types::*;
 use crate::webpush::WebPushConfig;
 use std::str::FromStr;
 
-use imap::extensions::metadata::{MetadataDepth, get_metadata, set_metadata};
-use imap_proto::types::{Metadata, Capability};
+use imap::extensions::metadata::{get_metadata, set_metadata};
+pub use imap::extensions::metadata::MetadataDepth;
+pub use imap_proto::types::{Metadata, Capability};
 
 const DC_IMAP_SEEN: usize = 0x0001;
 const DC_REGENERATE: usize = 0x01;
@@ -1774,7 +1775,7 @@ impl Imap {
     where
         S: std::fmt::Debug,
     {
-        info!(context, 0, "get metadata: \"{:?}\", \"{:?}\"", mbox, key);
+        info!(context, 0, "get metadata: {:?}, {:?}", mbox, key);
 
         if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
             Ok(session.get_metadata(mbox, key, depth, max_size)?)
@@ -1792,7 +1793,7 @@ impl Imap {
     where
         S: AsRef<str> + std::fmt::Debug,
     {
-        info!(context, 0, "set metadata: \"{:?}\", \"{:?}\"", mbox, keyval);
+        info!(context, 0, "set metadata: {:?}, {:?}", mbox, keyval);
 
         if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
             Ok(session.set_metadata(mbox, keyval)?)
