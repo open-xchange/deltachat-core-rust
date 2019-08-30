@@ -253,6 +253,7 @@ pub unsafe extern "C" fn dc_set_coi_message_filter(
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_webpush_supported(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
+
     (*context).get_webpush_config().is_some() as libc::c_int
 }
 
@@ -261,6 +262,7 @@ pub unsafe extern "C" fn dc_get_webpush_vapid_key(
     context: *mut dc_context_t,
 ) -> *mut libc::c_char {
     assert!(!context.is_null());
+
     if let Some(WebPushConfig { vapid: Some(v) }) = (*context).get_webpush_config() {
         v.strdup()
     } else {
@@ -268,6 +270,37 @@ pub unsafe extern "C" fn dc_get_webpush_vapid_key(
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn dc_subscribe_webpush(
+    context: *mut dc_context_t,
+    uid: *const libc::c_char,
+    json: *const libc::c_char,
+) -> libc::c_int {
+    assert!(!context.is_null());
+    assert!(!uid.is_null());
+
+    let uid = dc_tools::as_str(uid);
+    let json = dc_tools::as_opt_str(json);
+    match (*context).subscribe_webpush(uid, json) {
+        Ok(_) => 1,
+        Err(e) => {
+            error!(*context, 0, "Can't (un)subscribe to WebPush: {}", e);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_webpush_subscription(
+    context: *mut dc_context_t,
+    uid: *const libc::c_char,
+) -> *mut libc::c_char {
+    assert!(!context.is_null());
+    assert!(!uid.is_null());
+
+    let uid = dc_tools::as_str(uid);
+    strdup_opt((*context).get_webpush_subscription(uid).unwrap_or(None))
+}
 #[no_mangle]
 pub unsafe extern "C" fn dc_get_version_str() -> *mut libc::c_char {
     context::dc_get_version_str()
