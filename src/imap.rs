@@ -690,32 +690,36 @@ impl Imap {
             for meta in metadata {
                 match meta.entry.as_str() {
                     "/private/vendor/vendor.dovecot/coi/config/mailbox-root" => {
-                        if coi.is_some() {
-                            coi.as_mut().unwrap().mailbox_root = meta.value.to_string();
+                        if coi.is_some() && meta.value.is_some() {
+                            coi.as_mut().unwrap().mailbox_root = meta.value.unwrap().to_string();
                         }
                     }
                     "/private/vendor/vendor.dovecot/coi/config/enabled" => {
-                        if coi.is_some() {
-                            coi.as_mut().unwrap().enabled = meta.value == "yes";
+                        if coi.is_some() && meta.value.is_some() {
+                            coi.as_mut().unwrap().enabled = meta.value.unwrap() == "yes";
                         }
                     }
                     "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
-                        if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.as_str()) {
-                            if let Some(ref mut c) = coi {
-                                c.message_filter = message_filter;
+                        if meta.value.is_some() {
+                            if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.unwrap().as_str()) {
+                                if let Some(ref mut c) = coi {
+                                    c.message_filter = message_filter;
+                                }
                             }
                         }
                     }
                     "/private/vendor/vendor.dovecot/webpush/vapid" => {
                         if webpush.is_some() {
-                            webpush.as_mut().unwrap().vapid = Some(meta.value.to_string());
+                            webpush.as_mut().unwrap().vapid = meta.value.map(|s| s.to_string());
                         }
                     }
                     _ => {
-                        info!(
-                            context,
-                            0, "Unknown metadata: {} = {}", meta.entry, meta.value
-                        );
+                        if meta.value.is_some() {
+                            info!(
+                                context,
+                                0, "Unknown metadata: {} = {}", meta.entry, meta.value.unwrap()
+                            );
+                        }
                     }
                 }
             }
@@ -1818,7 +1822,7 @@ impl Imap {
             "",
             &[Metadata {
                 entry: COI_METADATA_ENABLED.into(),
-                value: enabled.into(),
+                value: Some(enabled.into()), // TODO: use enabled: bool, and None/Some("yes")
             }],
         )
     }
@@ -1841,7 +1845,7 @@ impl Imap {
             "",
             &[Metadata {
                 entry: COI_METADATA_MESSAGE_FILTER.into(),
-                value: filter_mode.to_string(),
+                value: Some(filter_mode.to_string()),
             }],
         )
     }
@@ -1860,8 +1864,10 @@ impl Imap {
         for meta in metadata {
             match meta.entry.as_str() {
                 "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
-                    if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.as_str()) {
-                        return Ok(message_filter);
+                    if meta.value.is_some() {
+                        if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.unwrap().as_str()) {
+                            return Ok(message_filter);
+                        }
                     }
                 }
                 _ => {}
