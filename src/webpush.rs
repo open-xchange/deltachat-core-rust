@@ -1,4 +1,6 @@
 use crate::context::*;
+use crate::error::Result;
+use crate::imap::*;
 
 #[derive(Clone)]
 pub struct WebPushConfig {
@@ -11,8 +13,39 @@ impl Default for WebPushConfig {
     }
 }
 
+const SUBSCRIPTIONS: &str = "/private/vendor/vendor.dovecot/webpush/subscriptions/";
+
 impl Context {
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
         self.inbox.read().unwrap().get_webpush_config()
+    }
+    pub fn subscribe_webpush(&self, uid: &str, json: Option<&str>) -> Result<()> {
+        self.inbox.read().unwrap().set_metadata(
+            self,
+            "",
+            &[Metadata {
+                entry: [SUBSCRIPTIONS, uid].concat(),
+                value: json.unwrap_or("NIL").into(),
+            }],
+        )
+    }
+    pub fn get_webpush_subscription(&self, uid: &str) -> Result<Option<String>> {
+        let res = self.inbox.read().unwrap().get_metadata(
+            self,
+            "",
+            &[&[SUBSCRIPTIONS, uid].concat()],
+            MetadataDepth::Zero,
+            None,
+        );
+        Ok(res?.first().map(|m| m.value.clone()))
+    }
+    pub fn list_webpush_subscriptions(&self) -> Result<Vec<Metadata>> {
+        self.inbox.read().unwrap().get_metadata(
+            self,
+            "",
+            &[&SUBSCRIPTIONS[..SUBSCRIPTIONS.len() - 1]],
+            MetadataDepth::One,
+            None,
+        )
     }
 }

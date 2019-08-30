@@ -446,6 +446,8 @@ int             dc_is_coi_supported          (dc_context_t*);
 int             dc_is_coi_enabled            (dc_context_t*);
 int             dc_is_webpush_supported      (dc_context_t*);
 char*           dc_get_webpush_vapid_key     (dc_context_t*);
+int             dc_subscribe_webpush         (dc_context_t*, const char* uid, const char* json);
+char*           dc_get_webpush_subscription  (dc_context_t*, const char* uid);
 
 // connect
 
