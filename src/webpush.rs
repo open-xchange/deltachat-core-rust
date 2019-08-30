@@ -25,7 +25,7 @@ impl Context {
             "",
             &[Metadata {
                 entry: [SUBSCRIPTIONS, uid].concat(),
-                value: json.unwrap_or("NIL").into(),
+                value: json.map(|s| s.into()),
             }],
         )
     }
@@ -37,7 +37,7 @@ impl Context {
             MetadataDepth::Zero,
             None,
         );
-        Ok(res?.first().map(|m| m.value.clone()))
+        Ok(res?.first().and_then(|m| m.value.clone()))
     }
     pub fn list_webpush_subscriptions(&self) -> Result<Vec<Metadata>> {
         self.inbox.read().unwrap().get_metadata(
