@@ -63,6 +63,7 @@ pub enum Config {
     SysVersion,
     #[strum(serialize = "sys.msgsize_max_recommended")]
     SysMsgsizeMaxRecommended,
+    ChatMode,
     #[strum(serialize = "sys.config_keys")]
     SysConfigKeys,
 }

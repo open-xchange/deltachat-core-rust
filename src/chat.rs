@@ -306,6 +306,7 @@ impl<'a> Chat<'a> {
             if let Some(from) = context.sql.get_config(context, "configured_addr") {
                 let from_c = CString::yolo(from);
                 new_rfc724_mid = dc_create_outgoing_rfc724_mid(
+                    context,
                     if self.typ == Chattype::Group || self.typ == Chattype::VerifiedGroup {
                         self.grpid.strdup()
                     } else {
@@ -1952,6 +1953,7 @@ pub unsafe fn get_chat_id_by_grpid(
 pub fn add_device_msg(context: &Context, chat_id: u32, text: impl AsRef<str>) {
     let rfc724_mid = unsafe {
         dc_create_outgoing_rfc724_mid(
+            context,
             ptr::null(),
             b"@device\x00" as *const u8 as *const libc::c_char,
         )
