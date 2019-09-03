@@ -142,26 +142,23 @@ class Account(object):
         res = lib.dc_get_webpush_vapid_key(self._dc_context)
         return None if res == ffi.NULL else from_dc_charpointer(res)
 
-    def subscribe_webpush(self, uid, data):
+    def subscribe_webpush(self, uid, data, id):
         """ subscribe for or unsubscribe from WebPush
         :param uid: unique subscription ID, between 10 and 36 alphanumeric characters
         :param data: subscription data as a dict to subscribe or None to unsubscribe
-        :return: True on success, False otherwise
+        :param id: request number which can be used to associate the status event with this call
         """
         js = None if data is None else json.dumps(data, ensure_ascii=False,
                                                   allow_nan=False)
-        return lib.dc_subscribe_webpush(self._dc_context, uid.encode("utf8"),
-                                        js.encode("utf8")) == 1
+        lib.dc_subscribe_webpush(self._dc_context, uid.encode("utf8"),
+                                 js.encode("utf8"), id)
 
-    def get_webpush_subscription(self, uid):
+    def get_webpush_subscription(self, uid, id):
         """ returns the data of an existing WebPush subscription
         :param uid: unique ID of the subscription to retrieve
-        :return: subscription data as a dict
-                 or None if a subscription with the specified ID is not found
+        :param id: request number which can be used to associate the status event with this call
         """
-        js = lib.dc_get_webpush_subscription(self._dc_context,
-                                             uid.encode("utf8"))
-        return None if js == ffi.NULL else json.loads(from_dc_charpointer(js))
+        lib.dc_get_webpush_subscription(self._dc_context, uid.encode("utf8"), id)
 
     def get_infostring(self):
         """ return info of the configured account. """
