@@ -55,7 +55,6 @@ pub unsafe extern "C" fn dc_context_new(
 pub unsafe extern "C" fn dc_context_unref(context: *mut dc_context_t) {
     assert!(!context.is_null());
     let context = &mut *context;
-    context::dc_close(context);
     Box::from_raw(context);
 }
 
