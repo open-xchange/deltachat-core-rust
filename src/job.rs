@@ -289,11 +289,14 @@ impl Job {
             }).collect();
             let inbox = context.inbox.read().unwrap();
             match inbox.set_metadata(context, "", &meta) {
-                Ok(_) => context.call_cb(Event::SET_METADATA_DONE,
-                                         self.foreign_id as uintptr_t, 0),
-                Err(e) => context.call_cb(Event::ERROR,
-                                          self.foreign_id as uintptr_t,
-                                          e.to_string().as_ptr() as uintptr_t),
+                Ok(_) => {
+                    context.call_cb(Event::SET_METADATA_DONE,
+                                    self.foreign_id as uintptr_t, 0);
+                },
+                Err(e) => {
+                    error!(context, self.foreign_id,
+                           "Cannot set metadata: {}", e);
+                },
             };
         }
     }
@@ -310,7 +313,7 @@ impl Job {
                         if meta.entry == key {
                             (true, meta.value.clone())
                         } else {
-                            (false, Some(format!("Invalid path in GETMETADATA response. expected: {}, got: {}",
+                            (false, Some(format!("Invalid path in GETMETADATA response. Expected: {}, got: {}",
                                                  key, meta.entry)))
                         }
                     } else {
@@ -322,6 +325,7 @@ impl Job {
         } else {
             (false, Some("Missing subscription ID".into()))
         };
+        let text = text.map(|s| std::ffi::CString::new(s).unwrap());
         context.call_cb(
             if success { Event::WEBPUSH_SUBSCRIPTION } else { Event::ERROR },
             self.foreign_id as uintptr_t,
