@@ -155,11 +155,12 @@ pub fn escape_param(s: &str) -> String {
 pub fn unescape_param(s: &str) -> String {
     lazy_static! { static ref RE: Regex = Regex::new(r"\\[nrse\\]").unwrap(); }
     RE.replace_all(s, |c: &Captures| match &c[0] {
-        "n" => "\n",
-        "r" => "\r",
-        "s" => " ",
-        "e" => "=",
-        _ => "",
+        "\\n" => "\n",
+        "\\r" => "\r",
+        "\\s" => " ",
+        "\\e" => "=",
+        "\\\\" => "\\",
+        _ => unreachable!(),
     }).to_string()
 }
 
@@ -306,7 +307,10 @@ mod tests {
 
     #[test]
     fn test_unescape_param() {
+        assert_eq!(unescape_param("\\n"), "\n");
+        assert_eq!(unescape_param("\\\\"), "\\");
+        assert_eq!(unescape_param("\\a\\"), "\\a\\");
         assert_eq!(unescape_param("test\\skey\\evalue\\\\s"), "test key=value\\s");
-        assert_eq!(unescape_param("test key=value\\x"), "test key=valuex");
+        assert_eq!(unescape_param("test key=value\\x"), "test key=value\\x");
     }
 }
