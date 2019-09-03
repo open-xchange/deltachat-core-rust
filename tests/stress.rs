@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 use std::ffi::CString;
 
-use mmime::mailimf_types::*;
 use tempfile::{tempdir, TempDir};
 
 use deltachat::chat::{self, Chat};
@@ -12,7 +11,6 @@ use deltachat::constants::*;
 use deltachat::contact::*;
 use deltachat::context::*;
 use deltachat::dc_imex::*;
-use deltachat::dc_mimeparser::*;
 use deltachat::dc_tools::*;
 use deltachat::key::*;
 use deltachat::keyring::*;
@@ -651,37 +649,6 @@ unsafe fn create_test_context() -> TestContext {
         dbfile.display()
     );
     TestContext { ctx: ctx, dir: dir }
-}
-
-#[test]
-fn test_dc_mimeparser_with_context() {
-    unsafe {
-        let context = create_test_context();
-
-        let mut mimeparser = dc_mimeparser_new(&context.ctx);
-        let raw: *const libc::c_char =
-        b"Content-Type: multipart/mixed; boundary=\"==break==\";\nSubject: outer-subject\nX-Special-A: special-a\nFoo: Bar\nChat-Version: 0.0\n\n--==break==\nContent-Type: text/plain; protected-headers=\"v1\";\nSubject: inner-subject\nX-Special-B: special-b\nFoo: Xy\nChat-Version: 1.0\n\ntest1\n\n--==break==--\n\n\x00"
-            as *const u8 as *const libc::c_char;
-
-        dc_mimeparser_parse(&mut mimeparser, raw, strlen(raw));
-        assert_eq!(
-            as_str(mimeparser.subject as *const libc::c_char),
-            "inner-subject",
-        );
-
-        let mut of: *mut mailimf_optional_field =
-            dc_mimeparser_lookup_optional_field(&mimeparser, "X-Special-A");
-        assert_eq!(as_str((*of).fld_value as *const libc::c_char), "special-a",);
-
-        of = dc_mimeparser_lookup_optional_field(&mimeparser, "Foo");
-        assert_eq!(as_str((*of).fld_value as *const libc::c_char), "Bar",);
-
-        of = dc_mimeparser_lookup_optional_field(&mimeparser, "Chat-Version");
-        assert_eq!(as_str((*of).fld_value as *const libc::c_char), "1.0",);
-        assert_eq!(mimeparser.parts.len(), 1);
-
-        dc_mimeparser_unref(&mut mimeparser);
-    }
 }
 
 #[test]

@@ -856,7 +856,7 @@ pub unsafe extern "C" fn dc_delete_msgs(
 ) {
     assert!(!context.is_null());
     assert!(!msg_ids.is_null());
-    assert!(msg_cnt > 0);
+    assert!(msg_cnt >= 0);
     let context = &*context;
 
     message::dc_delete_msgs(context, msg_ids, msg_cnt)
@@ -871,7 +871,7 @@ pub unsafe extern "C" fn dc_forward_msgs(
 ) {
     assert!(!context.is_null());
     assert!(!msg_ids.is_null());
-    assert!(msg_cnt > 0);
+    assert!(msg_cnt >= 0);
     assert!(chat_id > constants::DC_CHAT_ID_LAST_SPECIAL as u32);
     let context = &*context;
 
@@ -894,7 +894,7 @@ pub unsafe extern "C" fn dc_markseen_msgs(
 ) {
     assert!(!context.is_null());
     assert!(!msg_ids.is_null());
-    assert!(msg_cnt > 0);
+    assert!(msg_cnt >= 0);
     let context = &*context;
 
     message::dc_markseen_msgs(context, msg_ids, msg_cnt as usize);
@@ -909,7 +909,7 @@ pub unsafe extern "C" fn dc_star_msgs(
 ) {
     assert!(!context.is_null());
     assert!(!msg_ids.is_null());
-    assert!(msg_cnt > 0);
+    assert!(msg_cnt >= 0);
 
     let context = &*context;
 
@@ -1178,7 +1178,7 @@ pub unsafe extern "C" fn dc_send_locations_to_chat(
     assert!(!context.is_null());
     let context = &*context;
 
-    dc_location::dc_send_locations_to_chat(context, chat_id, seconds as i64)
+    location::send_locations_to_chat(context, chat_id, seconds as i64)
 }
 
 #[no_mangle]
@@ -1189,7 +1189,7 @@ pub unsafe extern "C" fn dc_is_sending_locations_to_chat(
     assert!(!context.is_null());
     let context = &*context;
 
-    dc_location::dc_is_sending_locations_to_chat(context, chat_id) as libc::c_int
+    location::is_sending_locations_to_chat(context, chat_id) as libc::c_int
 }
 
 #[no_mangle]
@@ -1202,7 +1202,7 @@ pub unsafe extern "C" fn dc_set_location(
     assert!(!context.is_null());
     let context = &*context;
 
-    dc_location::dc_set_location(context, latitude, longitude, accuracy)
+    location::set(context, latitude, longitude, accuracy)
 }
 
 #[no_mangle]
@@ -1216,7 +1216,7 @@ pub unsafe extern "C" fn dc_get_locations(
     assert!(!context.is_null());
     let context = &*context;
 
-    let res = dc_location::dc_get_locations(
+    let res = location::get_range(
         context,
         chat_id,
         contact_id,
@@ -1231,7 +1231,7 @@ pub unsafe extern "C" fn dc_delete_all_locations(context: *mut dc_context_t) {
     assert!(!context.is_null());
     let context = &*context;
 
-    dc_location::dc_delete_all_locations(context);
+    location::delete_all(context).log_err(context, "Failed to delete locations");
 }
 
 // dc_array_t

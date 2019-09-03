@@ -14,7 +14,6 @@ use crate::chat::{self, Chat};
 use crate::constants::*;
 use crate::contact::*;
 use crate::context::Context;
-use crate::dc_location::*;
 use crate::dc_mimeparser::*;
 use crate::dc_move::*;
 use crate::dc_securejoin::*;
@@ -22,6 +21,7 @@ use crate::dc_strencode::*;
 use crate::dc_tools::*;
 use crate::error::Result;
 use crate::job::*;
+use crate::location;
 use crate::message::*;
 use crate::param::*;
 use crate::peerstate::*;
@@ -56,8 +56,8 @@ pub unsafe fn dc_receive_imf(
     // we use mailmime_parse() through dc_mimeparser (both call mailimf_struct_multiple_parse()
     // somewhen, I did not found out anything that speaks against this approach yet)
 
-    let mut mime_parser = dc_mimeparser_new(context);
-    dc_mimeparser_parse(&mut mime_parser, imf_raw_not_terminated, imf_raw_bytes);
+    let body = std::slice::from_raw_parts(imf_raw_not_terminated as *const u8, imf_raw_bytes);
+    let mut mime_parser = dc_mimeparser_parse(context, body);
 
     if mime_parser.header.is_empty() {
         // Error - even adding an empty record won't help as we do not know the message ID
@@ -362,7 +362,7 @@ unsafe fn add_parts(
     }
 
     // 1 or 0 for yes/no
-    msgrmsg = mime_parser.is_send_by_messenger;
+    msgrmsg = mime_parser.is_send_by_messenger as _;
     if msgrmsg == 0 && 0 != dc_is_reply_to_messenger_message(context, mime_parser) {
         // 2=no, but is reply to messenger message
         msgrmsg = 2;
@@ -445,7 +445,7 @@ unsafe fn add_parts(
 
         if *chat_id == 0 {
             // check if the message belongs to a mailing list
-            if 0 != dc_mimeparser_is_mailinglist_message(mime_parser) {
+            if dc_mimeparser_is_mailinglist_message(mime_parser) {
                 *chat_id = 3;
                 info!(
                     context,
@@ -630,21 +630,18 @@ unsafe fn add_parts(
                         continue;
                     }
 
-                    if !mime_parser.location_kml.is_none()
-                        && icnt == 1
-                        && !part.msg.is_null()
-                        && (strcmp(
-                            part.msg,
-                            b"-location-\x00" as *const u8 as *const libc::c_char,
-                        ) == 0
-                            || *part.msg.offset(0) as libc::c_int == 0)
-                    {
-                        *hidden = 1;
-                        if state == MessageState::InFresh {
-                            state = MessageState::InNoticed;
+                    if let Some(ref msg) = part.msg {
+                        if !mime_parser.location_kml.is_none()
+                            && icnt == 1
+                            && (msg == "-location-" || msg.is_empty())
+                        {
+                            *hidden = 1;
+                            if state == MessageState::InFresh {
+                                state = MessageState::InNoticed;
+                            }
                         }
                     }
-                    if part.type_0 == Viewtype::Text as i32 {
+                    if part.type_0 == Viewtype::Text {
                         txt_raw = dc_mprintf(
                             b"%s\n\n%s\x00" as *const u8 as *const libc::c_char,
                             if !mime_parser.subject.is_null() {
@@ -673,11 +670,7 @@ unsafe fn add_parts(
                         part.type_0,
                         state,
                         msgrmsg,
-                        if !part.msg.is_null() {
-                            as_str(part.msg)
-                        } else {
-                            ""
-                        },
+                        part.msg.as_ref().map_or("", String::as_str),
                         // txt_raw might contain invalid utf8
                         if !txt_raw.is_null() {
                             to_string_lossy(txt_raw)
@@ -938,36 +931,34 @@ unsafe fn save_locations(
     let mut send_event = false;
 
     if !mime_parser.message_kml.is_none() && chat_id > DC_CHAT_ID_LAST_SPECIAL as libc::c_uint {
-        let newest_location_id: uint32_t = dc_save_locations(
-            context,
-            chat_id,
-            from_id,
-            &mime_parser.message_kml.as_ref().unwrap().locations,
-            1,
-        );
+        let locations = &mime_parser.message_kml.as_ref().unwrap().locations;
+        let newest_location_id =
+            location::save(context, chat_id, from_id, locations, 1).unwrap_or_default();
         if 0 != newest_location_id && 0 == hidden {
-            dc_set_msg_location_id(context, insert_msg_id, newest_location_id);
-            location_id_written = true;
-            send_event = true;
+            if location::set_msg_location_id(context, insert_msg_id, newest_location_id).is_ok() {
+                location_id_written = true;
+                send_event = true;
+            }
         }
     }
 
     if !mime_parser.location_kml.is_none() && chat_id > DC_CHAT_ID_LAST_SPECIAL as libc::c_uint {
-        if !mime_parser.location_kml.as_ref().unwrap().addr.is_null() {
+        if let Some(ref addr) = mime_parser.location_kml.as_ref().unwrap().addr {
             if let Ok(contact) = Contact::get_by_id(context, from_id) {
                 if !contact.get_addr().is_empty()
-                    && contact.get_addr().to_lowercase()
-                        == as_str(mime_parser.location_kml.as_ref().unwrap().addr).to_lowercase()
+                    && contact.get_addr().to_lowercase() == addr.to_lowercase()
                 {
-                    let newest_location_id = dc_save_locations(
-                        context,
-                        chat_id,
-                        from_id,
-                        &mime_parser.location_kml.as_ref().unwrap().locations,
-                        0,
-                    );
+                    let locations = &mime_parser.location_kml.as_ref().unwrap().locations;
+                    let newest_location_id =
+                        location::save(context, chat_id, from_id, locations, 0).unwrap_or_default();
                     if newest_location_id != 0 && hidden == 0 && !location_id_written {
-                        dc_set_msg_location_id(context, insert_msg_id, newest_location_id);
+                        if let Err(err) = location::set_msg_location_id(
+                            context,
+                            insert_msg_id,
+                            newest_location_id,
+                        ) {
+                            error!(context, 0, "Failed to set msg_location_id: {:?}", err);
+                        }
                     }
                     send_event = true;
                 }
@@ -1260,7 +1251,7 @@ unsafe fn create_or_lookup_group(
         .get_config(context, "configured_addr")
         .unwrap_or_default();
     if chat_id == 0
-            && 0 == dc_mimeparser_is_mailinglist_message(mime_parser)
+            && !dc_mimeparser_is_mailinglist_message(mime_parser)
             && !grpid.is_empty()
             && !grpname.is_null()
             // otherwise, a pending "quit" message may pop up
@@ -1352,7 +1343,7 @@ unsafe fn create_or_lookup_group(
             ok = 1
         } else {
             for part in &mut mime_parser.parts {
-                if part.type_0 == 20 {
+                if part.type_0 == Viewtype::Image {
                     grpimage = part
                         .param
                         .get(Param::File)
@@ -1435,7 +1426,7 @@ unsafe fn create_or_lookup_group(
 
     // check the number of receivers -
     // the only critical situation is if the user hits "Reply" instead of "Reply all" in a non-messenger-client */
-    if to_ids_cnt == 1 && mime_parser.is_send_by_messenger == 0 {
+    if to_ids_cnt == 1 && !mime_parser.is_send_by_messenger {
         let is_contact_cnt = chat::get_chat_contact_cnt(context, chat_id);
         if is_contact_cnt > 3 {
             // to_ids_cnt==1 may be "From: A, To: B, SELF" as SELF is not counted in to_ids_cnt.
@@ -1495,7 +1486,7 @@ unsafe fn create_or_lookup_adhoc_group(
     };
 
     // build member list from the given ids
-    if to_ids.is_empty() || 0 != dc_mimeparser_is_mailinglist_message(mime_parser) {
+    if to_ids.is_empty() || dc_mimeparser_is_mailinglist_message(mime_parser) {
         // too few contacts or a mailinglist
         cleanup(
             grpname,
@@ -1862,9 +1853,8 @@ unsafe fn set_better_msg<T: AsRef<str>>(mime_parser: &mut dc_mimeparser_t, bette
     let msg = better_msg.as_ref();
     if msg.len() > 0 && !mime_parser.parts.is_empty() {
         let part = &mut mime_parser.parts[0];
-        if (*part).type_0 == 10 {
-            free(part.msg as *mut libc::c_void);
-            part.msg = msg.strdup();
+        if (*part).type_0 == Viewtype::Text {
+            part.msg = Some(msg.to_string());
         }
     };
 }

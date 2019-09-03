@@ -9,6 +9,7 @@ use chrono::{Local, TimeZone};
 use mmime::mailimf_types::*;
 use rand::{thread_rng, Rng};
 
+use crate::config::Config;
 use crate::context::Context;
 use crate::error::Error;
 use crate::types::*;
@@ -355,33 +356,6 @@ unsafe fn dc_utf8_strnlen(s: *const libc::c_char, n: size_t) -> size_t {
     j
 }
 
-/* split string into lines*/
-pub unsafe fn dc_split_into_lines(buf_terminated: *const libc::c_char) -> Vec<*mut libc::c_char> {
-    let mut lines = Vec::new();
-    let mut line_chars = 0;
-    let mut p1: *const libc::c_char = buf_terminated;
-    let mut line_start: *const libc::c_char = p1;
-    while 0 != *p1 {
-        if *p1 as libc::c_int == '\n' as i32 {
-            lines.push(strndup(line_start, line_chars));
-            p1 = p1.offset(1isize);
-            line_start = p1;
-            line_chars = 0;
-        } else {
-            p1 = p1.offset(1isize);
-            line_chars += 1;
-        }
-    }
-    lines.push(strndup(line_start, line_chars));
-    lines
-}
-
-pub unsafe fn dc_free_splitted_lines(lines: Vec<*mut libc::c_char>) {
-    for s in lines {
-        free(s as *mut libc::c_void);
-    }
-}
-
 pub unsafe fn dc_str_from_clist(
     list: *const clist,
     delimiter: *const libc::c_char,
@@ -644,6 +618,7 @@ pub unsafe fn dc_create_incoming_rfc724_mid(
 }
 
 pub unsafe fn dc_create_outgoing_rfc724_mid(
+    context: &Context,
     grpid: *const libc::c_char,
     from_addr: *const libc::c_char,
 ) -> *mut libc::c_char {
@@ -654,25 +629,51 @@ pub unsafe fn dc_create_outgoing_rfc724_mid(
     let mut rand1: *mut libc::c_char = ptr::null_mut();
     let rand2: *mut libc::c_char = dc_create_id().strdup();
     let ret: *mut libc::c_char;
+    let chatconf: Option<String>;
+    let chatpfx_enabled: bool;
     let mut at_hostname: *const libc::c_char = strchr(from_addr, '@' as i32);
     if at_hostname.is_null() {
         at_hostname = b"@nohost\x00" as *const u8 as *const libc::c_char
     }
+    chatconf = context.get_config (Config :: ChatMode);
+    if chatconf.is_none() {
+        chatpfx_enabled = false;
+    } else {
+        if chatconf == Some("1".to_string()) {chatpfx_enabled = true;} else {chatpfx_enabled = false;}
+    }
     if !grpid.is_null() {
-        ret = dc_mprintf(
-            b"Gr.%s.%s%s\x00" as *const u8 as *const libc::c_char,
-            grpid,
-            rand2,
-            at_hostname,
-        )
+        if chatpfx_enabled {
+            ret = dc_mprintf(
+                b"chat$group.%s.%s%s\x00" as *const u8 as *const libc::c_char,
+                grpid,
+                rand2,
+                at_hostname,
+            )
+        } else {
+            ret = dc_mprintf(
+                b"Gr.%s.%s%s\x00" as *const u8 as *const libc::c_char,
+                grpid,
+                rand2,
+                at_hostname,
+            )
+        }
     } else {
         rand1 = dc_create_id().strdup();
-        ret = dc_mprintf(
-            b"Mr.%s.%s%s\x00" as *const u8 as *const libc::c_char,
-            rand1,
-            rand2,
-            at_hostname,
-        )
+        if chatpfx_enabled {
+            ret = dc_mprintf(
+                b"chat$%s.%s%s\x00" as *const u8 as *const libc::c_char,
+                rand1,
+                rand2,
+                at_hostname,
+            )
+        } else {
+            ret = dc_mprintf(
+                b"Mr.%s.%s%s\x00" as *const u8 as *const libc::c_char,
+                rand1,
+                rand2,
+                at_hostname,
+            )
+        }
     }
     free(rand1 as *mut libc::c_void);
     free(rand2 as *mut libc::c_void);
@@ -695,20 +696,17 @@ pub unsafe fn dc_create_outgoing_rfc724_mid(
 /// assert_eq!(grpid, Some("12345678901"));
 /// ```
 pub fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
-    if mid.len() < 9 || !mid.starts_with("Gr.") {
-        return None;
+    if mid.len() < 9 {return None;}
+    let mut split = mid.splitn(3, '.');    
+    match (split.next(), split.next(), split.next()) {
+        (Some("Gr"), Some(oldgrpid), Some(_rest)) if oldgrpid.len() == 11 || oldgrpid.len() == 16 => {
+            return Some(oldgrpid);
+        },
+        (Some("chat$group"), Some(newgrpid), Some(_rest)) if newgrpid.len() >= 12 => {
+            return Some(newgrpid);
+        },
+        _ => return None,
     }
-
-    if let Some(mid_without_offset) = mid.get(3..) {
-        if let Some(grpid_len) = mid_without_offset.find('.') {
-            /* strict length comparison, the 'Gr.' magic is weak enough */
-            if grpid_len == 11 || grpid_len == 16 {
-                return Some(mid_without_offset.get(0..grpid_len).unwrap());
-            }
-        }
-    }
-
-    None
 }
 
 pub unsafe fn dc_extract_grpid_from_rfc724_mid_list(list: *const clist) -> *mut libc::c_char {
@@ -1859,26 +1857,72 @@ mod tests {
     }
 
     #[test]
-    fn test_dc_extract_grpid_from_rfc724_mid() {
-        // Should return None if we pass invalid mid
+    fn test_dc_extract_grpid_from_rfc724_mid_with_too_short_input() {
         let mid = "foobar";
         let grpid = dc_extract_grpid_from_rfc724_mid(mid);
         assert_eq!(grpid, None);
+    }
 
-        // Should return None if grpid has a length which is not 11 or 16
+    #[test]
+    fn test_dc_extract_grpid_from_rfc724_mid_with_unknown_prefix() {
+        let mid = "foo.12345678901.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, None);
+        let mid = "foo$123456789012.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, None);
+        let mid = "foo.1234567890123456.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, None);
+    }
+
+    #[test]
+    fn test_dc_extract_old_grpid_from_rfc724_mid_with_too_short_grpid() {
         let mid = "Gr.12345678.morerandom@domain.de";
         let grpid = dc_extract_grpid_from_rfc724_mid(mid);
         assert_eq!(grpid, None);
+    }
 
-        // Should return extracted grpid for grpid with length of 11
+    #[test]
+    fn test_dc_extract_old_grpid_from_rfc724_mid_with_acceptable_len11_grpid() {
         let mid = "Gr.12345678901.morerandom@domain.de";
         let grpid = dc_extract_grpid_from_rfc724_mid(mid);
         assert_eq!(grpid, Some("12345678901"));
+    }
 
-        // Should return extracted grpid for grpid with length of 11
+    #[test]
+    fn test_dc_extract_old_grpid_from_rfc724_mid_with_wrongsized_len12_grpid() {
+        let mid = "Gr.123456789012.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, None);
+    }
+
+   #[test]
+    fn test_dc_extract_old_grpid_from_rfc724_mid_with_acceptable_len16_grpid() {
         let mid = "Gr.1234567890123456.morerandom@domain.de";
         let grpid = dc_extract_grpid_from_rfc724_mid(mid);
         assert_eq!(grpid, Some("1234567890123456"));
+    }
+
+    #[test]
+    fn test_dc_extract_new_grpid_from_rfc724_mid_with_too_short_grpid() {
+        let mid = "chat$group.12345678901.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, None);
+    }
+
+    #[test]
+    fn test_dc_extract_new_grpid_from_rfc724_mid_with_acceptable_len12_grpid() {
+        let mid = "chat$group.123456789012.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, Some("123456789012"));
+    }
+
+   #[test]
+    fn test_dc_extract_new_grpid_from_rfc724_mid_with_acceptable_len13_grpid() {
+        let mid = "chat$group.1234567890123.morerandom@domain.de";
+        let grpid = dc_extract_grpid_from_rfc724_mid(mid);
+        assert_eq!(grpid, Some("1234567890123"));
     }
 
     #[test]
