@@ -681,6 +681,69 @@ pub unsafe fn dc_create_outgoing_rfc724_mid(
     ret
 }
 
+/// Strip off `prefix` from `s` and return the remaining string if `s` starts with `prefix`.  If
+/// string `s` does not start with `prefix`, return None.
+///
+/// # Examples
+/// ```rust
+/// use deltachat::dc_tools::split_prefix;
+///
+/// let grp_id = "Gr.12345678901.morerandom@domain.de";
+/// assert_eq!(split_prefix(grp_id, "Gr."), Some("12345678901.morerandom@domain.de"));
+/// assert_eq!(split_prefix(grp_id, "chat$group."), None);
+/// ```
+pub fn split_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.starts_with(prefix) {
+        s.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn test_split_prefix() {
+    assert_eq!(split_prefix("", "Gr."), None);
+    assert_eq!(split_prefix("Gr", "Gr."), None);
+    assert_eq!(split_prefix("_Gr.", "Gr."), None);
+    assert_eq!(split_prefix("Gr.", "Gr."), Some(""));
+    assert_eq!(split_prefix("Gr.following", "Gr."), Some("following"));
+    assert_eq!(split_prefix("Gr.Gr.", "Gr."), Some("Gr."));
+}
+
+/// Splits a string `s` into two parts at `delimiter`.
+///
+/// # Examples
+/// ```rust
+/// use deltachat::dc_tools::split2;
+///
+/// assert_eq!(split2("abc.def", "."), Some(("abc", "def")));
+/// assert_eq!(split2("abc.", "."), Some(("abc", "")));
+/// ```
+pub fn split2<'a>(s: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
+    let mut iter = s.splitn(2, delimiter);
+    if let Some(first) = iter.next() {
+        if let Some(second) = iter.next() {
+            assert!(iter.next().is_none());
+            return Some((first, second));
+        }
+    }
+    None
+}
+
+#[test]
+fn test_split2() {
+    assert_eq!(split2("", "."), None);
+    assert_eq!(split2("abc", "."), None);
+    assert_eq!(split2(".", "."), Some(("", "")));
+    assert_eq!(split2(".b", "."), Some(("", "b")));
+    assert_eq!(split2("a.", "."), Some(("a", "")));
+    assert_eq!(split2("a.b", "."), Some(("a", "b")));
+    assert_eq!(split2("a.b.c", "."), Some(("a", "b.c")));
+}
+
+const OLD_GROUP_ID_PREFIX: &str = "Gr.";
+const NEW_GROUP_ID_PREFIX: &str = "chat$group.";
+
 /// Extract the group id (grpid) from a message id (mid)
 ///
 /// # Arguments
@@ -696,17 +759,25 @@ pub unsafe fn dc_create_outgoing_rfc724_mid(
 /// assert_eq!(grpid, Some("12345678901"));
 /// ```
 pub fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
-    if mid.len() < 9 {return None;}
-    let mut split = mid.splitn(3, '.');    
-    match (split.next(), split.next(), split.next()) {
-        (Some("Gr"), Some(oldgrpid), Some(_rest)) if oldgrpid.len() == 11 || oldgrpid.len() == 16 => {
-            return Some(oldgrpid);
-        },
-        (Some("chat$group"), Some(newgrpid), Some(_rest)) if newgrpid.len() >= 12 => {
-            return Some(newgrpid);
-        },
-        _ => return None,
+    if mid.len() < 9 {
+        return None;
     }
+
+    if let Some(suffix) = split_prefix(mid, NEW_GROUP_ID_PREFIX) {
+        return suffix
+            .split('.')
+            .next()
+            .filter(|new_grpid| new_grpid.len() >= 12);
+    }
+
+    if let Some(suffix) = split_prefix(mid, OLD_GROUP_ID_PREFIX) {
+        return suffix
+            .split('.')
+            .next()
+            .filter(|old_grpid| old_grpid.len() == 11 || old_grpid.len() == 16);
+    }
+
+    None
 }
 
 pub unsafe fn dc_extract_grpid_from_rfc724_mid_list(list: *const clist) -> *mut libc::c_char {
