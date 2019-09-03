@@ -4,7 +4,7 @@ use crate::configure::*;
 use crate::context::Context;
 use crate::imap::Imap;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum JobThreadKind {
     SentBox,
     MoveBox,
@@ -121,14 +121,14 @@ impl JobThread {
             JobThreadKind::SentBox => "configured_sentbox_folder",
             JobThreadKind::MoveBox => "configured_mvbox_folder",
         };
-        {
-            let arc = context.configured_mvbox_folder_override.clone();
-            let mutex_guard = arc.lock().unwrap();
-            if let Some(ref mvbox_folder_override) = *mutex_guard {
-                return Some(mvbox_folder_override.into());
+        if self.job_thread_kind == JobThreadKind::MoveBox {
+            if let Some(config) = context.get_coi_config() {
+                if config.is_server_side_move_active() {
+                    return Some(config.get_coi_chats_folder());
+                }
             }
         }
- 
+
         if let Some(mvbox_name) = context.sql.get_config(context, folder_config_name) {
             Some(mvbox_name)
         } else {

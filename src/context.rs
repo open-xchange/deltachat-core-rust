@@ -1,5 +1,4 @@
-use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Condvar, Mutex, RwLock};
-
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use crate::chat::*;
 use crate::constants::*;
 use crate::contact::*;
@@ -44,10 +43,6 @@ pub struct Context {
     /// Mutex to avoid generating the key for the user more than once.
     pub generating_key_mutex: Mutex<()>,
     pub webpush_config: Option<WebPushConfig>,
-
-    is_coi_enabled: AtomicBool,
-
-    pub configured_mvbox_folder_override: Arc<Mutex<Option<String>>>, 
 }
 
 unsafe impl std::marker::Send for Context {}
@@ -86,29 +81,32 @@ impl Context {
         }
     }
 
-    pub fn set_coi_enabled(&self, value: bool) {
-        self.is_coi_enabled.store(value, Ordering::Release);
-    }
-
-    pub fn is_coi_enabled(&self) -> bool {
-        self.is_coi_enabled.load(Ordering::Acquire)
-    }
-
-    /// DCC will move messages depending on two settings:
+    /// DCC will move messages when the two following conditions are met:
     ///
-    /// * `mvbox_move` has to be enabled (set to "1") in the config.
+    /// * `CoiConfig.is_server_side_move_active()` must return false. 
     ///
-    /// * `Context::is_coi_enabled` MUST NOT be set to `true`. In case a COI enabled server is
-    ///   detected, deltachat is disabled from moving messages automatically.
+    /// * Setting `mvbox_move` has to be enabled (set to "1") in the config.
     pub fn is_deltachat_move_enabled(&self) -> bool {
-        if self.is_coi_enabled() {
-            false
-        } else {
-            self.sql
-                .get_config_int(self, "mvbox_move")
-                .map(|value| value == 1)
-                .unwrap_or(true)
+        if let Some(config) = self.get_coi_config() {
+            if config.is_server_side_move_active() {
+                return false;
+            }
         }
+        self.sql
+            .get_config_int(self, "mvbox_move")
+            .map(|value| value == 1)
+            .unwrap_or(true)
+    }
+
+    pub fn get_inbox_watch_folder(&self) -> String {
+        self.get_coi_config().and_then(|config| {
+            if config.enabled && config.message_filter == CoiMessageFilter::Active {
+                // The COI/Chats folder is our "INBOX" when COI message filter is active.
+                Some(config.get_coi_chats_folder())
+            } else {
+                None
+            }
+        }).unwrap_or_else(|| "INBOX".into())
     }
 }
 
@@ -195,9 +193,6 @@ pub fn dc_context_new(
         perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
         generating_key_mutex: Mutex::new(()),
         webpush_config: None,
-        is_coi_enabled: AtomicBool::new(false),
-
-        configured_mvbox_folder_override: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -596,19 +591,15 @@ pub fn dc_is_sentbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
 }
 
 pub(crate) fn dc_is_mvbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
-    let arc = context.configured_mvbox_folder_override.clone();
-    let mutex_guard = arc.lock().unwrap();
-    if let Some(ref mvbox_folder_override) = *mutex_guard {
-        mvbox_folder_override == folder_name.as_ref()
-    } else {
-        // no override
+    if context.is_deltachat_move_enabled() {
         let mvbox_name = context.sql.get_config(context, "configured_mvbox_folder");
 
-        if let Some(name) = mvbox_name {
-            name == folder_name.as_ref()
-        } else {
-            false
-        }
+        mvbox_name.map(|name| name == folder_name.as_ref())
+                  .unwrap_or(false)
+    } else {
+        context.get_coi_config()
+               .map(|config| config.get_coi_chats_folder() == folder_name.as_ref())
+               .unwrap_or(false)
     }
 }
 

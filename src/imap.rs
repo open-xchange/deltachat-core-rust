@@ -46,7 +46,7 @@ pub struct Imap {
     receive_imf: dc_receive_imf_t,
 
     session: Arc<Mutex<Option<Session>>>,
-    stream: Arc<RwLock<Option<net::TcpStream>>>,
+    pub stream: Arc<RwLock<Option<net::TcpStream>>>,
     connected: Arc<Mutex<bool>>,
 
     should_reconnect: AtomicBool,
@@ -355,6 +355,16 @@ pub struct CoiConfig {
     pub enabled: bool,
     pub mailbox_root: String,
     pub message_filter: CoiMessageFilter,
+}
+
+impl CoiConfig {
+    pub fn is_server_side_move_active(&self) -> bool {
+        self.enabled && self.message_filter != CoiMessageFilter::None
+    }
+
+    pub fn get_coi_chats_folder(&self) -> String {
+        format!("{}/Chats", self.mailbox_root) // XXX: Use IMAP delimiter
+    }
 }
 
 impl Default for CoiConfig {

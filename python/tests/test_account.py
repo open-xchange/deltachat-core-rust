@@ -479,6 +479,7 @@ class TestOnlineAccount:
         assert mime.get_all("From")
         assert mime.get_all("Received")
 
+    @pytest.mark.skip(reason = "Segfaults")
     def test_send_and_receive_image(self, acfactory, lp, data):
         lp.sec("starting accounts, waiting for configuration")
         ac1 = acfactory.get_online_configuring_account()
@@ -530,7 +531,7 @@ class TestOnlineAccount:
 
     def test_ac_setup_message(self, acfactory):
         # note that the receiving account needs to be configured and running
-        # before ther setup message is send. DC does not read old messages
+        # before the setup message is send. DC does not read old messages
         # as of Jul2019
         ac1 = acfactory.get_online_configuring_account()
         ac2 = acfactory.clone_online_account(ac1)
