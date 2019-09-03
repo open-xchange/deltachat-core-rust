@@ -67,7 +67,6 @@ pub unsafe extern "C" fn dc_context_unref(context: *mut dc_context_t) {
     }
 
     let context = &mut *context;
-    context::dc_close(context);
     Box::from_raw(context);
 }
 
