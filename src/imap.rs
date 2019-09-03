@@ -540,9 +540,8 @@ impl Imap {
             context,
             0, "IMAP unsetup_handle step 1 (closing down stream)."
         );
-        let stream = self.stream.write().unwrap().take();
-        if stream.is_some() {
-            match stream.unwrap().shutdown(net::Shutdown::Both) {
+        if let Some(stream) = self.stream.write().unwrap().take() {
+            match stream.shutdown(net::Shutdown::Both) {
                 Ok(_) => {}
                 Err(err) => {
                     eprintln!("failed to shutdown connection: {:?}", err);
@@ -553,9 +552,9 @@ impl Imap {
             context,
             0, "IMAP unsetup_handle step 2 (acquiring session.lock)"
         );
-        let session = self.session.lock().unwrap().take();
-        if session.is_some() {
-            match session.unwrap().close() {
+
+        if let Some(mut session) = self.session.lock().unwrap().take() {
+            match session.close() {
                 Ok(_) => {}
                 Err(err) => {
                     eprintln!("failed to close connection: {:?}", err);
@@ -626,9 +625,11 @@ impl Imap {
             }
             let can_idle = caps.has(&Capability::Atom("IDLE"));
             let has_xlist = caps.has(&Capability::Atom("XLIST"));
-            let (coi, webpush) = self.query_metadata(context,
-                                                     caps.has(&Capability::Atom("COI")),
-                                                     caps.has(&Capability::Atom("WEBPUSH")));
+            let (coi, webpush) = self.query_metadata(
+                context,
+                caps.has(&Capability::Atom("COI")),
+                caps.has(&Capability::Atom("WEBPUSH")),
+            );
 
             let caps_list = caps
                 .iter()
@@ -1282,7 +1283,6 @@ impl Imap {
     }
 
     pub fn interrupt_idle(&self) {
-        // interrupt idle
         let &(ref lock, ref cvar) = &*self.watch.clone();
         let mut watch = lock.lock().unwrap();
 
