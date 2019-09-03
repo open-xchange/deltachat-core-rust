@@ -231,8 +231,8 @@ int             dc_is_coi_supported          (dc_context_t*);
 int             dc_is_coi_enabled            (dc_context_t*);
 int             dc_is_webpush_supported      (dc_context_t*);
 char*           dc_get_webpush_vapid_key     (dc_context_t*);
-int             dc_subscribe_webpush         (dc_context_t*, const char* uid, const char* json);
-char*           dc_get_webpush_subscription  (dc_context_t*, const char* uid);
+void            dc_subscribe_webpush         (dc_context_t*, const char* uid, const char* json, int id);
+void            dc_get_webpush_subscription  (dc_context_t*, const char* uid, int id);
 
 // connect
 void            dc_configure                 (dc_context_t*);
@@ -1073,6 +1073,27 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t*);
 #define DC_EVENT_SECUREJOIN_JOINER_PROGRESS       2061
 
 
+/**
+ * Status of a SETMETADATA call triggered by COI or WebPush functions.
+ * In case of errors, the ERROR event with the request ID in data1 is sent instead.
+ * @param data1 (int) ID of the request, can be used to match responses to requests.
+ * @param data2 (int) 0
+ * @return 0
+ */
+#define DC_EVENT_SET_METADATA_DONE                2070
+
+
+/**
+ * Result of a dc_get_webpush_subscription() call.
+ * In case of errors, the ERROR event with the request ID in data1 is sent instead.
+ * @param data1 (int) ID of the request, can be used to match responses to requests.
+ * @param data2 (const char*) JSON string returned by the server, or NULL if no subscription found.
+ *     Must not be free()'d or modified and is valid only until the callback returns.
+ * @return 0
+ */
+#define DC_EVENT_WEBPUSH_SUBSCRIPTION             2071
+
+
 // the following events are functions that should be provided by the frontends
 
 
@@ -1100,7 +1121,7 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t*);
 #define DC_ERROR_SELF_NOT_IN_GROUP   1    // deprecated
 #define DC_STR_SELFNOTINGRP          21   // deprecated
 #define DC_EVENT_DATA1_IS_STRING(e)  ((e)==DC_EVENT_IMEX_FILE_WRITTEN || (e)==DC_EVENT_FILE_COPIED)
-#define DC_EVENT_DATA2_IS_STRING(e)  ((e)>=100 && (e)<=499)
+#define DC_EVENT_DATA2_IS_STRING(e)  ((e)>=100 && (e)<=499 || (e)==DC_EVENT_WEBPUSH_SUBSCRIPTION)
 #define DC_EVENT_RETURNS_INT(e)      ((e)==DC_EVENT_IS_OFFLINE)
 #define DC_EVENT_RETURNS_STRING(e)   ((e)==DC_EVENT_GET_STRING)
 

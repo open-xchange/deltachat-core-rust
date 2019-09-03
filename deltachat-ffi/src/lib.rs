@@ -275,32 +275,29 @@ pub unsafe extern "C" fn dc_subscribe_webpush(
     context: *mut dc_context_t,
     uid: *const libc::c_char,
     json: *const libc::c_char,
-) -> libc::c_int {
+    id: libc::c_int,
+) {
     assert!(!context.is_null());
     assert!(!uid.is_null());
 
     let uid = dc_tools::as_str(uid);
     let json = dc_tools::as_opt_str(json);
-    match (*context).subscribe_webpush(uid, json) {
-        Ok(_) => 1,
-        Err(e) => {
-            error!(*context, 0, "Can't (un)subscribe to WebPush: {}", e);
-            0
-        }
-    }
+    (*context).subscribe_webpush(uid, json, id);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_get_webpush_subscription(
     context: *mut dc_context_t,
     uid: *const libc::c_char,
-) -> *mut libc::c_char {
+    id: libc::c_int,
+) {
     assert!(!context.is_null());
     assert!(!uid.is_null());
 
     let uid = dc_tools::as_str(uid);
-    strdup_opt((*context).get_webpush_subscription(uid).unwrap_or(None))
+    (*context).get_webpush_subscription(uid, id);
 }
+
 #[no_mangle]
 pub unsafe extern "C" fn dc_get_version_str() -> *mut libc::c_char {
     context::dc_get_version_str()

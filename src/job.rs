@@ -39,6 +39,8 @@ pub enum Action {
     MarkseenMdnOnImap = 120,
     MarkseenMsgOnImap = 130,
     MoveMsg = 200,
+    SetMetadata = 300,
+    GetWebPushSubscription = 310,
     ConfigureImap = 900,
     ImexImap = 910, // ... high priority
 
@@ -61,6 +63,8 @@ impl From<Action> for Thread {
             MarkseenMdnOnImap => Thread::Imap,
             MarkseenMsgOnImap => Thread::Imap,
             MoveMsg => Thread::Imap,
+            SetMetadata => Thread::Imap,
+            GetWebPushSubscription => Thread::Imap,
             ConfigureImap => Thread::Imap,
             ImexImap => Thread::Imap,
 
@@ -276,6 +280,55 @@ impl Job {
                 }
             }
         }
+    }
+
+    #[allow(non_snake_case)]
+    fn do_DC_JOB_SET_METADATA(&self, context: &Context) {
+        if let Some(meta) = self.param.get_map(Param::Metadata) {
+            let meta: Vec<Metadata> = meta.iter().map(|(k, v)| Metadata {
+                entry: k.to_string(),
+                value: if v.is_empty() { None } else { Some(v.to_string()) },
+            }).collect();
+            let inbox = context.inbox.read().unwrap();
+            match inbox.set_metadata(context, "", &meta) {
+                Ok(_) => context.call_cb(Event::SET_METADATA_DONE,
+                                         self.foreign_id as uintptr_t, 0),
+                Err(e) => context.call_cb(Event::ERROR,
+                                          self.foreign_id as uintptr_t,
+                                          e.to_string().as_ptr() as uintptr_t),
+            };
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn do_DC_JOB_GET_WEBPUSH_SUBSCRIPTION(&self, context: &Context) {
+        let (success, text) = if let Some(uid) = self.param.get(Param::Metadata) {
+            let inbox = context.inbox.read().unwrap();
+            let key = [crate::webpush::SUBSCRIPTIONS, uid].concat();
+            let res = inbox.get_metadata(context, "", &[&key], MetadataDepth::Zero, None);
+            match res {
+                Ok(meta) => {
+                    if let Some(meta) = meta.first() {
+                        if meta.entry == key {
+                            (true, meta.value.clone())
+                        } else {
+                            (false, Some(format!("Invalid path in GETMETADATA response. expected: {}, got: {}",
+                                                 key, meta.entry)))
+                        }
+                    } else {
+                        (true, None)
+                    }
+                },
+                Err(e) => (false, Some(e.to_string())),
+            }
+        } else {
+            (false, Some("Missing subscription ID".into()))
+        };
+        context.call_cb(
+            if success { Event::WEBPUSH_SUBSCRIPTION } else { Event::ERROR },
+            self.foreign_id as uintptr_t,
+            text.map(|s| s.as_ptr()).unwrap_or(ptr::null()) as uintptr_t
+        );
     }
 
     #[allow(non_snake_case)]
@@ -873,6 +926,8 @@ fn job_perform(context: &Context, thread: Thread, probe_network: bool) {
                 Action::MarkseenMsgOnImap => job.do_DC_JOB_MARKSEEN_MSG_ON_IMAP(context),
                 Action::MarkseenMdnOnImap => job.do_DC_JOB_MARKSEEN_MDN_ON_IMAP(context),
                 Action::MoveMsg => job.do_DC_JOB_MOVE_MSG(context),
+                Action::SetMetadata => job.do_DC_JOB_SET_METADATA(context),
+                Action::GetWebPushSubscription => job.do_DC_JOB_GET_WEBPUSH_SUBSCRIPTION(context),
                 Action::SendMdn => job.do_DC_JOB_SEND(context),
                 Action::ConfigureImap => unsafe { dc_job_do_DC_JOB_CONFIGURE_IMAP(context, &job) },
                 Action::ImexImap => unsafe { dc_job_do_DC_JOB_IMEX_IMAP(context, &job) },

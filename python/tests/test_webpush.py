@@ -1,3 +1,4 @@
+import json
 from conftest import wait_configuration_progress
 
 def test_webpush_capability(acfactory):
@@ -18,13 +19,34 @@ def test_webpush_subscription(acfactory):
 
     uid = "test_webpush_subscription"
     sub = {
-        "client": "DCC integration test",
-        "device": "PC",
-        "msgtype": "chat"
+        "client": "Test Client",
+        "device": "Test Phone",
+        "msgtype": "chat",
+        "resource": {
+            "endpoint": "http://localhost/",
+            "keys": {
+                "p256dh": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "auth": "1234567890123456"
+            }
+        }
     }
 
-    assert ac.subscribe_webpush(uid, sub)
-    assert ac.get_webpush_subscription(uid) == sub
+    ac.subscribe_webpush(uid, sub, 1)
+    ev1 = ac._evlogger.get_matching("DC_EVENT_SET_METADATA_DONE")
+    assert ev1[1] == 1
+    assert ev1[2] == 0
 
-    assert ac.subscribe_webpush(uid, None)
-    assert ac.get_webpush_subscription(uid) is None
+    ac.get_webpush_subscription(uid, 2)
+    ev2 = ac._evlogger.get_matching("DC_EVENT_WEBPUSH_SUBSCRIPTION")
+    assert ev2[1] == 2
+    assert json.loads(ev2[2]) == sub
+
+    ac.subscribe_webpush(uid, None, 3)
+    ev3 = ac._evlogger.get_matching("DC_EVENT_SET_METADATA_DONE")
+    assert ev3[1] == 3
+    assert ev3[2] == 0
+
+    ac.get_webpush_subscription(uid, 4)
+    ev4 = ac._evlogger.get_matching("DC_EVENT_WEBPUSH_SUBSCRIPTION")
+    assert ev4[1] == 4
+    assert ev4[2] == 0
