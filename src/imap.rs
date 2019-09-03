@@ -540,8 +540,7 @@ impl Imap {
             context,
             0, "IMAP unsetup_handle step 1 (closing down stream)."
         );
-        let stream = self.stream.write().unwrap().take();
-        if let Some(stream) = stream {
+        if let Some(stream) = self.stream.write().unwrap().take() {
             if let Err(err) = stream.shutdown(net::Shutdown::Both) {
                 eprintln!("failed to shutdown connection: {:?}", err);
             }
@@ -620,9 +619,11 @@ impl Imap {
             }
             let can_idle = caps.has(&Capability::Atom("IDLE"));
             let has_xlist = caps.has(&Capability::Atom("XLIST"));
-            let (coi, webpush) = self.query_metadata(context,
-                                                     caps.has(&Capability::Atom("COI")),
-                                                     caps.has(&Capability::Atom("WEBPUSH")));
+            let (coi, webpush) = self.query_metadata(
+                context,
+                caps.has(&Capability::Atom("COI")),
+                caps.has(&Capability::Atom("WEBPUSH")),
+            );
 
             let caps_list = caps
                 .iter()
@@ -1276,7 +1277,6 @@ impl Imap {
     }
 
     pub fn interrupt_idle(&self) {
-        // interrupt idle
         let &(ref lock, ref cvar) = &*self.watch.clone();
         let mut watch = lock.lock().unwrap();
 
