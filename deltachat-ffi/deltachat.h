@@ -448,6 +448,7 @@ int             dc_is_webpush_supported      (dc_context_t*);
 char*           dc_get_webpush_vapid_key     (dc_context_t*);
 void            dc_subscribe_webpush         (dc_context_t*, const char* uid, const char* json, int id);
 void            dc_get_webpush_subscription  (dc_context_t*, const char* uid, int id);
+void            dc_validate_webpush          (dc_context_t*, const char* uid, const char* msg, int id);
 
 // connect
 

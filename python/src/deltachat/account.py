@@ -160,6 +160,15 @@ class Account(object):
         """
         lib.dc_get_webpush_subscription(self._dc_context, uid.encode("utf8"), id)
 
+    def validate_webpush(self, uid, msg, id):
+        """ subscribe for or unsubscribe from WebPush
+        :param uid: unique subscription ID, between 10 and 36 alphanumeric characters
+        :param msg: payload of the validation message as a string
+        :param id: request number which can be used to associate the status event with this call
+        """
+        lib.dc_validate_webpush(self._dc_context, uid.encode("utf8"),
+                                msg.encode("utf8"), id)
+
     def get_infostring(self):
         """ return info of the configured account. """
         self.check_is_configured()
