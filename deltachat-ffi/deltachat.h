@@ -444,6 +444,9 @@ char*           dc_get_oauth2_url            (dc_context_t* context, const char*
 
 int             dc_is_coi_supported          (dc_context_t*);
 int             dc_is_coi_enabled            (dc_context_t*);
+int             dc_set_coi_enabled           (dc_context_t*, int enable);
+int             dc_set_coi_message_filter    (dc_context_t*, const char* mode);
+char*           dc_get_coi_message_filter    (dc_context_t*);
 int             dc_is_webpush_supported      (dc_context_t*);
 char*           dc_get_webpush_vapid_key     (dc_context_t*);
 void            dc_subscribe_webpush         (dc_context_t*, const char* uid, const char* json, int id);

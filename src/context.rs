@@ -85,12 +85,10 @@ impl Context {
         }
     }
 
-    pub fn set_coi_enabled(&self, value: bool) {
-        self.is_coi_enabled.store(value, Ordering::Release);
-    }
-
-    pub fn is_coi_enabled(&self) -> bool {
-        self.is_coi_enabled.load(Ordering::Acquire)
+    /// If this method is called with `is_coi_enabled` set to true,
+    /// this will stop Deltachat from moving messages.
+    pub fn override_deltachat_move(&self, is_coi_enabled: bool) {
+        self.is_coi_enabled.store(is_coi_enabled, Ordering::Release);
     }
 
     /// DCC will move messages depending on two settings:
@@ -100,7 +98,7 @@ impl Context {
     /// * `Context::is_coi_enabled` MUST NOT be set to `true`. In case a COI enabled server is
     ///   detected, deltachat is disabled from moving messages automatically.
     pub fn is_deltachat_move_enabled(&self) -> bool {
-        if self.is_coi_enabled() {
+        if self.is_coi_enabled.load(Ordering::Acquire) {
             false
         } else {
             self.sql

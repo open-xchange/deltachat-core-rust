@@ -1081,13 +1081,13 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             }
         }
         "coi-enable" => {
-            match context.enable_coi() {
+            match context.set_coi_enabled(true) {
                 Ok(_) => println!("Command succeeded"),
                 Err(e) => bail!("Command failed. {:?}", e)
             }
         }
         "coi-disable" => {
-            match context.disable_coi() {
+            match context.set_coi_enabled(false) {
                 Ok(_) => println!("Command succeeded"),
                 Err(e) => bail!("Command failed. {:?}", e)
             }

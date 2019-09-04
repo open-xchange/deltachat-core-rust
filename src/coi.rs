@@ -8,12 +8,8 @@ impl Context {
         self.inbox.read().unwrap().get_coi_config()
     }
 
-    pub fn enable_coi(&self) -> Result<(), Error> {
-        self.inbox.write().unwrap().enable_coi(self)
-    }
-
-    pub fn disable_coi(&self) -> Result<(), Error> {
-        self.inbox.write().unwrap().disable_coi(self)
+    pub fn set_coi_enabled(&self, enable: bool) -> Result<(), Error> {
+        self.inbox.write().unwrap().set_coi_enabled(self, enable)
     }
 
     pub fn set_coi_message_filter(&self, message_filter: CoiMessageFilter) -> Result<(), Error> {

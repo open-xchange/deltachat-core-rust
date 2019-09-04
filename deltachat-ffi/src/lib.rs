@@ -247,26 +247,18 @@ pub unsafe extern "C" fn dc_get_coi_message_filter(
         .unwrap_or(std::ptr::null_mut())
 }
 
-/// Enables COI.
+/// Enable (enable != 0) or disable (enable == 0) COI.
+///
 /// The caller should reconnect after calling this method!
 #[no_mangle]
-pub unsafe extern "C" fn dc_enable_coi(context: *mut dc_context_t) -> libc::c_int {
+pub unsafe extern "C" fn dc_set_coi_enabled(context: *mut dc_context_t, enable: libc::c_int) -> libc::c_int {
     assert!(!context.is_null());
-    (*context)
-        .enable_coi()
-        .map(|_| 1 /* success */)
-        .unwrap_or(0 /* error */)
-}
-
-/// Disables COI.
-/// The caller should reconnect after calling this method!
-#[no_mangle]
-pub unsafe extern "C" fn dc_disable_coi(context: *mut dc_context_t) -> libc::c_int {
-    assert!(!context.is_null());
-    (*context)
-        .disable_coi()
-        .map(|_| 1 /* success */)
-        .unwrap_or(0 /* error */)
+    if (enable != 0) { 
+        (*context).enable_coi()
+    } else {
+        (*context).disable_coi() {
+    }.map(|_| 1 /* success */)
+     .unwrap_or(0 /* error */)
 }
 
 /// mode: "none" | "active" | "seen"

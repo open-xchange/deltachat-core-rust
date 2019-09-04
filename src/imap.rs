@@ -1810,23 +1810,18 @@ impl Imap {
         self.config.read().unwrap().coi.clone()
     }
 
-    fn toggle_coi(&self, context: &Context, enabled: &str) -> crate::error::Result<()> {
+    pub fn set_coi_enabled(&self, context: &Context, enable: bool) -> crate::error::Result<()> {
+        // XXX: Change Some("no") to None once the Dovecot server has fixed the bug.
+        let value: Option<String> = if enable { Some("yes".into()) } else { Some("no".into()) };
+
         self.set_metadata(
             context,
             "",
             &[Metadata {
                 entry: COI_METADATA_ENABLED.into(),
-                value: Some(enabled.into()), // TODO: use enabled: bool, and None/Some("yes")
+                value
             }],
         )
-    }
-
-    pub fn enable_coi(&self, context: &Context) -> crate::error::Result<()> {
-        self.toggle_coi(context, "yes")
-    }
-
-    pub fn disable_coi(&self, context: &Context) -> crate::error::Result<()> {
-        self.toggle_coi(context, "no")
     }
 
     pub fn set_coi_message_filter(

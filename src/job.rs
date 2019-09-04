@@ -1117,7 +1117,7 @@ fn connect_to_inbox(context: &Context, inbox: &Imap) -> libc::c_int {
         let deltachat_mode = determine_deltachat_mode(&context.get_coi_config());
 
         // If `coi_enabled` is true, this will disable Deltachat from moving messages.
-        context.set_coi_enabled(deltachat_mode.coi_enabled);
+        context.override_deltachat_move(deltachat_mode.coi_enabled);
         inbox.set_watch_folder(deltachat_mode.inbox_folder);
         let arc = context.configured_mvbox_folder_override.clone();
         let mut mutex_guard = arc.lock().unwrap();
