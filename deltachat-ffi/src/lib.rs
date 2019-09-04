@@ -298,6 +298,22 @@ pub unsafe extern "C" fn dc_get_webpush_subscription(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_validate_webpush(
+    context: *mut dc_context_t,
+    uid: *const libc::c_char,
+    msg: *const libc::c_char,
+    id: libc::c_int,
+) {
+    assert!(!context.is_null());
+    assert!(!uid.is_null());
+    assert!(!msg.is_null());
+
+    let uid = dc_tools::as_str(uid);
+    let msg = dc_tools::as_str(msg);
+    (*context).validate_webpush(uid, msg, id);
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_get_version_str() -> *mut libc::c_char {
     context::dc_get_version_str()
 }

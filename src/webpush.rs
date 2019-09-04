@@ -19,6 +19,7 @@ impl Context {
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
         self.inbox.read().unwrap().get_webpush_config()
     }
+
     pub fn subscribe_webpush(&self, uid: &str, json: Option<&str>, id: i32) {
         let mut params = Params::new();
         params.set_map(Param::Metadata,
@@ -26,9 +27,17 @@ impl Context {
                           json.map_or("", |s| s.into()))]);
         job_add(self, Action::SetMetadata, id as libc::c_int, params, 0);
     }
+
     pub fn get_webpush_subscription(&self, uid: &str, id: i32) {
         let mut params = Params::new();
         params.set(Param::Metadata, uid);
         job_add(self, Action::GetWebPushSubscription, id as libc::c_int, params, 0);
+    }
+
+    pub fn validate_webpush(&self, uid: &str, msg: &str, id: i32) {
+        let mut params = Params::new();
+        params.set_map(Param::Metadata,
+                       &[(&[SUBSCRIPTIONS, uid, "/validate"].concat(), msg)]);
+        job_add(self, Action::SetMetadata, id as libc::c_int, params, 0);
     }
 }
