@@ -1107,7 +1107,7 @@ fn determine_deltachat_mode(coi_config: &Option<CoiConfig>) -> DeltachatMode {
         }) => DeltachatMode {
             coi_enabled: true,
             inbox_folder: format!("{}/Chats", mailbox_root),
-            configured_mvbox_folder_override: Some(format!("{}/Chats", mailbox_root))},
+            configured_mvbox_folder_override: Some("INBOX".into())},
     }
 }
 
