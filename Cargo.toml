@@ -23,10 +23,9 @@ num-derive = "0.2.5"
 num-traits = "0.2.6"
 native-tls = "0.2.3"
 lettre = "0.9.0"
-imap-proto = { path = "../tokio-imap/imap-proto" }
+imap-proto = { git = "https://github.com/open-xchange/tokio-imap", branch="metadata" }
 nom = "4.0"
-# imap = { git = "https://github.com/open-xchange/rust-imap", branch="5d34ab2" }
-imap = { path = "../rust-imap" }
+imap = { git = "https://github.com/open-xchange/rust-imap", branch="metadata" }
 mmime = { git = "https://github.com/dignifiedquire/mmime", rev = "bccd2c2" }
 base64 = "0.10"
 charset = "0.1"
@@ -79,3 +78,9 @@ default = ["nightly", "ringbuf"]
 vendored = ["native-tls/vendored", "reqwest/default-tls-vendored"]
 nightly = ["pgp/nightly"]
 ringbuf = ["pgp/ringbuf"]
+
+
+
+[patch.crates-io]
+
+imap-proto = { git = "https://github.com/open-xchange/tokio-imap", branch="metadata" }
