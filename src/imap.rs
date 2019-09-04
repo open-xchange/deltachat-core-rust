@@ -32,10 +32,6 @@ const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 const FETCH_FLAGS: &str = "(FLAGS)";
 
-const COI_METADATA_ENABLED: &str = "/private/vendor/vendor.dovecot/coi/config/enabled";
-const COI_METADATA_MESSAGE_FILTER: &str =
-    "/private/vendor/vendor.dovecot/coi/config/message-filter";
-
 pub struct Imap {
     config: Arc<RwLock<ImapConfig>>,
     watch: Arc<(Mutex<bool>, Condvar)>,
@@ -1809,62 +1805,6 @@ impl Imap {
     pub fn get_coi_config(&self) -> Option<CoiConfig> {
         self.config.read().unwrap().coi.clone()
     }
-
-    pub fn set_coi_enabled(&self, context: &Context, enable: bool) -> crate::error::Result<()> {
-        // XXX: Change Some("no") to None once the Dovecot server has fixed the bug.
-        let value: Option<String> = if enable { Some("yes".into()) } else { Some("no".into()) };
-
-        self.set_metadata(
-            context,
-            "",
-            &[Metadata {
-                entry: COI_METADATA_ENABLED.into(),
-                value
-            }],
-        )
-    }
-
-    pub fn set_coi_message_filter(
-        &self,
-        context: &Context,
-        filter_mode: CoiMessageFilter,
-    ) -> crate::error::Result<()> {
-        self.set_metadata(
-            context,
-            "",
-            &[Metadata {
-                entry: COI_METADATA_MESSAGE_FILTER.into(),
-                value: Some(filter_mode.to_string()),
-            }],
-        )
-    }
-
-    pub fn get_coi_message_filter(
-        &self,
-        context: &Context
-    ) -> crate::error::Result<CoiMessageFilter> {
-        let metadata = self.get_metadata(
-            context,
-            "",
-            &[COI_METADATA_MESSAGE_FILTER.into()],
-            MetadataDepth::Zero,
-            None
-        )?;
-        for meta in metadata {
-            match meta.entry.as_str() {
-                "/private/vendor/vendor.dovecot/coi/config/message-filter" => {
-                    if meta.value.is_some() {
-                        if let Ok(message_filter) = CoiMessageFilter::from_str(meta.value.unwrap().as_str()) {
-                            return Ok(message_filter);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        return Err(format_err!("No COI message-filter metadata"));
-    }
-
 
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
         self.config.read().unwrap().webpush.clone()
