@@ -1,4 +1,5 @@
 import json
+import re
 from conftest import wait_configuration_progress
 
 def test_webpush_capability(acfactory):
@@ -11,7 +12,8 @@ def test_webpush_vapid_key(acfactory):
     ac = acfactory.get_online_configuring_account()
     wait_configuration_progress(ac, 1000)
 
-    assert ac.get_webpush_vapid_key() is not None
+    vapid = ac.get_webpush_vapid_key()
+    assert re.match(r"-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/\r\n]+={,3}\r?\n-----END PUBLIC KEY-----", vapid)
 
 def test_webpush_subscription(acfactory):
     ac = acfactory.get_online_configuring_account()
@@ -39,7 +41,7 @@ def test_webpush_subscription(acfactory):
     ac.get_webpush_subscription(uid, 2)
     ev2 = ac._evlogger.get_matching("DC_EVENT_WEBPUSH_SUBSCRIPTION")
     assert ev2[1] == 2
-    assert json.loads(ev2[2]) == sub
+    assert ev2[2] != 0 and json.loads(ev2[2]) == sub
 
     ac.subscribe_webpush(uid, None, 3)
     ev3 = ac._evlogger.get_matching("DC_EVENT_SET_METADATA_DONE")

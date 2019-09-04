@@ -13,7 +13,7 @@ impl Default for WebPushConfig {
     }
 }
 
-pub const SUBSCRIPTIONS: &str = "/private/vendor/vendor.dovecot/webpush/subscription/";
+pub const SUBSCRIPTIONS: &str = "/private/vendor/vendor.dovecot/webpush/subscriptions/";
 
 impl Context {
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
