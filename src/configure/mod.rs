@@ -5,7 +5,6 @@ use crate::context::Context;
 use crate::dc_loginparam::*;
 use crate::dc_tools::*;
 use crate::e2ee;
-use crate::filter_mode::{get_filter_mode, FilterMode};
 use crate::imap::*;
 use crate::job::*;
 use crate::oauth2::*;
