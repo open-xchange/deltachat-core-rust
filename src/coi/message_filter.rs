@@ -1,5 +1,5 @@
 use strum_macros::{AsRefStr, Display, EnumString};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, From};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
@@ -28,11 +28,22 @@ impl TryFrom<i32> for CoiMessageFilter {
     }
 }
 
+impl From<CoiMessageFilter> for i32 {
+    fn from(src: CoiMessageFilter) -> i32 {
+        match src {
+            CoiMessageFilter::None => 0,
+            CoiMessageFilter::Active => 1,
+            CoiMessageFilter::Seen => 2,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
     use std::string::ToString;
+    use std::convert::From;
 
     #[test]
     fn test_to_string() {
@@ -59,15 +70,16 @@ mod tests {
 
     #[test]
     fn test_as_int() {
-        assert_eq!(CoiMessageFilter::None   as i32, 0);
-        assert_eq!(CoiMessageFilter::Active as i32, 1);
-        assert_eq!(CoiMessageFilter::Seen   as i32, 2);
+        assert_eq!(i32::from(CoiMessageFilter::None), 0);
+        assert_eq!(i32::from(CoiMessageFilter::Active), 1);
+        assert_eq!(i32::from(CoiMessageFilter::Seen), 2);
     }
 
     #[test]
     fn test_from_int() {
-        assert_eq!(0 as CoiMessageFilter, CoiMessageFilter::None);
-        assert_eq!(1 as CoiMessageFilter, CoiMessageFilter::Active);
-        assert_eq!(2 as CoiMessageFilter, CoiMessageFilter::Seen);
+        assert_eq!(CoiMessageFilter::try_from(0i32), Ok(CoiMessageFilter::None));
+        assert_eq!(CoiMessageFilter::try_from(1i32), Ok(CoiMessageFilter::Active));
+        assert_eq!(CoiMessageFilter::try_from(2i32), Ok(CoiMessageFilter::Seen));
+        assert!(CoiMessageFilter::try_from(3i32).is_err());
     }
 }
