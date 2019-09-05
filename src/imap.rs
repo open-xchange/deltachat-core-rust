@@ -651,7 +651,9 @@ impl Imap {
         let mut webpush = None;
         if has_coi {
             keys.push("/private/vendor/vendor.dovecot/coi/config");
-            coi = Some(CoiConfig::default());
+            let mut coi_config = CoiConfig::default();
+            coi_config.imap_delimiter = self.config.read().unwrap().imap_delimiter;
+            coi = Some(coi_config);
         }
         if has_webpush {
             keys.push("/private/vendor/vendor.dovecot/webpush");

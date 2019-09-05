@@ -45,6 +45,7 @@ mod param;
 pub mod peerstate;
 pub mod pgp;
 pub mod qr;
+pub mod server_side_move;
 mod smtp;
 pub mod sql;
 mod stock;
