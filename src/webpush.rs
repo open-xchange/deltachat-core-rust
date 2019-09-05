@@ -13,7 +13,7 @@ impl Default for WebPushConfig {
     }
 }
 
-pub const SUBSCRIPTIONS: &str = "/private/vendor/vendor.dovecot/webpush/subscriptions/";
+const SUBSCRIPTIONS: &str = "/private/vendor/vendor.dovecot/webpush/subscriptions/";
 
 impl Context {
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
@@ -30,8 +30,8 @@ impl Context {
 
     pub fn get_webpush_subscription(&self, uid: &str, id: i32) {
         let mut params = Params::new();
-        params.set(Param::Metadata, uid);
-        job_add(self, Action::GetWebPushSubscription, id as libc::c_int, params, 0);
+        params.set(Param::Metadata, &[SUBSCRIPTIONS, uid].concat());
+        job_add(self, Action::GetMetadata, id as libc::c_int, params, 0);
     }
 
     pub fn validate_webpush(&self, uid: &str, msg: &str, id: i32) {

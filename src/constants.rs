@@ -452,18 +452,18 @@ pub enum Event {
     /// @return 0
     SECUREJOIN_JOINER_PROGRESS = 2061,
 
-    /// Status of a SETMETADATA call triggered by COI or WebPush functions.
+    /// Status of a SETMETADATA command triggered by COI or WebPush functions.
     /// In case of errors, the ERROR event with the request ID in data1 is sent instead.
     /// @param data1 (int) ID of the request, can be used to match responses to requests.
     /// @param data2 (int) 0
     SET_METADATA_DONE = 2070,
 
-    /// Result of a dc_get_webpush_subscription() call.
+    /// Result of a GETMETADATA command triggered by COI or WebPush functions.
     /// In case of errors, the ERROR event with the request ID in data1 is sent instead.
     /// @param data1 (int) ID of the request, can be used to match responses to requests.
     /// @param data2 (const char*) JSON string returned by the server, or NULL if no subscription found.
     ///     Must not be free()'d or modified and is valid only until the callback returns.
-    WEBPUSH_SUBSCRIPTION = 2071,
+    METADATA = 2071,
 
     // the following events are functions that should be provided by the frontends
     /// Requeste a localized string from the frontend.

@@ -125,9 +125,38 @@ class Account(object):
 
     def is_coi_supported(self):
         """ determine whether connected to a COI-compliant server
-        :return: True if COI is supported by the server
+        :return: True if COI is supported by the server, False otherwise
         """
         return lib.dc_is_coi_supported(self._dc_context) == 1
+
+    def is_coi_enabled(self):
+        """ determine whether COI is supported and enabled on the server
+        :return: True if COI is supported and enabled, False otherwise
+        """
+        return lib.dc_is_coi_enabled(self._dc_context) == 1
+
+    def set_coi_enabled(self, enable, id):
+        """ enable or disable COI on the server
+        :param enable: True to enable COI, False to disable COI
+        :param id: request number which can be used to associate the status event with this call
+        """
+        lib.dc_set_coi_enabled(self._dc_context, enable, id)
+
+    def set_coi_message_filter(self, mode, id):
+        """ configure server-side filtering of chat messages
+        :param mode: one of const.DC_COI_FILTER_{NONE|ACTIVE|SEEN}
+        :param id: request number which can be used to associate the status event with this call
+        """
+        assert mode == const.DC_COI_FILTER_NONE or\
+               mode == const.DC_COI_FILTER_ACTIVE or\
+               mode == const.DC_COI_FILTER_SEEN
+        lib.dc_set_coi_message_filter(self._dc_context, mode, id)
+
+    def get_coi_message_filter(self):
+        """ return the current mode of server-side filtering
+        :return: One of const.DC_COI_FILTER_{NONE|ACTIVE|SEEN}
+        """
+        return lib.dc_get_coi_message_filter(self._dc_context)
 
     def is_webpush_supported(self):
         """ determine whether connected to a WebPush-compliant server

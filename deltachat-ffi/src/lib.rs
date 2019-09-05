@@ -12,7 +12,7 @@ extern crate human_panic;
 extern crate num_traits;
 
 use num_traits::{FromPrimitive, ToPrimitive};
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::ptr;
 use std::str::FromStr;
 
@@ -223,61 +223,47 @@ pub unsafe extern "C" fn dc_is_coi_enabled(context: *mut dc_context_t) -> libc::
         .unwrap_or(false) as libc::c_int
 }
 
-/// Returns "none" if message filter is set to None.
-/// Returns "active" if message filter is set to Active
-/// Returns "seen" if message filter is set to Seen.
-/// Otherwise, returns NULL.
-///
-/// Caller has to free the returned string.
+/// Returns one of the DC_COI_FILTER_* values depending on the setting of the message filter.
 #[no_mangle]
 pub unsafe extern "C" fn dc_get_coi_message_filter(
     context: *mut dc_context_t,
-) -> *mut libc::c_char {
+) -> libc::c_int {
     assert!(!context.is_null());
-    (*context)
-        .get_coi_config()
-        .map(|c| {
-            match c.message_filter {
-                CoiMessageFilter::None => "none",
-                CoiMessageFilter::Active => "active",
-                CoiMessageFilter::Seen => "seen",
-            }
-            .strdup()
-        })
-        .unwrap_or(std::ptr::null_mut())
+    (*context).get_coi_config()
+        .map(|c| c.message_filter)
+        .unwrap_or(CoiMessageFilter::None) as libc::c_int
 }
 
 /// Enable (enable != 0) or disable (enable == 0) COI.
 ///
 /// The caller should reconnect after calling this method!
 #[no_mangle]
-pub unsafe extern "C" fn dc_set_coi_enabled(context: *mut dc_context_t, enable: libc::c_int) -> libc::c_int {
+pub unsafe extern "C" fn dc_set_coi_enabled(
+    context: *mut dc_context_t,
+    enable: libc::c_int,
+    id: libc::c_int,
+) {
     assert!(!context.is_null());
-    (*context).set_coi_enabled(enable != 0).map(|_| 1 /* success */).unwrap_or(0 /* error */)
+    (*context).set_coi_enabled(enable != 0, id);
 }
 
-/// mode: "none" | "active" | "seen"
+/// mode: one of the DC_COI_FILTER_* constants
+/// returns: 1 if a job was queued successfully,
+///          0 if an invalid mode value was specified.
 #[no_mangle]
 pub unsafe extern "C" fn dc_set_coi_message_filter(
     context: *mut dc_context_t,
-    mode: *const libc::c_char,
+    mode: libc::c_int,
+    id: libc::c_int,
 ) -> libc::c_int {
     assert!(!context.is_null());
 
-    let message_filter = if libc::strcmp(mode, "none\0".as_ptr() as *const libc::c_char) == 0 {
-        CoiMessageFilter::None
-    } else if libc::strcmp(mode, "active\0".as_ptr() as *const libc::c_char) == 0 {
-        CoiMessageFilter::Active
-    } else if libc::strcmp(mode, "seen\0".as_ptr() as *const libc::c_char) == 0 {
-        CoiMessageFilter::Seen
+    if let Ok(message_filter) = CoiMessageFilter::try_from(mode) {
+        (*context).set_coi_message_filter(message_filter, id);
+        1
     } else {
-        return 0; /* error */
-    };
-
-    (*context)
-        .set_coi_message_filter(message_filter)
-        .map(|_| 1 /* success */)
-        .unwrap_or(0 /* error */)
+        0
+    }
 }
 
 #[no_mangle]

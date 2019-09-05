@@ -40,7 +40,7 @@ pub enum Action {
     MarkseenMsgOnImap = 130,
     MoveMsg = 200,
     SetMetadata = 300,
-    GetWebPushSubscription = 310,
+    GetMetadata = 310,
     ConfigureImap = 900,
     ImexImap = 910, // ... high priority
 
@@ -64,7 +64,7 @@ impl From<Action> for Thread {
             MarkseenMsgOnImap => Thread::Imap,
             MoveMsg => Thread::Imap,
             SetMetadata => Thread::Imap,
-            GetWebPushSubscription => Thread::Imap,
+            GetMetadata => Thread::Imap,
             ConfigureImap => Thread::Imap,
             ImexImap => Thread::Imap,
 
@@ -302,19 +302,18 @@ impl Job {
     }
 
     #[allow(non_snake_case)]
-    fn do_DC_JOB_GET_WEBPUSH_SUBSCRIPTION(&self, context: &Context) {
-        let (success, text) = if let Some(uid) = self.param.get(Param::Metadata) {
+    fn do_DC_JOB_GET_METADATA(&self, context: &Context) {
+        let (success, text) = if let Some(path) = self.param.get(Param::Metadata) {
             let inbox = context.inbox.read().unwrap();
-            let key = [crate::webpush::SUBSCRIPTIONS, uid].concat();
-            let res = inbox.get_metadata(context, "", &[&key], MetadataDepth::Zero, None);
+            let res = inbox.get_metadata(context, "", &[path], MetadataDepth::Zero, None);
             match res {
                 Ok(meta) => {
                     if let Some(meta) = meta.first() {
-                        if meta.entry == key {
+                        if meta.entry == path {
                             (true, meta.value.clone())
                         } else {
                             (false, Some(format!("Invalid path in GETMETADATA response. Expected: {}, got: {}",
-                                                 key, meta.entry)))
+                                                 path, meta.entry)))
                         }
                     } else {
                         (true, None)
@@ -323,11 +322,11 @@ impl Job {
                 Err(e) => (false, Some(e.to_string())),
             }
         } else {
-            (false, Some("Missing subscription ID".into()))
+            (false, Some("Missing metadata path".into()))
         };
         let text = text.map(|s| std::ffi::CString::new(s).unwrap());
         context.call_cb(
-            if success { Event::WEBPUSH_SUBSCRIPTION } else { Event::ERROR },
+            if success { Event::METADATA } else { Event::ERROR },
             self.foreign_id as uintptr_t,
             text.map(|s| s.as_ptr()).unwrap_or(ptr::null()) as uintptr_t
         );
@@ -935,7 +934,7 @@ fn job_perform(context: &Context, thread: Thread, probe_network: bool) {
                 Action::MarkseenMdnOnImap => job.do_DC_JOB_MARKSEEN_MDN_ON_IMAP(context),
                 Action::MoveMsg => job.do_DC_JOB_MOVE_MSG(context),
                 Action::SetMetadata => job.do_DC_JOB_SET_METADATA(context),
-                Action::GetWebPushSubscription => job.do_DC_JOB_GET_WEBPUSH_SUBSCRIPTION(context),
+                Action::GetMetadata => job.do_DC_JOB_GET_METADATA(context),
                 Action::SendMdn => job.do_DC_JOB_SEND(context),
                 Action::ConfigureImap => unsafe { dc_job_do_DC_JOB_CONFIGURE_IMAP(context, &job) },
                 Action::ImexImap => unsafe { dc_job_do_DC_JOB_IMEX_IMAP(context, &job) },
