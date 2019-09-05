@@ -46,7 +46,7 @@ impl Context {
     }
 
     pub fn get_mvbox_folder_override(&self) -> Option<String> {
-        self.with_server_side_move_config(&|config| config.get_mvbox_folder_override())
+        self.with_server_side_move_config(|config| config.get_mvbox_folder_override())
     }
 
     /// DCC will move messages depending on two settings:
@@ -55,7 +55,7 @@ impl Context {
     ///
     /// * `server_side_move_config` has to be set to ServerSideMove::Disabled.
     pub fn is_deltachat_move_enabled(&self) -> bool {
-        if self.with_server_side_move_config(&|config| config.is_enabled()) {
+        if self.with_server_side_move_config(|config| config.is_enabled()) {
             false
         } else {
             self.sql
@@ -67,7 +67,7 @@ impl Context {
 
     /// Helper function that allows us to access the mutex protected server_side_move_configuration
     /// without having to write too verbose code.
-    pub fn with_server_side_move_config<T>(&self, cb: &impl Fn(&ServerSideMove) -> T) -> T {
+    pub fn with_server_side_move_config<T>(&self, cb: impl FnOnce(&ServerSideMove) -> T) -> T {
         let arc = self.server_side_move_config.clone();
         let ssm = arc.lock().unwrap();
         cb(&ssm)

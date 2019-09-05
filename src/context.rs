@@ -568,7 +568,7 @@ pub fn dc_is_sentbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
 
 pub(crate) fn dc_is_mvbox(context: &Context, folder_name: impl AsRef<str>) -> bool {
     let folder_name_as_ref = folder_name.as_ref();
-    if context.with_server_side_move_config(&|config| config.mvbox_folder_override_equals(folder_name_as_ref)) {
+    if context.with_server_side_move_config(|config| config.mvbox_folder_override_equals(folder_name_as_ref)) {
         true
     }
     else {
