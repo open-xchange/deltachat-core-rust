@@ -244,7 +244,6 @@ pub unsafe extern "C" fn dc_set_coi_enabled(
     id: libc::c_int,
 ) {
     assert!(!context.is_null());
-
     (*context).set_coi_enabled(enable != 0, id);
 }
 
