@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime};
 
-use crate::coi_message_filter::CoiMessageFilter;
+use crate::coi::{CoiConfig, CoiMessageFilter};
 use crate::constants::*;
 use crate::context::Context;
 use crate::dc_loginparam::*;
@@ -343,23 +343,6 @@ fn cap_to_str<'a>(cap: &'a Capability) -> &'a str {
         Capability::Imap4rev1 => "IMAP4REV1",
         Capability::Auth(s) => s,
         Capability::Atom(s) => s,
-    }
-}
-
-#[derive(Clone)]
-pub struct CoiConfig {
-    pub enabled: bool,
-    pub mailbox_root: String,
-    pub message_filter: CoiMessageFilter,
-}
-
-impl Default for CoiConfig {
-    fn default() -> Self {
-        CoiConfig {
-            enabled: false,
-            mailbox_root: "COI".into(),
-            message_filter: CoiMessageFilter::default(),
-        }
     }
 }
 

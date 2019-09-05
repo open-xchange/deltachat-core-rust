@@ -6,7 +6,7 @@ use deltachat_derive::{FromSql, ToSql};
 use rand::{thread_rng, Rng};
 
 use crate::chat;
-use crate::coi_message_filter::CoiMessageFilter;
+use crate::coi::{CoiConfig, CoiMessageFilter};
 use crate::configure::*;
 use crate::constants::*;
 use crate::context::Context;

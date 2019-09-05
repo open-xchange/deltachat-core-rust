@@ -16,7 +16,7 @@ use std::convert::{TryFrom, TryInto};
 use std::ptr;
 use std::str::FromStr;
 
-use deltachat::coi_message_filter::CoiMessageFilter;
+use deltachat::coi::CoiMessageFilter;
 use deltachat::contact::Contact;
 use deltachat::dc_tools::{as_str, dc_strdup, StrExt};
 use deltachat::webpush::WebPushConfig;

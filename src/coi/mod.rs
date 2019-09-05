@@ -1,6 +1,9 @@
-use crate::coi_message_filter::CoiMessageFilter;
+pub mod config;
+pub mod message_filter;
+
+pub use message_filter::CoiMessageFilter;
+pub use config::CoiConfig;
 use crate::context::*;
-use crate::imap::*;
 use crate::job::*;
 use crate::param::*;
 
