@@ -669,7 +669,7 @@ impl Imap {
                 match meta.entry.as_str() {
                     "/private/vendor/vendor.dovecot/coi/config/mailbox-root" => {
                         if coi.is_some() && meta.value.is_some() {
-                            coi.as_mut().unwrap().mailbox_root = meta.value.unwrap().to_string();
+                            coi.as_mut().unwrap().set_mailbox_root(&meta.value.unwrap());
                         }
                     }
                     "/private/vendor/vendor.dovecot/coi/config/enabled" => {

@@ -121,12 +121,9 @@ impl JobThread {
             JobThreadKind::SentBox => "configured_sentbox_folder",
             JobThreadKind::MoveBox => "configured_mvbox_folder",
         };
-        {
-            let arc = context.configured_mvbox_folder_override.clone();
-            let mutex_guard = arc.lock().unwrap();
-            if let Some(ref mvbox_folder_override) = *mutex_guard {
-                return Some(mvbox_folder_override.into());
-            }
+
+        if let Some(mvbox_folder_override) = context.get_mvbox_folder_override() {
+            return Some(mvbox_folder_override);
         }
  
         if let Some(mvbox_name) = context.sql.get_config(context, folder_config_name) {
