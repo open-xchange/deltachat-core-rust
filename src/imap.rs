@@ -591,7 +591,11 @@ impl Imap {
             let caps = (*self.session.lock().unwrap())
                 .as_mut()
                 .ok_or_else(|| format_err!("No session"))?
-                .capabilities()?;
+                .capabilities()
+                .or_else(|err| {
+                    info!(context, 0, "CAPABILITY command error: {}", err);
+                    Err(err)
+                })?;
             if !context.sql.is_open() {
                 warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
                 return Err(format_err!("Failed to open database"));
