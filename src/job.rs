@@ -1059,7 +1059,6 @@ fn suspend_smtp_thread(context: &Context, suspend: bool) {
 
 struct DeltachatMode {
     coi_enabled: bool,
-    inbox_folder: String,
     configured_mvbox_folder_override: Option<String>,
 }
 
@@ -1082,7 +1081,6 @@ fn determine_deltachat_mode(coi_config: &Option<CoiConfig>) -> DeltachatMode {
             ..
         }) => DeltachatMode {
             coi_enabled: false,
-            inbox_folder: "INBOX".into(),
             configured_mvbox_folder_override: None},
 
         // COI is supported and enabled, message filter is set to "seen".  The server will move the
@@ -1095,7 +1093,6 @@ fn determine_deltachat_mode(coi_config: &Option<CoiConfig>) -> DeltachatMode {
             mailbox_root
         }) => DeltachatMode {
             coi_enabled: true,
-            inbox_folder: "INBOX".into(),
             configured_mvbox_folder_override: Some(format!("{}/Chats", mailbox_root))},
 
         // Active COI message filter. The server will move messages.
@@ -1105,8 +1102,7 @@ fn determine_deltachat_mode(coi_config: &Option<CoiConfig>) -> DeltachatMode {
             mailbox_root,
         }) => DeltachatMode {
             coi_enabled: true,
-            inbox_folder: format!("{}/Chats", mailbox_root),
-            configured_mvbox_folder_override: Some("INBOX".into())},
+            configured_mvbox_folder_override: Some(format!("{}/Chats", mailbox_root))},
     }
 }
 
@@ -1117,7 +1113,7 @@ fn connect_to_inbox(context: &Context, inbox: &Imap) -> libc::c_int {
 
         // If `coi_enabled` is true, this will disable Deltachat from moving messages.
         context.override_deltachat_move(deltachat_mode.coi_enabled);
-        inbox.set_watch_folder(deltachat_mode.inbox_folder);
+        inbox.set_watch_folder("INBOX".into());
         let arc = context.configured_mvbox_folder_override.clone();
         let mut mutex_guard = arc.lock().unwrap();
         *mutex_guard = deltachat_mode.configured_mvbox_folder_override;
