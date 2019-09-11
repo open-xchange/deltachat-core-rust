@@ -20,6 +20,7 @@ use crate::param::*;
 use crate::sql;
 use crate::types::*;
 use crate::x::*;
+use crate::coi::deltachat_mode::CoiDeltachatMode;
 
 /// Thread IDs
 #[derive(Debug, Display, Copy, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
@@ -518,25 +519,26 @@ pub fn perform_imap_idle(context: &Context) {
 fn mvbox_use_network(context: &Context) -> bool {
     context
         .sql
-        .get_config_int(context, "mvbox_watch")
-        .map(|value| value == 1)
+        .get_config_bool(context, "mvbox_watch")
         .unwrap_or(true)
 }
 
 pub fn perform_mvbox_fetch(context: &Context) {
+    let use_network = mvbox_use_network(context);
     context
         .mvbox_thread
         .write()
         .unwrap()
-        .fetch(context, mvbox_use_network(context));
+        .fetch(context, use_network);
 }
 
 pub fn perform_mvbox_idle(context: &Context) {
+    let use_network = mvbox_use_network(context);
     context
         .mvbox_thread
         .read()
         .unwrap()
-        .idle(context, mvbox_use_network(context));
+        .idle(context, use_network);
 }
 
 pub fn interrupt_mvbox_idle(context: &Context) {
@@ -546,27 +548,27 @@ pub fn interrupt_mvbox_idle(context: &Context) {
 pub fn perform_sentbox_fetch(context: &Context) {
     let use_network = context
         .sql
-        .get_config_int(context, "sentbox_watch")
-        .unwrap_or_else(|| 1);
+        .get_config_bool(context, "sentbox_watch")
+        .unwrap_or(true);
 
     context
         .sentbox_thread
         .write()
         .unwrap()
-        .fetch(context, use_network == 1);
+        .fetch(context, use_network);
 }
 
 pub fn perform_sentbox_idle(context: &Context) {
     let use_network = context
         .sql
-        .get_config_int(context, "sentbox_watch")
-        .unwrap_or_else(|| 1);
+        .get_config_bool(context, "sentbox_watch")
+        .unwrap_or(true);
 
     context
         .sentbox_thread
         .read()
         .unwrap()
-        .idle(context, use_network == 1);
+        .idle(context, use_network);
 }
 
 pub fn interrupt_sentbox_idle(context: &Context) {
@@ -1035,7 +1037,7 @@ fn connect_to_inbox(context: &Context, inbox: &Imap) -> libc::c_int {
             context
                 .get_coi_config()
                 .map(|config| config.get_coi_deltachat_mode())
-                .unwrap_or_default();
+                .unwrap_or(CoiDeltachatMode::Disabled);
 
         inbox.set_watch_folder(coi_deltachat_mode.get_inbox_folder_override().unwrap_or("INBOX").into());
         context.set_coi_deltachat_mode(coi_deltachat_mode);

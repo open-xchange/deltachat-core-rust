@@ -21,20 +21,18 @@ impl CoiConfig {
     pub fn get_coi_deltachat_mode(&self) -> CoiDeltachatMode {
         if self.enabled {
             match self.message_filter {
-                CoiMessageFilter::None => CoiDeltachatMode::coi_disabled(),
-                CoiMessageFilter::Seen => CoiDeltachatMode {
-                    server_side_move_enabled: true,
-                    inbox_folder_override: Some("INBOX".to_string()),
-                    mvbox_folder_override: Some(self.coi_chats_folder.to_string()),
+                CoiMessageFilter::None => CoiDeltachatMode::Disabled,
+                CoiMessageFilter::Seen => CoiDeltachatMode::Enabled {
+                    inbox_folder_override: "INBOX".to_string(),
+                    mvbox_folder_override: self.coi_chats_folder.to_string(),
                 },
-                CoiMessageFilter::Active => CoiDeltachatMode {
-                    server_side_move_enabled: true,
-                    inbox_folder_override: Some(self.coi_chats_folder.to_string()),
-                    mvbox_folder_override: Some("INBOX".to_string()),
+                CoiMessageFilter::Active => CoiDeltachatMode::Enabled {
+                    inbox_folder_override: self.coi_chats_folder.to_string(),
+                    mvbox_folder_override: "INBOX".to_string(),
                 },
             }
         } else {
-            CoiDeltachatMode::coi_disabled()
+            CoiDeltachatMode::Disabled
         }
     }
 

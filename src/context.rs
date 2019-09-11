@@ -166,7 +166,7 @@ pub fn dc_context_new(
         perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
         generating_key_mutex: Mutex::new(()),
         webpush_config: None,
-        coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::default())),
+        coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
     }
 }
 
