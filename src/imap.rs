@@ -98,10 +98,11 @@ impl<'a> IdleHandle<'a> {
         }
     }
 
-    pub fn wait_keepalive(self) -> imap::error::Result<()> {
+    pub fn wait_interruptible(self) -> imap::error::Result<(Box<dyn FnOnce() -> imap::error::Result<()> + Send + 'a>,
+                                                            Box<dyn FnOnce() -> imap::error::Result<()>>)> {
         match self {
-            IdleHandle::Secure(i) => i.wait_keepalive(),
-            IdleHandle::Insecure(i) => i.wait_keepalive(),
+            IdleHandle::Secure(i) => i.wait_interruptible(),
+            IdleHandle::Insecure(i) => i.wait_interruptible(),
         }
     }
 }
@@ -1123,40 +1124,45 @@ impl Imap {
             return self.fake_idle(context);
         }
 
-        let session = self.session.clone();
-        let mut worker = Some({
+        let thread: imap::error::Result<_> = (|| {
             let (sender, receiver) = std::sync::mpsc::channel();
-            let v = self.watch.clone();
 
-            info!(context, 0, "IMAP-IDLE SPAWNING");
-            std::thread::spawn(move || {
-                let &(ref lock, ref cvar) = &*v;
-                if let Some(ref mut session) = &mut *session.lock().unwrap() {
-                    let mut idle = match session.idle() {
-                        Ok(idle) => idle,
-                        Err(err) => {
-                            eprintln!("failed to setup idle: {:?}", err);
-                            return;
-                        }
-                    };
+            let mut stop: Box<dyn FnOnce() -> imap::error::Result<()>> = Box::new(|| Ok(()));
+            if let Some(ref mut session) = &mut *self.session.clone().lock().unwrap() {
+                let v = self.watch.clone();
+                let mut idle = session.idle()?;
 
-                    // most servers do not allow more than ~28 minutes; stay clearly below that.
-                    // a good value that is also used by other MUAs is 23 minutes.
-                    // if needed, the ui can call dc_imap_interrupt_idle() to trigger a reconnect.
-                    idle.set_keepalive(Duration::from_secs(23 * 60));
-                    let res = idle.wait_keepalive();
+                // most servers do not allow more than ~28 minutes; stay clearly below that.
+                // a good value that is also used by other MUAs is 23 minutes.
+                // if needed, the ui can call dc_imap_interrupt_idle() to trigger a reconnect.
+                idle.set_keepalive(Duration::from_secs(23 * 60));
+
+                let (wait, stop_fn) = idle.wait_interruptible()?;
+                stop = stop_fn;
+
+                info!(context, 0, "IMAP-IDLE SPAWNING");
+                std::thread::spawn(move || {
+                    let &(ref lock, ref cvar) = &*v;
 
                     // Ignoring the error, as this happens when we try sending after the drop
-                    let _send_res = sender.send(res);
+                    let _send_res = sender.send(wait());
 
                     // Trigger condvar
                     let mut watch = lock.lock().unwrap();
                     *watch = true;
                     cvar.notify_one();
-                }
-            });
-            receiver
-        });
+                });
+            }
+
+            Ok((receiver, stop))
+        })();
+        let (worker, stop) = match thread {
+            Ok(ws) => ws,
+            Err(err) => {
+                warn!(context, 0, "failed to setup idle: {:?}", err);
+                return;
+            }
+        };
 
         let &(ref lock, ref cvar) = &*self.watch.clone();
         let mut watch = lock.lock().unwrap();
@@ -1180,20 +1186,19 @@ impl Imap {
         };
 
         loop {
-            if let Ok(res) = worker.as_ref().unwrap().try_recv() {
+            if let Ok(res) = worker.try_recv() {
                 handle_res(res);
                 break;
             } else {
                 let res = cvar.wait(watch).unwrap();
                 watch = res;
                 if *watch {
-                    if let Ok(res) = worker.as_ref().unwrap().try_recv() {
+                    if let Ok(res) = worker.try_recv() {
                         handle_res(res);
                     } else {
                         info!(context, 0, "IMAP-IDLE interrupted");
                     }
-
-                    drop(worker.take());
+                    stop();
                     break;
                 }
             }
