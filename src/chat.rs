@@ -303,17 +303,18 @@ impl<'a> Chat<'a> {
                 "Cannot send message; self not in group.",
             );
         } else {
-            if let Some(from) = context.sql.get_config(context, "configured_addr") {
-                let from_c = CString::yolo(from);
+
+            if let Some(from) = context.sql.get_config(context, "configured_addr")
+            {
                 new_rfc724_mid = dc_create_outgoing_rfc724_mid(
                     context,
                     if self.typ == Chattype::Group || self.typ == Chattype::VerifiedGroup {
-                        self.grpid.strdup()
+                        Some(self.grpid.as_ref())
                     } else {
-                        ptr::null_mut()
+                        None
                     },
-                    from_c.as_ptr(),
-                );
+                    from.as_ref(),
+                ).strdup();
 
                 if self.typ == Chattype::Single {
                     if let Some(id) = context.sql.query_row_col(
@@ -1951,13 +1952,11 @@ pub unsafe fn get_chat_id_by_grpid(
 }
 
 pub fn add_device_msg(context: &Context, chat_id: u32, text: impl AsRef<str>) {
-    let rfc724_mid = unsafe {
-        dc_create_outgoing_rfc724_mid(
+    let rfc724_mid = dc_create_outgoing_rfc724_mid(
             context,
-            ptr::null(),
-            b"@device\x00" as *const u8 as *const libc::c_char,
-        )
-    };
+            None,
+            "@device"
+        );
 
     if context.sql.execute(
         "INSERT INTO msgs (chat_id,from_id,to_id, timestamp,type,state, txt,rfc724_mid) VALUES (?,?,?, ?,?,?, ?,?);",
@@ -1969,10 +1968,9 @@ pub fn add_device_msg(context: &Context, chat_id: u32, text: impl AsRef<str>) {
             Viewtype::Text,
             MessageState::InNoticed,
             text.as_ref(),
-            as_str(rfc724_mid),
+            rfc724_mid.as_str(),
         ]
     ).is_err() {
-        unsafe { free(rfc724_mid as *mut libc::c_void) };
         return;
     }
 
@@ -1981,9 +1979,8 @@ pub fn add_device_msg(context: &Context, chat_id: u32, text: impl AsRef<str>) {
         &context.sql,
         "msgs",
         "rfc724_mid",
-        as_str(rfc724_mid),
+        rfc724_mid.as_str(),
     );
-    unsafe { free(rfc724_mid as *mut libc::c_void) };
     context.call_cb(
         Event::MSGS_CHANGED,
         chat_id as uintptr_t,

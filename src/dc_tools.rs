@@ -617,68 +617,45 @@ pub unsafe fn dc_create_incoming_rfc724_mid(
     )
 }
 
-pub unsafe fn dc_create_outgoing_rfc724_mid(
+pub fn dc_create_outgoing_rfc724_mid(
     context: &Context,
-    grpid: *const libc::c_char,
-    from_addr: *const libc::c_char,
-) -> *mut libc::c_char {
+    group_id: Option<&str>,
+    from_addr: &str,
+) -> String {
     /* Function generates a Message-ID that can be used for a new outgoing message.
     - this function is called for all outgoing messages.
     - the message ID should be globally unique
     - do not add a counter or any private data as as this may give unneeded information to the receiver	*/
-    let mut rand1: *mut libc::c_char = ptr::null_mut();
-    let rand2: *mut libc::c_char = dc_create_id().strdup();
-    let ret: *mut libc::c_char;
-    let chatconf: Option<String>;
-    let chatpfx_enabled: bool;
-    let mut at_hostname: *const libc::c_char = strchr(from_addr, '@' as i32);
-    if at_hostname.is_null() {
-        at_hostname = b"@nohost\x00" as *const u8 as *const libc::c_char
-    }
-    chatconf = context.get_config (Config :: ChatMode);
-    if chatconf.is_none() {
-        chatpfx_enabled = false;
-    } else {
-        if chatconf == Some("1".to_string()) {chatpfx_enabled = true;} else {chatpfx_enabled = false;}
-    }
-    if !grpid.is_null() {
-        if chatpfx_enabled {
-            ret = dc_mprintf(
-                b"chat$group.%s.%s%s\x00" as *const u8 as *const libc::c_char,
-                grpid,
-                rand2,
-                at_hostname,
-            )
-        } else {
-            ret = dc_mprintf(
-                b"Gr.%s.%s%s\x00" as *const u8 as *const libc::c_char,
-                grpid,
-                rand2,
-                at_hostname,
-            )
-        }
-    } else {
-        rand1 = dc_create_id().strdup();
-        if chatpfx_enabled {
-            ret = dc_mprintf(
-                b"chat$%s.%s%s\x00" as *const u8 as *const libc::c_char,
-                rand1,
-                rand2,
-                at_hostname,
-            )
-        } else {
-            ret = dc_mprintf(
-                b"Mr.%s.%s%s\x00" as *const u8 as *const libc::c_char,
-                rand1,
-                rand2,
-                at_hostname,
-            )
-        }
-    }
-    free(rand1 as *mut libc::c_void);
-    free(rand2 as *mut libc::c_void);
 
-    ret
+    let at_hostname = match from_addr.find('@') {
+        None => "@nohost",
+        Some(pos) => &from_addr[pos..]
+    };
+
+    match group_id {
+        None => {
+            let mid_prefix = match context.get_config(Config::Rfc724MsgIdPrefix) {
+                Some(ref s) if s == "1" => "chat$",
+                _ => "Mr."
+            };
+            format!("{mid_prefix}{group}.{rand2}{hostname}",
+                mid_prefix = mid_prefix,
+                group = dc_create_id(),
+                rand2 = dc_create_id(),
+                hostname = at_hostname)
+        }
+        Some(group) => {
+            let mid_prefix = match context.get_config(Config::Rfc724MsgIdPrefix) {
+                Some(ref s) if s == "1" => "chat$group.",
+                _ => "Gr."
+            };
+            format!("{mid_prefix}{group}.{rand2}{hostname}",
+                mid_prefix = mid_prefix,
+                group = group,
+                rand2 = dc_create_id(),
+                hostname = at_hostname)
+        }
+    }
 }
 
 /// Strip off `prefix` from `s` and return the remaining string if `s` starts with `prefix`.  If
@@ -708,37 +685,6 @@ fn test_split_prefix() {
     assert_eq!(split_prefix("Gr.", "Gr."), Some(""));
     assert_eq!(split_prefix("Gr.following", "Gr."), Some("following"));
     assert_eq!(split_prefix("Gr.Gr.", "Gr."), Some("Gr."));
-}
-
-/// Splits a string `s` into two parts at `delimiter`.
-///
-/// # Examples
-/// ```rust
-/// use deltachat::dc_tools::split2;
-///
-/// assert_eq!(split2("abc.def", "."), Some(("abc", "def")));
-/// assert_eq!(split2("abc.", "."), Some(("abc", "")));
-/// ```
-pub fn split2<'a>(s: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
-    let mut iter = s.splitn(2, delimiter);
-    if let Some(first) = iter.next() {
-        if let Some(second) = iter.next() {
-            assert!(iter.next().is_none());
-            return Some((first, second));
-        }
-    }
-    None
-}
-
-#[test]
-fn test_split2() {
-    assert_eq!(split2("", "."), None);
-    assert_eq!(split2("abc", "."), None);
-    assert_eq!(split2(".", "."), Some(("", "")));
-    assert_eq!(split2(".b", "."), Some(("", "b")));
-    assert_eq!(split2("a.", "."), Some(("a", "")));
-    assert_eq!(split2("a.b", "."), Some(("a", "b")));
-    assert_eq!(split2("a.b.c", "."), Some(("a", "b.c")));
 }
 
 const OLD_GROUP_ID_PREFIX: &str = "Gr.";
@@ -1968,7 +1914,7 @@ mod tests {
         assert_eq!(grpid, None);
     }
 
-   #[test]
+    #[test]
     fn test_dc_extract_old_grpid_from_rfc724_mid_with_acceptable_len16_grpid() {
         let mid = "Gr.1234567890123456.morerandom@domain.de";
         let grpid = dc_extract_grpid_from_rfc724_mid(mid);
@@ -1989,7 +1935,7 @@ mod tests {
         assert_eq!(grpid, Some("123456789012"));
     }
 
-   #[test]
+    #[test]
     fn test_dc_extract_new_grpid_from_rfc724_mid_with_acceptable_len13_grpid() {
         let mid = "chat$group.1234567890123.morerandom@domain.de";
         let grpid = dc_extract_grpid_from_rfc724_mid(mid);
