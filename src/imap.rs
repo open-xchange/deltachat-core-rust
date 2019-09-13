@@ -85,12 +85,12 @@ enum Session {
     Insecure(imap::Session<net::TcpStream>),
 }
 
-enum IdleHandle<'a> {
-    Secure(imap::extensions::idle::Handle<'a, native_tls::TlsStream<net::TcpStream>>),
-    Insecure(imap::extensions::idle::Handle<'a, net::TcpStream>),
+enum IdleHandle {
+    Secure(imap::extensions::idle::Handle<native_tls::TlsStream<net::TcpStream>>),
+    Insecure(imap::extensions::idle::Handle<net::TcpStream>),
 }
 
-impl<'a> IdleHandle<'a> {
+impl<'a> IdleHandle {
     pub fn set_keepalive(&mut self, interval: Duration) {
         match self {
             IdleHandle::Secure(i) => i.set_keepalive(interval),
@@ -98,11 +98,19 @@ impl<'a> IdleHandle<'a> {
         }
     }
 
-    pub fn wait_interruptible(self) -> imap::error::Result<(Box<dyn FnOnce() -> imap::error::Result<()> + Send + 'a>,
+    pub fn wait_interruptible(self) -> imap::error::Result<(Box<dyn FnOnce() -> imap::error::Result<Session> + Send + 'a>,
                                                             Box<dyn FnOnce() -> imap::error::Result<()>>)> {
         match self {
-            IdleHandle::Secure(i) => i.wait_interruptible(),
-            IdleHandle::Insecure(i) => i.wait_interruptible(),
+            IdleHandle::Secure(i) => i.wait_interruptible().map(|(w, s)| {
+                let wait: Box<dyn FnOnce() -> imap::error::Result<Session> + Send> =
+                    Box::new(|| w().map(Session::Secure));
+                (wait, s)
+            }),
+            IdleHandle::Insecure(i) => i.wait_interruptible().map(|(w, s)| {
+                let wait: Box<dyn FnOnce() -> imap::error::Result<Session> + Send> =
+                    Box::new(|| w().map(Session::Insecure));
+                (wait, s)
+            }),
         }
     }
 }
@@ -270,7 +278,7 @@ impl Session {
         }
     }
 
-    pub fn idle(&mut self) -> imap::error::Result<IdleHandle> {
+    pub fn idle(self) -> imap::error::Result<IdleHandle> {
         match self {
             Session::Secure(i) => i.idle().map(IdleHandle::Secure),
             Session::Insecure(i) => i.idle().map(IdleHandle::Insecure),
@@ -1128,7 +1136,7 @@ impl Imap {
             let (sender, receiver) = std::sync::mpsc::channel();
 
             let mut stop: Box<dyn FnOnce() -> imap::error::Result<()>> = Box::new(|| Ok(()));
-            if let Some(ref mut session) = &mut *self.session.clone().lock().unwrap() {
+            if let Some(session) = self.session.clone().lock().unwrap().take() {
                 let v = self.watch.clone();
                 let mut idle = session.idle()?;
 
@@ -1168,8 +1176,9 @@ impl Imap {
         let mut watch = lock.lock().unwrap();
 
         let handle_res = |res| match res {
-            Ok(()) => {
+            Ok(session) => {
                 info!(context, 0, "IMAP-IDLE has data.");
+                *self.session.lock().unwrap() = Some(session);
             }
             Err(err) => match err {
                 imap::error::Error::ConnectionLost => {
@@ -1198,7 +1207,9 @@ impl Imap {
                     } else {
                         info!(context, 0, "IMAP-IDLE interrupted");
                     }
-                    stop();
+                    if let Err(err) = stop() {
+                        warn!(context, 0, "Error while stopping IMAP-IDLE: {}", err);
+                    }
                     break;
                 }
             }
