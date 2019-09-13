@@ -407,7 +407,7 @@ class TestOnlineAccount:
         assert msg_in in chat2.get_messages()
         assert chat2.is_deaddrop()
         assert chat2.count_fresh_messages() == 0
-        assert msg_in.time_received > msg_in.time_sent
+        assert msg_in.time_received >= msg_in.time_sent
 
         lp.sec("create new chat with contact and verify it's proper")
         chat2b = ac2.create_chat_by_message(msg_in)
