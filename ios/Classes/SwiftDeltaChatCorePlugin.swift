@@ -65,7 +65,7 @@ public class SwiftDeltaChatCorePlugin: NSObject, FlutterPlugin {
 
     init(registrar: FlutterPluginRegistrar) {
         self.registrar = registrar
-        
+
         self.dcContext = DcContext()
         self.dcEventHandler = DCEventHandler()
         self.dcEventHandler.start()
