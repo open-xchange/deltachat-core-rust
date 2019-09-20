@@ -19,6 +19,7 @@ use std::str::FromStr;
 use imap::extensions::metadata::{get_metadata, set_metadata};
 pub use imap::extensions::metadata::MetadataDepth;
 pub use imap_proto::types::{Metadata, Capability};
+use imap::extensions::idle::Signal;
 
 const DC_IMAP_SEEN: usize = 0x0001;
 const DC_REGENERATE: usize = 0x01;
@@ -85,12 +86,12 @@ enum Session {
     Insecure(imap::Session<net::TcpStream>),
 }
 
-enum IdleHandle {
-    Secure(imap::extensions::idle::Handle<native_tls::TlsStream<net::TcpStream>>),
-    Insecure(imap::extensions::idle::Handle<net::TcpStream>),
+enum IdleHandle<'a> {
+    Secure(imap::extensions::idle::Handle<'a, native_tls::TlsStream<net::TcpStream>>),
+    Insecure(imap::extensions::idle::Handle<'a, net::TcpStream>),
 }
 
-impl<'a> IdleHandle {
+impl<'a> IdleHandle<'a> {
     pub fn set_keepalive(&mut self, interval: Duration) {
         match self {
             IdleHandle::Secure(i) => i.set_keepalive(interval),
@@ -98,27 +99,17 @@ impl<'a> IdleHandle {
         }
     }
 
-    pub fn wait_interruptible(self) -> std::result::Result<(Box<dyn FnOnce() -> (imap::error::Result<()>, Session) + Send + 'a>,
-                                                            Box<dyn FnOnce() -> imap::error::Result<()>>),
-                                                           (imap::error::Error, Session)>
-    {
+    pub fn get_interrupt(&mut self) -> imap::error::Result<Signal> {
         match self {
-            IdleHandle::Secure(i) => i.wait_interruptible().map(|(w, s)| {
-                    let wait: Box<dyn FnOnce() -> (imap::error::Result<()>, Session) + Send> =
-                        Box::new(|| {
-                            let (res, session) = w();
-                            (res, Session::Secure(session))
-                        });
-                    (wait, s)
-                }).map_err(|(err, handle)| (err, Session::Secure(handle))),
-            IdleHandle::Insecure(i) => i.wait_interruptible().map(|(w, s)| {
-                    let wait: Box<dyn FnOnce() -> (imap::error::Result<()>, Session) + Send> =
-                        Box::new(|| {
-                            let (res, session) = w();
-                            (res, Session::Insecure(session))
-                        });
-                    (wait, s)
-                }).map_err(|(err, handle)| (err, Session::Insecure(handle))),
+            IdleHandle::Secure(i) => i.get_interrupt(),
+            IdleHandle::Insecure(i) => i.get_interrupt(),
+        }
+    }
+
+    pub fn wait_interruptible(self) -> imap::error::Result<()> {
+        match self {
+            IdleHandle::Secure(i) => i.wait_interruptible(),
+            IdleHandle::Insecure(i) => i.wait_interruptible(),
         }
     }
 }
@@ -286,12 +277,10 @@ impl Session {
         }
     }
 
-    pub fn idle(self) -> std::result::Result<IdleHandle, (imap::error::Error, Self)> {
+    pub fn idle(&mut self) -> imap::error::Result<IdleHandle> {
         match self {
-            Session::Secure(i) => i.idle().map(IdleHandle::Secure)
-                .map_err(|(err, session)| (err, Session::Secure(session))),
-            Session::Insecure(i) => i.idle().map(IdleHandle::Insecure)
-                .map_err(|(err, session)| (err, Session::Insecure(session))),
+            Session::Secure(i) => i.idle().map(IdleHandle::Secure),
+            Session::Insecure(i) => i.idle().map(IdleHandle::Insecure),
         }
     }
 
@@ -1142,30 +1131,23 @@ impl Imap {
             return self.fake_idle(context);
         }
 
-        let mut session_lock = self.session.lock().unwrap();
-        if let Some(session) = session_lock.take() {
-            let (res, session) = (|| {
-                let mut idle = match session.idle() {
-                    Ok(idle) => idle,
-                    Err((err, session)) => return (Err(err), session),
-                };
+        if let Some(ref mut session) = *self.session.lock().unwrap() {
+            let res = (|| {
+                let mut idle = session.idle()?;
 
                 // most servers do not allow more than ~28 minutes; stay clearly below that.
                 // a good value that is also used by other MUAs is 23 minutes.
                 // if needed, the ui can call dc_imap_interrupt_idle() to trigger a reconnect.
                 idle.set_keepalive(Duration::from_secs(23 * 60));
 
-                let (wait, stop) = match idle.wait_interruptible() {
-                    Ok(ok) => ok,
-                    Err((err, session)) => return (Err(err), session),
-                };
-                *self.stop.lock().unwrap() = Some(stop);
-                wait()
+                let stop = idle.get_interrupt()?;
+                *self.stop.lock().unwrap() = Some(Box::new(move || stop.signal()));
+
+                idle.wait_interruptible()
             })();
             if let Err(err) = res {
                 warn!(context, 0, "Error in IMAP-IDLE: {:?}", err);
             }
-            session_lock.replace(session);
         }
 /*
         let thread: imap::error::Result<_> = (|| {
