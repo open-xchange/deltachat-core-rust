@@ -259,6 +259,11 @@ impl Sql {
         self.get_config(context, key).and_then(|s| s.parse().ok())
     }
 
+    /// Treats an integer value of "0" as false and any other integer value as true.
+    pub fn get_config_bool(&self, context: &Context, key: impl AsRef<str>) -> Option<bool> {
+        self.get_config_int(context, key).map(|value| value != 0)
+    }
+
     pub fn set_config_int64(
         &self,
         context: &Context,
