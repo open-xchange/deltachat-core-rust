@@ -585,14 +585,11 @@ unsafe fn decrypt_recursive(
             ) == 0i32
         {
             for cur_data in (*(*mime).mm_data.mm_multipart.mm_mp_list).into_iter() {
-                let mut decrypted_mime: *mut mailmime = ptr::null_mut();
-                if decrypt_part(
-                    context,
+                if let Some(decrypted_mime) = decrypt_part(
                     cur_data as *mut mailmime,
                     private_keyring,
                     public_keyring_for_validate,
                     ret_valid_signatures,
-                    &mut decrypted_mime,
                 ) {
                     if (*ret_gossip_headers).is_null() && ret_valid_signatures.len() > 0 {
                         let mut dummy: libc::size_t = 0;
@@ -653,13 +650,11 @@ unsafe fn decrypt_recursive(
 }
 
 unsafe fn decrypt_part(
-    _context: &Context,
     mime: *mut mailmime,
     private_keyring: &Keyring,
     public_keyring_for_validate: &Keyring,
     ret_valid_signatures: &mut HashSet<String>,
-    ret_decrypted_mime: *mut *mut mailmime,
-) -> bool {
+) -> Option<*mut mailmime> {
     let mut ok_to_continue = true;
     let mime_data: *mut mailmime_data;
     let mut mime_transfer_encoding: libc::c_int = MAILMIME_MECHANISM_BINARY as libc::c_int;
@@ -668,9 +663,9 @@ unsafe fn decrypt_part(
     /* must not be free()'d */
     let mut decoded_data: *const libc::c_char = ptr::null_mut();
     let mut decoded_data_bytes: libc::size_t = 0;
-    let mut sth_decrypted = false;
 
-    *ret_decrypted_mime = ptr::null_mut();
+    let mut res: Option<*mut mailmime> = None;
+
     mime_data = (*mime).mm_data.mm_single;
     /* MAILMIME_DATA_FILE indicates, the data is in a file; AFAIK this is not used on parsing */
     if !((*mime_data).dt_type != MAILMIME_DATA_TEXT as libc::c_int
@@ -751,8 +746,7 @@ unsafe fn decrypt_part(
                             mailmime_free(decrypted_mime);
                         }
                     } else {
-                        *ret_decrypted_mime = decrypted_mime;
-                        sth_decrypted = true;
+                        res = Some(decrypted_mime);
                     }
                     std::mem::forget(plain);
                 }
@@ -765,7 +759,7 @@ unsafe fn decrypt_part(
         mmap_string_unref(transfer_decoding_buffer);
     }
 
-    sth_decrypted
+    res
 }
 
 unsafe fn has_decrypted_pgp_armor(str__: *const libc::c_char, mut str_bytes: libc::c_int) -> bool {
@@ -844,11 +838,267 @@ pub fn ensure_secret_key_exists(context: &Context) -> Result<String> {
     Ok(self_addr)
 }
 
+/// Returns the string representation of `mailmime`.
+unsafe fn mailmime_to_string(mime: *mut mailmime) -> Result<String> {
+    use std::ffi::CString;
+    let plain: *mut MMAPString = mmap_string_new(b"\x00" as *const u8 as *const libc::c_char);
+    let mut col: libc::c_int = 0i32;
+    mailmime_write_mem(plain, &mut col, mime);
+    if (*plain).str_0.is_null() || (*plain).len <= 0 {
+        bail!("Could not write/allocate");
+    }
+    let cstr = CString::from_raw((*plain).str_0);
+    Ok(cstr.to_str()?.into())
+}
+
+fn decrypt_message_from_string(
+    context: &Context,
+    msg: &str,
+    private_keys_for_decryption: &Keyring,
+    public_keys: &Keyring,
+) -> Result<String> {
+    let mut indx: libc::size_t = 0;
+    let mut mail: *mut mailmime = ptr::null_mut();
+    let res = unsafe { mailmime_parse(msg.as_ptr() as *const i8, msg.len(), &mut indx, &mut mail) };
+    if res != 0 {
+        bail!("Failed to parse mail");
+    }
+
+    let mut valid_signatures: HashSet<String> = HashSet::new();
+    let mut gossip_headers: *mut mailimf_fields = ptr::null_mut();
+    let mut has_unencrypted_parts: libc::c_int = 0;
+
+    let _ = unsafe {
+        decrypt_recursive(
+            context,
+            mail,
+            &private_keys_for_decryption,
+            &public_keys,
+            &mut valid_signatures,
+            &mut gossip_headers,
+            &mut has_unencrypted_parts,
+        )
+    }?;
+
+    if has_unencrypted_parts != 0 {
+        bail!("Has unencrypted parts");
+    }
+
+    unsafe { mailmime_to_string(mail) }
+}
+
+pub fn decrypt_message_in_memory(
+    context: &Context,
+    content_type: &str,
+    content: &str,
+    _sender_addr: &str,
+) -> Result<String> {
+    let full_mime_msg = format!("{}\r\n\r\n{}", content_type, content);
+
+    let self_addr = context
+        .sql
+        .get_config(context, "configured_addr")
+        .unwrap_or_default();
+
+    let mut private_keys_for_decryption = Keyring::default();
+    if !private_keys_for_decryption.load_self_private_for_decrypting(
+        context,
+        self_addr.clone(),
+        &context.sql,
+    ) {
+        bail!("Failed to load private key for decrypting");
+    }
+
+    // XXX: Load public key of `_sender_addr` in order to validate signature
+    let public_keys = Keyring::default();
+
+    decrypt_message_from_string(
+        context,
+        &full_mime_msg,
+        &private_keys_for_decryption,
+        &public_keys,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::test_utils::*;
+
+    mod decryption {
+        use super::*;
+
+        #[test]
+        fn test_encrypt_and_decrypt() {
+            let plain = b"This is a message";
+
+            let t = dummy_context();
+            let test_addr = configure_alice_keypair(&t.ctx);
+
+            let mut public_keys_for_encryption = Keyring::default();
+            public_keys_for_encryption
+                .add_owned(Key::from_self_public(&t.ctx, test_addr.clone(), &t.ctx.sql).unwrap());
+            let encrypted_message =
+                dc_pgp_pk_encrypt(plain, &public_keys_for_encryption, None).unwrap();
+
+            let mut private_keys_for_decryption = Keyring::default();
+            assert!(
+                private_keys_for_decryption.load_self_private_for_decrypting(
+                    &t.ctx,
+                    test_addr.clone(),
+                    &t.ctx.sql
+                )
+            );
+            let decrypted_message = dc_pgp_pk_decrypt(
+                &encrypted_message.as_bytes(),
+                &private_keys_for_decryption,
+                &Keyring::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(decrypted_message, plain);
+        }
+
+        #[test]
+        fn test_decrypt_message() {
+            let encrypted_message = "-----BEGIN PGP MESSAGE-----
+
+wcBMA5Og3DZG63HoAQf/V375OzDFEbvqaO19mPWnB4rc+jA2E0b4NaxIWnLVQZpL
+/kb4MH0tbh8EDHhFs3IL8LD6o7Y/pkwZnHZ9va5zm+75vRMXKCSsaqCXhu4yYQL7
+JdwSua1byr0pYXGU4Trz6Yrga1sv49I1PAlj1StEYCOaK+vYaYG/EAPwrU/szgIL
+Iq0oIf3wySlAgRXfbYwgcuem7JbOUJZtqlwNxekkO2g2A5M0geOuufIw9dvevBqx
+gULxeS72mLkJkpgOzckaDV9K/6F3lhO7z7qOdb/c2K3FOmQPF7OCFTLqaCMFGiEv
+mCDjB2u7+JHfBeH3sXNu55d3qlltseG2cAEbnS3j69JCAVq0UzMidVWwiX+0Z/Li
+Ju7oJPGwXBqe/XPDD9NojzYmHG3uVgyFALTgXRkSOk8y/wKVvSaAZLhETV3sIa0r
+QgoI
+=iQ+M
+-----END PGP MESSAGE-----
+";
+            let t = dummy_context();
+            let test_addr = configure_alice_keypair(&t.ctx);
+            let mut private_keys_for_decryption = Keyring::default();
+            assert!(
+                private_keys_for_decryption.load_self_private_for_decrypting(
+                    &t.ctx,
+                    test_addr.clone(),
+                    &t.ctx.sql
+                )
+            );
+            let decrypted_message = dc_pgp_pk_decrypt(
+                &encrypted_message.as_bytes(),
+                &private_keys_for_decryption,
+                &Keyring::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(decrypted_message, b"This is a message");
+        }
+
+        #[test]
+        fn test_decrypt_message_in_memory() {
+            let content_type = r###"Content-Type: multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted"###;
+            let content = r###"--5d8b0f2e_f8f75182_bb0c
+Content-Type: application/pgp-encrypted
+Content-Transfer-Encoding: 7bit
+
+Version: 1
+
+--5d8b0f2e_f8f75182_bb0c
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: 7bit
+
+-----BEGIN PGP MESSAGE-----
+
+wcBMA5Og3DZG63HoAQf/V375OzDFEbvqaO19mPWnB4rc+jA2E0b4NaxIWnLVQZpL
+/kb4MH0tbh8EDHhFs3IL8LD6o7Y/pkwZnHZ9va5zm+75vRMXKCSsaqCXhu4yYQL7
+JdwSua1byr0pYXGU4Trz6Yrga1sv49I1PAlj1StEYCOaK+vYaYG/EAPwrU/szgIL
+Iq0oIf3wySlAgRXfbYwgcuem7JbOUJZtqlwNxekkO2g2A5M0geOuufIw9dvevBqx
+gULxeS72mLkJkpgOzckaDV9K/6F3lhO7z7qOdb/c2K3FOmQPF7OCFTLqaCMFGiEv
+mCDjB2u7+JHfBeH3sXNu55d3qlltseG2cAEbnS3j69JCAVq0UzMidVWwiX+0Z/Li
+Ju7oJPGwXBqe/XPDD9NojzYmHG3uVgyFALTgXRkSOk8y/wKVvSaAZLhETV3sIa0r
+QgoI
+=iQ+M
+-----END PGP MESSAGE-----
+
+--5d8b0f2e_f8f75182_bb0c--
+
+"###;
+            let sender_addr = "bob@example.org";
+            let expected_decrypted_msg = "Content-Type: message/rfc822\r\n\r\nContent-Type: text/plain\r\n\r\nThis is a message";
+
+            let t = dummy_context();
+            let _ = configure_alice_keypair(&t.ctx);
+
+            assert_eq!(
+                expected_decrypted_msg,
+                decrypt_message_in_memory(&t.ctx, content_type, content, sender_addr).unwrap()
+            );
+        }
+
+        #[test]
+        fn test_decrypt_message_from_string() {
+            let msg = r###"Content-Type: multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted";
+
+--5d8b0f2e_f8f75182_bb0c
+Content-Type: application/pgp-encrypted
+Content-Transfer-Encoding: 7bit
+
+Version: 1
+
+--5d8b0f2e_f8f75182_bb0c
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: 7bit
+
+-----BEGIN PGP MESSAGE-----
+
+wcBMA5Og3DZG63HoAQf/V375OzDFEbvqaO19mPWnB4rc+jA2E0b4NaxIWnLVQZpL
+/kb4MH0tbh8EDHhFs3IL8LD6o7Y/pkwZnHZ9va5zm+75vRMXKCSsaqCXhu4yYQL7
+JdwSua1byr0pYXGU4Trz6Yrga1sv49I1PAlj1StEYCOaK+vYaYG/EAPwrU/szgIL
+Iq0oIf3wySlAgRXfbYwgcuem7JbOUJZtqlwNxekkO2g2A5M0geOuufIw9dvevBqx
+gULxeS72mLkJkpgOzckaDV9K/6F3lhO7z7qOdb/c2K3FOmQPF7OCFTLqaCMFGiEv
+mCDjB2u7+JHfBeH3sXNu55d3qlltseG2cAEbnS3j69JCAVq0UzMidVWwiX+0Z/Li
+Ju7oJPGwXBqe/XPDD9NojzYmHG3uVgyFALTgXRkSOk8y/wKVvSaAZLhETV3sIa0r
+QgoI
+=iQ+M
+-----END PGP MESSAGE-----
+
+--5d8b0f2e_f8f75182_bb0c--
+
+"###;
+            let expected_decrypted_msg = "Content-Type: message/rfc822\r\n\r\nContent-Type: text/plain\r\n\r\nThis is a message";
+
+            let t = dummy_context();
+            let _ = configure_alice_keypair(&t.ctx);
+
+            let self_addr = t
+                .ctx
+                .sql
+                .get_config(&t.ctx, "configured_addr")
+                .unwrap_or_default();
+
+            let mut private_keys_for_decryption = Keyring::default();
+            assert!(
+                private_keys_for_decryption.load_self_private_for_decrypting(
+                    &t.ctx,
+                    self_addr.clone(),
+                    &t.ctx.sql
+                )
+            );
+            let public_keys = Keyring::default();
+
+            assert_eq!(
+                expected_decrypted_msg,
+                decrypt_message_from_string(
+                    &t.ctx,
+                    msg,
+                    &private_keys_for_decryption,
+                    &public_keys
+                )
+                .unwrap()
+            );
+        }
+    }
 
     mod ensure_secret_key_exists {
         use super::*;

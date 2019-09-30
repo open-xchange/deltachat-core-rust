@@ -37,7 +37,7 @@ pub mod configure;
 pub mod constants;
 pub mod contact;
 pub mod context;
-mod e2ee;
+pub mod e2ee;
 mod imap;
 pub mod job;
 mod job_thread;

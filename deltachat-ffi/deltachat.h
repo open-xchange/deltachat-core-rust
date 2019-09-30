@@ -3668,6 +3668,19 @@ uint32_t        dc_lot_get_id            (const dc_lot_t* lot);
 int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 
+
+/**
+ * Decrypt a message in memory and return the decrypted message as a string.
+ *
+ * @param context The context object.
+ * @param content_type The content type.
+ * @param content The message content.
+ * @param sender_addr The sender address of the message.
+ * @return The decrypted message or NULL in case of error.
+ */
+char*           dc_decrypt_message_in_memory(dc_context_t* context, const char *content_type, const char *content, const char *sender_addr);
+
+
 /**
  * @defgroup DC_MSG DC_MSG
  *
