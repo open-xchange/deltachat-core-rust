@@ -80,7 +80,7 @@ impl E2eeHelper {
                 != context
                     .sql
                     .get_config_int(context, "e2ee_enabled")
-                    .unwrap_or_default()
+                    .unwrap_or(1)
             {
                 EncryptPreference::Mutual
             } else {
