@@ -2641,6 +2641,33 @@ pub unsafe extern "C" fn dc_lot_get_timestamp(lot: *mut dc_lot_t) -> i64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_decrypt_message_in_memory(
+    context: *mut dc_context_t,
+    content_type: *const libc::c_char,
+    content: *const libc::c_char,
+    sender_addr: *const libc::c_char,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_decrypt_msg_in_memory()");
+        return ptr::null_mut();
+    }
+    let ffi_context = &*context;
+
+    if let Ok(Ok(decrypted_msg)) = ffi_context.with_inner(|ctx| {
+        e2ee::decrypt_message_in_memory(
+            ctx,
+            as_str(content_type),
+            as_str(content),
+            as_str(sender_addr),
+        )
+    }) {
+        decrypted_msg.strdup()
+    } else {
+        ptr::null_mut()
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_str_unref(s: *mut libc::c_char) {
     libc::free(s as *mut _)
 }
