@@ -2653,14 +2653,12 @@ pub unsafe extern "C" fn dc_decrypt_message_in_memory(
     }
     let ffi_context = &*context;
 
-    if let Ok(Ok(decrypted_msg)) = ffi_context.with_inner(|ctx| {
-        e2ee::decrypt_message_in_memory(
-            ctx,
-            as_str(content_type),
-            as_str(content),
-            as_str(sender_addr),
-        )
-    }) {
+    if let Ok(decrypted_msg) = e2ee::decrypt_message_in_memory(
+        ffi_context,
+        as_str(content_type),
+        as_str(content),
+        as_str(sender_addr),
+    ) {
         decrypted_msg.strdup()
     } else {
         ptr::null_mut()
