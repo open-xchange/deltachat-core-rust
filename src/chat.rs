@@ -1483,7 +1483,7 @@ pub unsafe fn add_contact_to_chat_ex(
                                 msg.id as uintptr_t,
                             );
                         }
-                        context.call_cb(Event::MSGS_CHANGED, chat_id as uintptr_t, 0 as uintptr_t);
+                        context.call_cb(Event::CHAT_MODIFIED, chat_id as uintptr_t, 0 as uintptr_t);
                         success = 1;
                     }
                 }
