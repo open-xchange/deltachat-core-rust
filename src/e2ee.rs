@@ -859,7 +859,7 @@ fn decrypt_message_from_string(
 ) -> Result<String> {
     let mut indx: libc::size_t = 0;
     let mut mail: *mut mailmime = ptr::null_mut();
-    let res = unsafe { mailmime_parse(msg.as_ptr() as *const i8, msg.len(), &mut indx, &mut mail) };
+    let res = unsafe { mailmime_parse(msg.as_ptr() as *const libc::c_char, msg.len(), &mut indx, &mut mail) };
     if res != 0 {
         bail!("Failed to parse mail");
     }
