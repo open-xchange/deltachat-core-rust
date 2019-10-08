@@ -1043,7 +1043,10 @@ pub fn decrypt_message_in_memory(
         .get_config(context, "configured_addr")
         .unwrap_or_default();
 
-    let full_mime_msg = format!("To: {}\r\nFrom:{}\r\n{}\r\n\r\n{}", self_addr, sender_addr, content_type, content);
+    let full_mime_msg = format!(
+        "To: {}\r\nFrom: {}\r\nContent-Type: {}\r\n\r\n{}",
+        self_addr, sender_addr, content_type, content
+    );
 
     let mime_parser = unsafe { dc_mimeparser_parse(context, full_mime_msg.as_bytes())};
 
@@ -1143,7 +1146,7 @@ QgoI
 
         #[test]
         fn test_decrypt_message_in_memory() {
-            let content_type = r###"Content-Type: multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted"###;
+            let content_type = r###"multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted"###;
             let content = r###"--5d8b0f2e_f8f75182_bb0c
 Content-Type: application/pgp-encrypted
 Content-Transfer-Encoding: 7bit
