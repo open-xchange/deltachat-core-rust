@@ -2646,6 +2646,8 @@ pub unsafe extern "C" fn dc_decrypt_message_in_memory(
     content_type: *const libc::c_char,
     content: *const libc::c_char,
     sender_addr: *const libc::c_char,
+    extract_part: libc::c_int,
+    out_total_number_of_parts: *mut libc::c_int,
 ) -> *mut libc::c_char {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_decrypt_msg_in_memory()");
@@ -2653,13 +2655,19 @@ pub unsafe extern "C" fn dc_decrypt_message_in_memory(
     }
     let ffi_context = &*context;
 
-    if let Ok(decrypted_msg) = e2ee::decrypt_message_in_memory(
+    if let Ok(msg_parts) = e2ee::decrypt_message_in_memory(
         ffi_context,
         as_str(content_type),
         as_str(content),
         as_str(sender_addr),
     ) {
-        decrypted_msg.strdup()
+        *out_total_number_of_parts = msg_parts.len() as libc::c_int;
+
+        if let Some(Some(msg)) = msg_parts.get(extract_part as usize) {
+            msg.strdup()
+        } else {
+            ptr::null_mut()
+        }
     } else {
         ptr::null_mut()
     }

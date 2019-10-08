@@ -1030,87 +1030,36 @@ pub fn ensure_secret_key_exists(context: &Context) -> Result<String> {
     Ok(self_addr)
 }
 
-/// Returns the string representation of `mailmime`.
-unsafe fn mailmime_to_string(mime: *mut mailmime) -> Result<String> {
-    use std::ffi::CString;
-    let plain: *mut MMAPString = mmap_string_new(b"\x00" as *const u8 as *const libc::c_char);
-    let mut col: libc::c_int = 0i32;
-    mailmime_write_mem(plain, &mut col, mime);
-    if (*plain).str_0.is_null() || (*plain).len <= 0 {
-        bail!("Could not write/allocate");
-    }
-    let cstr = CString::from_raw((*plain).str_0);
-    Ok(cstr.to_str()?.into())
-}
-
-fn decrypt_message_from_string(
-    context: &Context,
-    msg: &str,
-    private_keys_for_decryption: &Keyring,
-    public_keys: &Keyring,
-) -> Result<String> {
-    let mut indx: libc::size_t = 0;
-    let mut mail: *mut mailmime = ptr::null_mut();
-    let res = unsafe { mailmime_parse(msg.as_ptr() as *const i8, msg.len(), &mut indx, &mut mail) };
-    if res != 0 {
-        bail!("Failed to parse mail");
-    }
-
-    let mut valid_signatures: HashSet<String> = HashSet::new();
-    let mut gossip_headers: *mut mailimf_fields = ptr::null_mut();
-    let mut has_unencrypted_parts: libc::c_int = 0;
-
-    let _ = unsafe {
-        decrypt_recursive(
-            context,
-            mail,
-            &private_keys_for_decryption,
-            &public_keys,
-            &mut valid_signatures,
-            &mut gossip_headers,
-            &mut has_unencrypted_parts,
-        )
-    }?;
-
-    if has_unencrypted_parts != 0 {
-        bail!("Has unencrypted parts");
-    }
-
-    unsafe { mailmime_to_string(mail) }
-}
-
 pub fn decrypt_message_in_memory(
     context: &Context,
     content_type: &str,
     content: &str,
-    _sender_addr: &str,
-) -> Result<String> {
-    let full_mime_msg = format!("{}\r\n\r\n{}", content_type, content);
+    sender_addr: &str,
+) -> Result<Vec<Option<String>>> {
+    use crate::constants::Viewtype;
 
     let self_addr = context
         .sql
         .get_config(context, "configured_addr")
         .unwrap_or_default();
 
-    let mut private_keys_for_decryption = Keyring::default();
-    if !private_keys_for_decryption.load_self_private_for_decrypting(
-        context,
-        self_addr.clone(),
-        &context.sql,
-    ) {
-        bail!("Failed to load private key for decrypting");
+    let full_mime_msg = format!("To: {}\r\nFrom:{}\r\n{}\r\n\r\n{}", self_addr, sender_addr, content_type, content);
+
+    let mime_parser = unsafe { dc_mimeparser_parse(context, full_mime_msg.as_bytes())};
+
+    if mime_parser.header.is_empty() {
+        bail!("No headers");
     }
 
-    // XXX: Load public key of `_sender_addr` in order to validate signature
-    let public_keys = Keyring::default();
-
-    decrypt_message_from_string(
-        context,
-        &full_mime_msg,
-        &private_keys_for_decryption,
-        &public_keys,
-    )
+    Ok(mime_parser.parts.iter().map(|part| {
+        if part.type_0 == Viewtype::Text {
+            Some(as_str(part.msg_raw).into())
+        } else {
+            None
+        }
+    }).collect())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1222,77 +1171,13 @@ QgoI
 
 "###;
             let sender_addr = "bob@example.org";
-            let expected_decrypted_msg = "Content-Type: message/rfc822\r\n\r\nContent-Type: text/plain\r\n\r\nThis is a message";
 
             let t = dummy_context();
             let _ = configure_alice_keypair(&t.ctx);
 
             assert_eq!(
-                expected_decrypted_msg,
+                vec![Some(String::from("This is a message"))],
                 decrypt_message_in_memory(&t.ctx, content_type, content, sender_addr).unwrap()
-            );
-        }
-
-        #[test]
-        fn test_decrypt_message_from_string() {
-            let msg = r###"Content-Type: multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted";
-
---5d8b0f2e_f8f75182_bb0c
-Content-Type: application/pgp-encrypted
-Content-Transfer-Encoding: 7bit
-
-Version: 1
-
---5d8b0f2e_f8f75182_bb0c
-Content-Type: application/octet-stream
-Content-Transfer-Encoding: 7bit
-
------BEGIN PGP MESSAGE-----
-
-wcBMA5Og3DZG63HoAQf/V375OzDFEbvqaO19mPWnB4rc+jA2E0b4NaxIWnLVQZpL
-/kb4MH0tbh8EDHhFs3IL8LD6o7Y/pkwZnHZ9va5zm+75vRMXKCSsaqCXhu4yYQL7
-JdwSua1byr0pYXGU4Trz6Yrga1sv49I1PAlj1StEYCOaK+vYaYG/EAPwrU/szgIL
-Iq0oIf3wySlAgRXfbYwgcuem7JbOUJZtqlwNxekkO2g2A5M0geOuufIw9dvevBqx
-gULxeS72mLkJkpgOzckaDV9K/6F3lhO7z7qOdb/c2K3FOmQPF7OCFTLqaCMFGiEv
-mCDjB2u7+JHfBeH3sXNu55d3qlltseG2cAEbnS3j69JCAVq0UzMidVWwiX+0Z/Li
-Ju7oJPGwXBqe/XPDD9NojzYmHG3uVgyFALTgXRkSOk8y/wKVvSaAZLhETV3sIa0r
-QgoI
-=iQ+M
------END PGP MESSAGE-----
-
---5d8b0f2e_f8f75182_bb0c--
-
-"###;
-            let expected_decrypted_msg = "Content-Type: message/rfc822\r\n\r\nContent-Type: text/plain\r\n\r\nThis is a message";
-
-            let t = dummy_context();
-            let _ = configure_alice_keypair(&t.ctx);
-
-            let self_addr = t
-                .ctx
-                .sql
-                .get_config(&t.ctx, "configured_addr")
-                .unwrap_or_default();
-
-            let mut private_keys_for_decryption = Keyring::default();
-            assert!(
-                private_keys_for_decryption.load_self_private_for_decrypting(
-                    &t.ctx,
-                    self_addr.clone(),
-                    &t.ctx.sql
-                )
-            );
-            let public_keys = Keyring::default();
-
-            assert_eq!(
-                expected_decrypted_msg,
-                decrypt_message_from_string(
-                    &t.ctx,
-                    msg,
-                    &private_keys_for_decryption,
-                    &public_keys
-                )
-                .unwrap()
             );
         }
     }
