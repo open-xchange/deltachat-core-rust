@@ -1048,21 +1048,24 @@ pub fn decrypt_message_in_memory(
         self_addr, sender_addr, content_type, content
     );
 
-    let mime_parser = unsafe { dc_mimeparser_parse(context, full_mime_msg.as_bytes())};
+    let mime_parser = unsafe { dc_mimeparser_parse(context, full_mime_msg.as_bytes()) };
 
     if mime_parser.header.is_empty() {
         bail!("No headers");
     }
 
-    Ok(mime_parser.parts.iter().map(|part| {
-        if part.type_0 == Viewtype::Text {
-            Some(as_str(part.msg_raw).into())
-        } else {
-            None
-        }
-    }).collect())
+    Ok(mime_parser
+        .parts
+        .iter()
+        .map(|part| {
+            if part.type_0 == Viewtype::Text {
+                Some(as_str(part.msg_raw).into())
+            } else {
+                None
+            }
+        })
+        .collect())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1083,11 +1086,13 @@ mod tests {
             let mut public_keys_for_encryption = Keyring::default();
             public_keys_for_encryption
                 .add_owned(Key::from_self_public(&t.ctx, test_addr.clone(), &t.ctx.sql).unwrap());
-            let encrypted_message =
-                dc_pgp_pk_encrypt(
-                    plain.as_ptr() as *const core::ffi::c_void,
-                    plain.len(),
-                    &public_keys_for_encryption, None).unwrap();
+            let encrypted_message = dc_pgp_pk_encrypt(
+                plain.as_ptr() as *const core::ffi::c_void,
+                plain.len(),
+                &public_keys_for_encryption,
+                None,
+            )
+            .unwrap();
 
             let mut private_keys_for_decryption = Keyring::default();
             assert!(
