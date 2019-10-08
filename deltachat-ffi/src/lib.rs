@@ -2661,6 +2661,10 @@ pub unsafe extern "C" fn dc_decrypt_message_in_memory(
         as_str(content),
         as_str(sender_addr),
     ) {
+        if out_total_number_of_parts.is_null() {
+            eprintln!("ignoring careless call to dc_decrypt_msg_in_memory()");
+            return ptr::null_mut();
+        }
         *out_total_number_of_parts = msg_parts.len() as libc::c_int;
 
         if let Some(Some(msg)) = msg_parts.get(extract_part as usize) {
