@@ -24,6 +24,7 @@ pub enum Error {
     Utf8(std::str::Utf8Error),
     #[fail(display = "{:?}", _0)]
     Imap(imap::error::Error),
+    #[fail(display = "{:?}", _0)]
     CStringError(crate::dc_tools::CStringError),
     #[fail(display = "PGP: {:?}", _0)]
     Pgp(pgp::errors::Error),

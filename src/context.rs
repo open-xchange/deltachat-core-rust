@@ -25,7 +25,6 @@ use crate::param::Params;
 use crate::smtp::*;
 use crate::sql::Sql;
 use crate::webpush::WebPushConfig;
-use std::path::PathBuf;
 use std::ptr;
 use crate::coi::CoiDeltachatMode;
 

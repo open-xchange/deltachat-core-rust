@@ -605,11 +605,11 @@ impl Imap {
                 .ok_or_else(|| format_err!("No session"))?
                 .capabilities()
                 .or_else(|err| {
-                    info!(context, 0, "CAPABILITY command error: {}", err);
+                    info!(context, "CAPABILITY command error: {}", err);
                     Err(err)
                 })?;
             if !context.sql.is_open() {
-                warn!(context, 0, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
+                warn!(context, "IMAP-LOGIN as {} ok but ABORTING", lp.mail_user);
                 return Err(format_err!("Failed to open database"));
             }
             let can_idle = caps.has(&Capability::Atom("IDLE"));
@@ -706,14 +706,14 @@ impl Imap {
                         if meta.value.is_some() {
                             info!(
                                 context,
-                                0, "Unknown metadata: {} = {}", meta.entry, meta.value.unwrap()
+                                "Unknown metadata: {} = {}", meta.entry, meta.value.unwrap()
                             );
                         }
                     }
                 }
             }
         } else if let Err(error) = metadata {
-            warn!(context, 0, "Error while retrieving metadata: {}", error);
+            warn!(context, "Error while retrieving metadata: {}", error);
         }
         (coi, webpush)
     }
@@ -1132,11 +1132,11 @@ impl Imap {
             })();
             match res {
                 Err(imap::error::Error::ConnectionLost) => {
-                    info!(context, 0, "IMAP-IDLE wait cancelled, we will reconnect soon.");
+                    info!(context, "IMAP-IDLE wait cancelled, we will reconnect soon.");
                     self.should_reconnect.store(true, Ordering::Relaxed);
                 },
                 Err(err) => {
-                    warn!(context, 0, "Error in IMAP-IDLE: {:?}", err);
+                    warn!(context, "Error in IMAP-IDLE: {:?}", err);
                 },
                 _ => {},
             }
@@ -1561,7 +1561,7 @@ impl Imap {
     where
         S: std::fmt::Debug,
     {
-        info!(context, 0, "get metadata: {:?}, {:?}", mbox, key);
+        info!(context, "get metadata: {:?}, {:?}", mbox, key);
 
         if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
             Ok(session.get_metadata(mbox, key, depth, max_size)?)
@@ -1579,7 +1579,7 @@ impl Imap {
     where
         S: AsRef<str> + std::fmt::Debug,
     {
-        info!(context, 0, "set metadata: {:?}, {:?}", mbox, keyval);
+        info!(context, "set metadata: {:?}, {:?}", mbox, keyval);
 
         if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
             Ok(session.set_metadata(mbox, keyval)?)
