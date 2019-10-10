@@ -532,60 +532,6 @@ pub struct SmtpState {
     pub probe_network: bool,
 }
 
-// create/open/config/information
-pub fn dc_context_new(
-    cb: Option<dc_callback_t>,
-    userdata: *mut libc::c_void,
-    os_name: Option<String>,
-) -> Context {
-    Context {
-        blobdir: Arc::new(RwLock::new(std::ptr::null_mut())),
-        dbfile: Arc::new(RwLock::new(None)),
-        inbox: Arc::new(RwLock::new({
-            Imap::new(
-                cb_get_config,
-                cb_set_config,
-                cb_precheck_imf,
-                cb_receive_imf,
-            )
-        })),
-        userdata,
-        cb,
-        os_name,
-        running_state: Arc::new(RwLock::new(Default::default())),
-        sql: Sql::new(),
-        smtp: Arc::new(Mutex::new(Smtp::new())),
-        smtp_state: Arc::new((Mutex::new(Default::default()), Condvar::new())),
-        oauth2_critical: Arc::new(Mutex::new(())),
-        bob: Arc::new(RwLock::new(Default::default())),
-        last_smeared_timestamp: Arc::new(RwLock::new(0)),
-        cmdline_sel_chat_id: Arc::new(RwLock::new(0)),
-        sentbox_thread: Arc::new(RwLock::new(JobThread::new(
-            JobThreadKind::SentBox,
-            Imap::new(
-                cb_get_config,
-                cb_set_config,
-                cb_precheck_imf,
-                cb_receive_imf,
-            ),
-        ))),
-        mvbox_thread: Arc::new(RwLock::new(JobThread::new(
-            JobThreadKind::MoveBox,
-            Imap::new(
-                cb_get_config,
-                cb_set_config,
-                cb_precheck_imf,
-                cb_receive_imf,
-            ),
-        ))),
-        probe_imap_network: Arc::new(RwLock::new(false)),
-        perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
-        generating_key_mutex: Mutex::new(()),
-        webpush_config: None,
-        coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
-    }
-}
-
 pub fn get_version_str() -> &'static str {
     &DC_VERSION_STR
 }
