@@ -307,8 +307,12 @@ impl Job {
         };
 
         match result {
-            Ok(json) => context.call_cb(Event::Metadata { forgeign_id: self.foreign_id, json }),
-            Err(err) => context.call_cb(Event::Error(err))
+            Ok(json) => {
+                context.call_cb(Event::Metadata { foreign_id: self.foreign_id, json });
+            }
+            Err(err) => {
+                context.call_cb(Event::Error(err));
+            }
         }
     }
 

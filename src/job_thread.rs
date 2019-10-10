@@ -4,7 +4,7 @@ use crate::configure::*;
 use crate::context::Context;
 use crate::imap::Imap;
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum JobThreadKind {
     SentBox,
     MoveBox,
@@ -116,17 +116,20 @@ impl JobThread {
         self.state.0.lock().unwrap().using_handle = false;
     }
 
-    fn get_watch_folder(&self, context: &Context) -> Option<String> {
-        let folder_config_name = match self.job_thread_kind {
+    // XXX: This might be broken!
+    fn folder_config_name(&self) -> &str {
+        self.job_thread_kind {
             JobThreadKind::SentBox => "configured_sentbox_folder",
             JobThreadKind::MoveBox => "configured_mvbox_folder",
-        };
+        }
+    }
 
+    fn get_watch_folder(&self, context: &Context) -> Option<String> {
         if let Some(mvbox_folder_override) = context.get_mvbox_folder_override() {
             return Some(mvbox_folder_override);
         }
  
-        if let Some(mvbox_name) = context.sql.get_config(context, folder_config_name) {
+        if let Some(mvbox_name) = context.sql.get_raw_config(context, self.folder_config_name()) {
             Some(mvbox_name)
         } else {
             None
@@ -150,7 +153,7 @@ impl JobThread {
                 self.imap.configure_folders(context, 0x1);
             }
 
-            if let Some(mvbox_name) = context.sql.get_raw_config(context, self.folder_config_name) {
+            if let Some(mvbox_name) = context.sql.get_raw_config(context, self.folder_config_name()) {
                 self.imap.set_watch_folder(mvbox_name);
             } else {
                 self.imap.disconnect(context);

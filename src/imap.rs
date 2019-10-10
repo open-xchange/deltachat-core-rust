@@ -43,6 +43,8 @@ pub type StopCallback = dyn FnOnce() -> imap::error::Result<()>;
 #[derive(DebugStub)]
 pub struct Imap {
     config: Arc<RwLock<ImapConfig>>,
+    watch: Arc<(Mutex<bool>, Condvar)>,
+
     #[debug_stub = "Stop"]
     stop: Arc<Mutex<Option<Box<StopCallback>>>>,
     session: Arc<Mutex<Option<Session>>>,
