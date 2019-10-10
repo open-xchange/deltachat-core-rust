@@ -273,8 +273,7 @@ impl Job {
             let inbox = context.inbox.read().unwrap();
             match inbox.set_metadata(context, "", &meta) {
                 Ok(_) => {
-                    context.call_cb(Event::SET_METADATA_DONE,
-                                    self.foreign_id as uintptr_t, 0);
+                    context.call_cb(Event::SetMetadataDone { foreign_id: self.foreign_id });
                 },
                 Err(e) => {
                     error!(context, self.foreign_id,
@@ -286,33 +285,32 @@ impl Job {
 
     #[allow(non_snake_case)]
     fn do_DC_JOB_GET_METADATA(&self, context: &Context) {
-        let (success, text) = if let Some(path) = self.param.get(Param::Metadata) {
+        let result: Result<Option<String>, String> = if let Some(path) = self.param.get(Param::Metadata) {
             let inbox = context.inbox.read().unwrap();
             let res = inbox.get_metadata(context, "", &[path], MetadataDepth::Zero, None);
             match res {
                 Ok(meta) => {
                     if let Some(meta) = meta.first() {
                         if meta.entry == path {
-                            (true, meta.value.clone())
+                            Ok(meta.value.clone())
                         } else {
-                            (false, Some(format!("Invalid path in GETMETADATA response. Expected: {}, got: {}",
-                                                 path, meta.entry)))
+                            Err(format!("Invalid path in GETMETADATA response. Expected: {}, got: {}",
+                                                 path, meta.entry))
                         }
                     } else {
-                        (true, None)
+                        Ok(None)
                     }
                 },
-                Err(e) => (false, Some(e.to_string())),
+                Err(e) => Err(e.to_string()),
             }
         } else {
-            (false, Some("Missing metadata path".into()))
+            Err("Missing metadata path".into())
         };
-        let text = text.map(|s| std::ffi::CString::new(s).unwrap());
-        context.call_cb(
-            if success { Event::METADATA } else { Event::ERROR },
-            self.foreign_id as uintptr_t,
-            text.map(|s| s.as_ptr()).unwrap_or(ptr::null()) as uintptr_t
-        );
+
+        match result {
+            Ok(json) => context.call_cb(Event::Metadata { forgeign_id: self.foreign_id, json }),
+            Err(err) => context.call_cb(Event::Error(err))
+        }
     }
 
     #[allow(non_snake_case)]

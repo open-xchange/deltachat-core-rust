@@ -238,6 +238,21 @@ pub enum Event {
     #[strum(props(id = "2061"))]
     SecurejoinJoinerProgress { contact_id: u32, progress: usize },
 
+    /// Status of a SETMETADATA command triggered by COI or WebPush functions.
+    /// In case of errors, the ERROR event with the request ID in data1 is sent instead.
+    /// @param data1 (int) ID of the request, can be used to match responses to requests.
+    /// @param data2 (int) 0
+    #[strum(props(id = "2070"))]
+    SetMetadataDone { foreign_id: u32 },
+
+    /// Result of a GETMETADATA command triggered by COI or WebPush functions.
+    /// In case of errors, the ERROR event with the request ID in data1 is sent instead.
+    /// @param data1 (int) ID of the request, can be used to match responses to requests.
+    /// @param data2 (const char*) JSON string returned by the server, or NULL if no subscription found.
+    ///     Must not be free()'d or modified and is valid only until the callback returns.
+    #[strum(props(id = "2071"))]
+    Metadata { foreign_id: u32, json: Option<String> },  
+
     // the following events are functions that should be provided by the frontends
     /// Requeste a localized string from the frontend.
     /// @param data1 (int) ID of the string to request, one of the DC_STR_/// constants.
