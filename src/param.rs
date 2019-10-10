@@ -6,6 +6,7 @@ use std::str;
 
 use num_traits::FromPrimitive;
 
+use crate::dc_mimeparser::SystemMessage;
 use crate::error;
 
 /// Available param keys.
@@ -13,68 +14,68 @@ use crate::error;
 #[repr(u8)]
 pub enum Param {
     /// For messages and jobs
-    File = 'f' as u8,
+    File = b'f',
     /// For Messages
-    Width = 'w' as u8,
+    Width = b'w',
     /// For Messages
-    Height = 'h' as u8,
+    Height = b'h',
     /// For Messages
-    Duration = 'd' as u8,
+    Duration = b'd',
     /// For Messages
-    MimeType = 'm' as u8,
+    MimeType = b'm',
     /// For Messages: message is encryoted, outgoing: guarantee E2EE or the message is not send
-    GuranteeE2ee = 'c' as u8,
+    GuranteeE2ee = b'c',
     /// For Messages: decrypted with validation errors or without mutual set, if neither
     /// 'c' nor 'e' are preset, the messages is only transport encrypted.
-    ErroneousE2ee = 'e' as u8,
+    ErroneousE2ee = b'e',
     /// For Messages: force unencrypted message, either `ForcePlaintext::AddAutocryptHeader` (1),
     /// `ForcePlaintext::NoAutocryptHeader` (2) or 0.
-    ForcePlaintext = 'u' as u8,
+    ForcePlaintext = b'u',
     /// For Messages
-    WantsMdn = 'r' as u8,
+    WantsMdn = b'r',
     /// For Messages
-    Forwarded = 'a' as u8,
+    Forwarded = b'a',
     /// For Messages
-    Cmd = 'S' as u8,
+    Cmd = b'S',
     /// For Messages
-    Arg = 'E' as u8,
+    Arg = b'E',
     /// For Messages
-    Arg2 = 'F' as u8,
+    Arg2 = b'F',
     /// For Messages
-    Arg3 = 'G' as u8,
+    Arg3 = b'G',
     /// For Messages
-    Arg4 = 'H' as u8,
+    Arg4 = b'H',
     /// For Messages
-    Error = 'L' as u8,
+    Error = b'L',
     /// For Messages: space-separated list of messaged IDs of forwarded copies.
-    PrepForwards = 'P' as u8,
+    PrepForwards = b'P',
     /// For Jobs
-    SetLatitude = 'l' as u8,
+    SetLatitude = b'l',
     /// For Jobs
-    SetLongitude = 'n' as u8,
+    SetLongitude = b'n',
     /// For Jobs
-    ServerFolder = 'Z' as u8,
+    ServerFolder = b'Z',
     /// For Jobs
-    ServerUid = 'z' as u8,
+    ServerUid = b'z',
     /// For Jobs
-    AlsoMove = 'M' as u8,
+    AlsoMove = b'M',
     /// For Jobs: space-separated list of message recipients
-    Recipients = 'R' as u8,
+    Recipients = b'R',
     // For Groups
-    Unpromoted = 'U' as u8,
+    Unpromoted = b'U',
     // For Groups and Contacts
-    ProfileImage = 'i' as u8,
+    ProfileImage = b'i',
     // For Chats
-    Selftalk = 'K' as u8,
+    Selftalk = b'K',
     // For QR
-    Auth = 's' as u8,
+    Auth = b's',
     // For QR
-    GroupId = 'x' as u8,
+    GroupId = b'x',
     // For QR
-    GroupName = 'g' as u8,
+    GroupName = b'g',
     // For Jobs: space-separated list of keys or key=value pairs
     // CR, LF, ' ', '=' and '\' are escaped as '\r', '\n', '\s', '\e' and '\\', respectively
-    Metadata = 'D' as u8,
+    Metadata = b'D',
 }
 
 /// Possible values for `Param::ForcePlaintext`.
@@ -99,7 +100,7 @@ impl fmt::Display for Params {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, (key, value)) in self.inner.iter().enumerate() {
             if i > 0 {
-                write!(f, "\n")?;
+                writeln!(f)?;
             }
             write!(f, "{}={}", *key as u8 as char, value)?;
         }
@@ -126,8 +127,8 @@ impl str::FromStr for Params {
             ensure!(key.is_some(), "Missing key");
             ensure!(value.is_some(), "Missing value");
 
-            let key = key.unwrap().trim();
-            let value = value.unwrap().trim();
+            let key = key.unwrap_or_default().trim();
+            let value = value.unwrap_or_default().trim();
 
             if let Some(key) = Param::from_u8(key.as_bytes()[0]) {
                 inner.insert(key, value.to_string());
@@ -205,6 +206,13 @@ impl Params {
     /// Get the given parameter and parse as `i32`.
     pub fn get_int(&self, key: Param) -> Option<i32> {
         self.get(key).and_then(|s| s.parse().ok())
+    }
+
+    /// Get the parameter behind `Param::Cmd` interpreted as `SystemMessage`.
+    pub fn get_cmd(&self) -> SystemMessage {
+        self.get_int(Param::Cmd)
+            .and_then(SystemMessage::from_i32)
+            .unwrap_or_default()
     }
 
     /// Get the given parameter and parse as `f64`.

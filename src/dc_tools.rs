@@ -1,27 +1,26 @@
+//! Some tools and enhancements to the used libraries, there should be
+//! no references to Context and other "larger" entities here.
+
+use core::cmp::max;
 use std::borrow::Cow;
 use std::ffi::{CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 use std::{fmt, fs, ptr};
 
 use chrono::{Local, TimeZone};
-use mmime::mailimf_types::*;
+use libc::{memcpy, strlen};
+use mmime::clist::*;
+use mmime::mailimf::types::*;
 use rand::{thread_rng, Rng};
 
 use crate::config::Config;
 use crate::context::Context;
 use crate::error::Error;
-use crate::types::*;
-use crate::x::*;
+use crate::events::Event;
 
-use itertools::max;
-
-/* Some tools and enhancements to the used libraries, there should be
-no references to Context and other "larger" classes here. */
-/* ** library-private **********************************************************/
-/* math tools */
-pub fn dc_exactly_one_bit_set(v: libc::c_int) -> bool {
+pub(crate) fn dc_exactly_one_bit_set(v: libc::c_int) -> bool {
     0 != v && 0 == v & (v - 1)
 }
 
@@ -32,11 +31,11 @@ pub fn dc_exactly_one_bit_set(v: libc::c_int) -> bool {
 /// # Examples
 ///
 /// ```
-/// use deltachat::dc_tools::{dc_strdup, to_string};
+/// use deltachat::dc_tools::{dc_strdup, to_string_lossy};
 /// unsafe {
 ///     let str_a = b"foobar\x00" as *const u8 as *const libc::c_char;
 ///     let str_a_copy = dc_strdup(str_a);
-///     assert_eq!(to_string(str_a_copy), "foobar");
+///     assert_eq!(to_string_lossy(str_a_copy), "foobar");
 ///     assert_ne!(str_a, str_a_copy);
 /// }
 /// ```
@@ -46,83 +45,15 @@ pub unsafe fn dc_strdup(s: *const libc::c_char) -> *mut libc::c_char {
         ret = strdup(s);
         assert!(!ret.is_null());
     } else {
-        ret = calloc(1, 1) as *mut libc::c_char;
+        ret = libc::calloc(1, 1) as *mut libc::c_char;
         assert!(!ret.is_null());
     }
 
     ret
 }
 
-/// Duplicates a string, returns null if given string is null
-///
-/// # Examples
-///
-/// ```
-/// use deltachat::dc_tools::{dc_strdup_keep_null, to_string};
-/// use std::ffi::{CStr};
-///
-/// unsafe {
-///     let str_a = b"foobar\x00" as *const u8 as *const libc::c_char;
-///     let str_a_copy = dc_strdup_keep_null(str_a);
-///     assert_eq!(to_string(str_a_copy), "foobar");
-///     assert_ne!(str_a, str_a_copy);
-/// }
-/// ```
-pub unsafe fn dc_strdup_keep_null(s: *const libc::c_char) -> *mut libc::c_char {
-    if !s.is_null() {
-        dc_strdup(s)
-    } else {
-        ptr::null_mut()
-    }
-}
-
-pub unsafe fn dc_atoi_null_is_0(s: *const libc::c_char) -> libc::c_int {
-    if !s.is_null() {
-        as_str(s).parse().unwrap_or_default()
-    } else {
-        0
-    }
-}
-
-pub fn dc_atof(s: *const libc::c_char) -> libc::c_double {
-    if s.is_null() {
-        return 0.;
-    }
-
-    as_str(s).parse().unwrap_or_default()
-}
-
-pub unsafe fn dc_str_replace(
-    haystack: *mut *mut libc::c_char,
-    needle: *const libc::c_char,
-    replacement: *const libc::c_char,
-) {
-    let haystack_s = to_string(*haystack);
-    let needle_s = to_string(needle);
-    let replacement_s = to_string(replacement);
-
-    free(*haystack as *mut libc::c_void);
-
-    *haystack = haystack_s.replace(&needle_s, &replacement_s).strdup();
-}
-
-pub unsafe fn dc_ftoa(f: libc::c_double) -> *mut libc::c_char {
-    // hack around printf(%f) that may return `,` as decimal point on mac
-    let test: *mut libc::c_char = dc_mprintf(b"%f\x00" as *const u8 as *const libc::c_char, 1.2f64);
-    *test.offset(2isize) = 0 as libc::c_char;
-    let mut str: *mut libc::c_char = dc_mprintf(b"%f\x00" as *const u8 as *const libc::c_char, f);
-    dc_str_replace(
-        &mut str,
-        test.offset(1isize),
-        b".\x00" as *const u8 as *const libc::c_char,
-    );
-    free(test as *mut libc::c_void);
-
-    str
-}
-
 unsafe fn dc_ltrim(buf: *mut libc::c_char) {
-    let mut len: size_t;
+    let mut len: libc::size_t;
     let mut cur: *const libc::c_uchar;
     if !buf.is_null() && 0 != *buf as libc::c_int {
         len = strlen(buf);
@@ -132,7 +63,7 @@ unsafe fn dc_ltrim(buf: *mut libc::c_char) {
             len = len.wrapping_sub(1)
         }
         if buf as *const libc::c_uchar != cur {
-            memmove(
+            libc::memmove(
                 buf as *mut libc::c_void,
                 cur as *const libc::c_void,
                 len.wrapping_add(1),
@@ -142,7 +73,7 @@ unsafe fn dc_ltrim(buf: *mut libc::c_char) {
 }
 
 unsafe fn dc_rtrim(buf: *mut libc::c_char) {
-    let mut len: size_t;
+    let mut len: libc::size_t;
     let mut cur: *mut libc::c_uchar;
     if !buf.is_null() && 0 != *buf as libc::c_int {
         len = strlen(buf);
@@ -163,28 +94,13 @@ unsafe fn dc_rtrim(buf: *mut libc::c_char) {
     };
 }
 
-pub unsafe fn dc_trim(buf: *mut libc::c_char) {
+pub(crate) unsafe fn dc_trim(buf: *mut libc::c_char) {
     dc_ltrim(buf);
     dc_rtrim(buf);
 }
 
-/* the result must be free()'d */
-pub unsafe fn dc_null_terminate(
-    in_0: *const libc::c_char,
-    bytes: libc::c_int,
-) -> *mut libc::c_char {
-    let out: *mut libc::c_char = malloc(bytes as usize + 1) as *mut libc::c_char;
-    assert!(!out.is_null());
-    if !in_0.is_null() && bytes > 0 {
-        strncpy(out, in_0, bytes as usize);
-    }
-    *out.offset(bytes as isize) = 0 as libc::c_char;
-
-    out
-}
-
 /* remove all \r characters from string */
-pub unsafe fn dc_remove_cr_chars(buf: *mut libc::c_char) {
+pub(crate) unsafe fn dc_remove_cr_chars(buf: *mut libc::c_char) {
     /* search for first `\r` */
     let mut p1: *const libc::c_char = buf;
     while 0 != *p1 {
@@ -205,158 +121,30 @@ pub unsafe fn dc_remove_cr_chars(buf: *mut libc::c_char) {
     *p2 = 0 as libc::c_char;
 }
 
-/* replace bad UTF-8 characters by sequences of `_` (to avoid problems in filenames, we do not use eg. `?`) the function is useful if strings are unexpectingly encoded eg. as ISO-8859-1 */
-#[allow(non_snake_case)]
-pub unsafe fn dc_replace_bad_utf8_chars(buf: *mut libc::c_char) {
-    let mut OK_TO_CONTINUE = true;
-    if buf.is_null() {
-        return;
-    }
-    /* force unsigned - otherwise the `> ' '` comparison will fail */
-    let mut p1: *mut libc::c_uchar = buf as *mut libc::c_uchar;
-    let p1len: libc::c_int = strlen(buf) as libc::c_int;
-    let mut c: libc::c_int;
-    let mut i: libc::c_int;
-    let ix: libc::c_int;
-    let mut n: libc::c_int;
-    let mut j: libc::c_int;
-    i = 0;
-    ix = p1len;
-    's_36: loop {
-        if !(i < ix) {
-            break;
-        }
-        c = *p1.offset(i as isize) as libc::c_int;
-        if c > 0 && c <= 0x7f {
-            n = 0
-        } else if c & 0xe0 == 0xc0 {
-            n = 1
-        } else if c == 0xed
-            && i < ix - 1
-            && *p1.offset((i + 1) as isize) as libc::c_int & 0xa0 == 0xa0
-        {
-            /* U+d800 to U+dfff */
-            OK_TO_CONTINUE = false;
-            break;
-        } else if c & 0xf0 == 0xe0 {
-            n = 2
-        } else if c & 0xf8 == 0xf0 {
-            n = 3
-        } else {
-            //else if ((c & 0xFC) == 0xF8)                          { n=4; }        /* 111110bb - not valid in https://tools.ietf.org/html/rfc3629 */
-            //else if ((c & 0xFE) == 0xFC)                          { n=5; }        /* 1111110b - not valid in https://tools.ietf.org/html/rfc3629 */
-            OK_TO_CONTINUE = false;
-            break;
-        }
-        j = 0;
-        while j < n && i < ix {
-            /* n bytes matching 10bbbbbb follow ? */
-            i += 1;
-            if i == ix || *p1.offset(i as isize) as libc::c_int & 0xc0 != 0x80 {
-                OK_TO_CONTINUE = false;
-                break 's_36;
-            }
-            j += 1
-        }
-        i += 1
-    }
-    if OK_TO_CONTINUE == false {
-        while 0 != *p1 {
-            if *p1 as libc::c_int > 0x7f {
-                *p1 = '_' as i32 as libc::c_uchar
-            }
-            p1 = p1.offset(1isize)
-        }
-        return;
-    }
-}
-
 /// Shortens a string to a specified length and adds "..." or "[...]" to the end of
 /// the shortened string.
-///
-/// # Examples
-/// ```
-/// use deltachat::dc_tools::dc_truncate;
-///
-/// let s = "this is a little test string";
-/// assert_eq!(dc_truncate(s, 16, false), "this is a [...]");
-/// assert_eq!(dc_truncate(s, 16, true), "this is a ...");
-/// ```
-pub fn dc_truncate(buf: &str, approx_chars: usize, do_unwrap: bool) -> Cow<str> {
+pub(crate) fn dc_truncate(buf: &str, approx_chars: usize, do_unwrap: bool) -> Cow<str> {
     let ellipse = if do_unwrap { "..." } else { "[...]" };
 
-    if approx_chars > 0 && buf.len() > approx_chars + ellipse.len() {
-        if let Some(index) = buf[..approx_chars].rfind(|c| c == ' ' || c == '\n') {
-            Cow::Owned(format!("{}{}", &buf[..index + 1], ellipse))
+    let count = buf.chars().count();
+    if approx_chars > 0 && count > approx_chars + ellipse.len() {
+        let end_pos = buf
+            .char_indices()
+            .nth(approx_chars)
+            .map(|(n, _)| n)
+            .unwrap_or_default();
+
+        if let Some(index) = buf[..end_pos].rfind(|c| c == ' ' || c == '\n') {
+            Cow::Owned(format!("{}{}", &buf[..=index], ellipse))
         } else {
-            Cow::Owned(format!("{}{}", &buf[..approx_chars], ellipse))
+            Cow::Owned(format!("{}{}", &buf[..end_pos], ellipse))
         }
     } else {
         Cow::Borrowed(buf)
     }
 }
 
-#[allow(non_snake_case)]
-pub unsafe fn dc_truncate_n_unwrap_str(
-    buf: *mut libc::c_char,
-    approx_characters: libc::c_int,
-    do_unwrap: libc::c_int,
-) {
-    /* Function unwraps the given string and removes unnecessary whitespace.
-    Function stops processing after approx_characters are processed.
-    (as we're using UTF-8, for simplicity, we cut the string only at whitespaces). */
-    /* a single line is truncated `...` instead of `[...]` (the former is typically also used by the UI to fit strings in a rectangle) */
-    let ellipse_utf8: *const libc::c_char = if 0 != do_unwrap {
-        b" ...\x00" as *const u8 as *const libc::c_char
-    } else {
-        b" [...]\x00" as *const u8 as *const libc::c_char
-    };
-    let mut lastIsCharacter: libc::c_int = 0;
-    /* force unsigned - otherwise the `> ' '` comparison will fail */
-    let mut p1: *mut libc::c_uchar = buf as *mut libc::c_uchar;
-    while 0 != *p1 {
-        if *p1 as libc::c_int > ' ' as i32 {
-            lastIsCharacter = 1
-        } else if 0 != lastIsCharacter {
-            let used_bytes: size_t = (p1 as uintptr_t).wrapping_sub(buf as uintptr_t) as size_t;
-            if dc_utf8_strnlen(buf, used_bytes) >= approx_characters as usize {
-                let buf_bytes: size_t = strlen(buf);
-                if buf_bytes.wrapping_sub(used_bytes) >= strlen(ellipse_utf8) {
-                    strcpy(p1 as *mut libc::c_char, ellipse_utf8);
-                }
-                break;
-            } else {
-                lastIsCharacter = 0;
-                if 0 != do_unwrap {
-                    *p1 = ' ' as i32 as libc::c_uchar
-                }
-            }
-        } else if 0 != do_unwrap {
-            *p1 = '\r' as i32 as libc::c_uchar
-        }
-        p1 = p1.offset(1isize)
-    }
-    if 0 != do_unwrap {
-        dc_remove_cr_chars(buf);
-    };
-}
-
-unsafe fn dc_utf8_strnlen(s: *const libc::c_char, n: size_t) -> size_t {
-    if s.is_null() {
-        return 0;
-    }
-
-    let mut j: size_t = 0;
-    for i in 0..n {
-        if *s.add(i) as libc::c_int & 0xc0 != 0x80 {
-            j = j.wrapping_add(1)
-        }
-    }
-
-    j
-}
-
-pub unsafe fn dc_str_from_clist(
+pub(crate) unsafe fn dc_str_from_clist(
     list: *const clist,
     delimiter: *const libc::c_char,
 ) -> *mut libc::c_char {
@@ -388,32 +176,14 @@ pub unsafe fn dc_str_from_clist(
     res.strdup()
 }
 
-pub unsafe fn dc_str_to_clist(
-    str: *const libc::c_char,
-    delimiter: *const libc::c_char,
-) -> *mut clist {
-    let list: *mut clist = clist_new();
-    assert!(!list.is_null());
-
-    if !str.is_null() && !delimiter.is_null() && strlen(delimiter) >= 1 {
-        let mut p1: *const libc::c_char = str;
-        loop {
-            let p2: *const libc::c_char = strstr(p1, delimiter);
-            if p2.is_null() {
-                clist_insert_after(list, (*list).last, strdup(p1) as *mut libc::c_void);
-                break;
-            } else {
-                clist_insert_after(
-                    list,
-                    (*list).last,
-                    strndup(p1, p2.wrapping_offset_from(p1) as libc::c_ulong) as *mut libc::c_void,
-                );
-                p1 = p2.add(strlen(delimiter))
-            }
+pub(crate) fn dc_str_to_clist(str: &str, delimiter: &str) -> *mut clist {
+    unsafe {
+        let list: *mut clist = clist_new();
+        for cur in str.split(&delimiter) {
+            clist_insert_after(list, (*list).last, cur.strdup().cast());
         }
+        list
     }
-
-    list
 }
 
 /* the colors must fulfill some criterions as:
@@ -427,7 +197,7 @@ const COLORS: [u32; 16] = [
     0x39b249, 0xbb243b, 0x964078, 0x66874f, 0x308ab9, 0x127ed0, 0xbe450c,
 ];
 
-pub fn dc_str_to_color(s: impl AsRef<str>) -> u32 {
+pub(crate) fn dc_str_to_color(s: impl AsRef<str>) -> u32 {
     let str_lower = s.as_ref().to_lowercase();
     let mut checksum = 0;
     let bytes = str_lower.as_bytes();
@@ -440,64 +210,28 @@ pub fn dc_str_to_color(s: impl AsRef<str>) -> u32 {
     COLORS[color_index]
 }
 
-/* clist tools */
-/* calls free() for each item content */
-pub unsafe fn clist_free_content(haystack: *const clist) {
-    let mut iter = (*haystack).first;
-
-    while !iter.is_null() {
-        free((*iter).data);
-        (*iter).data = ptr::null_mut();
-        iter = if !iter.is_null() {
-            (*iter).next
-        } else {
-            ptr::null_mut()
-        }
-    }
-}
-
-pub unsafe fn clist_search_string_nocase(
-    haystack: *const clist,
-    needle: *const libc::c_char,
-) -> libc::c_int {
-    let mut iter = (*haystack).first;
-
-    while !iter.is_null() {
-        if strcasecmp((*iter).data as *const libc::c_char, needle) == 0 {
-            return 1;
-        }
-        iter = if !iter.is_null() {
-            (*iter).next
-        } else {
-            ptr::null_mut()
-        }
-    }
-
-    0
-}
-
 /* date/time tools */
 /* the result is UTC or DC_INVALID_TIMESTAMP */
-pub unsafe fn dc_timestamp_from_date(date_time: *mut mailimf_date_time) -> i64 {
-    let sec = (*date_time).dt_sec;
-    let min = (*date_time).dt_min;
-    let hour = (*date_time).dt_hour;
-    let day = (*date_time).dt_day;
-    let month = (*date_time).dt_month;
-    let year = (*date_time).dt_year;
+pub(crate) fn dc_timestamp_from_date(date_time: *mut mailimf_date_time) -> i64 {
+    assert!(!date_time.is_null());
+    let dt = unsafe { *date_time };
+
+    let sec = dt.dt_sec;
+    let min = dt.dt_min;
+    let hour = dt.dt_hour;
+    let day = dt.dt_day;
+    let month = dt.dt_month;
+    let year = dt.dt_year;
 
     let ts = chrono::NaiveDateTime::new(
         chrono::NaiveDate::from_ymd(year, month as u32, day as u32),
         chrono::NaiveTime::from_hms(hour as u32, min as u32, sec as u32),
     );
 
-    let (zone_hour, zone_min) = if (*date_time).dt_zone >= 0 {
-        ((*date_time).dt_zone / 100, (*date_time).dt_zone % 100)
+    let (zone_hour, zone_min) = if dt.dt_zone >= 0 {
+        (dt.dt_zone / 100, dt.dt_zone % 100)
     } else {
-        (
-            -(-(*date_time).dt_zone / 100),
-            -(-(*date_time).dt_zone % 100),
-        )
+        (-(-dt.dt_zone / 100), -(-dt.dt_zone % 100))
     };
 
     ts.timestamp() - (zone_hour * 3600 + zone_min * 60) as i64
@@ -512,13 +246,13 @@ pub fn dc_timestamp_to_str(wanted: i64) -> String {
     ts.format("%Y.%m.%d %H:%M:%S").to_string()
 }
 
-pub fn dc_gm2local_offset() -> i64 {
+pub(crate) fn dc_gm2local_offset() -> i64 {
     let lt = Local::now();
     ((lt.offset().local_minus_utc() / (60 * 60)) * 100) as i64
 }
 
 /* timesmearing */
-pub unsafe fn dc_smeared_time(context: &Context) -> i64 {
+pub(crate) fn dc_smeared_time(context: &Context) -> i64 {
     /* function returns a corrected time(NULL) */
     let mut now = time();
     let ts = *context.last_smeared_timestamp.clone().read().unwrap();
@@ -529,7 +263,7 @@ pub unsafe fn dc_smeared_time(context: &Context) -> i64 {
     now
 }
 
-pub fn dc_create_smeared_timestamp(context: &Context) -> i64 {
+pub(crate) fn dc_create_smeared_timestamp(context: &Context) -> i64 {
     let now = time();
     let mut ret = now;
 
@@ -544,7 +278,7 @@ pub fn dc_create_smeared_timestamp(context: &Context) -> i64 {
     ret
 }
 
-pub fn dc_create_smeared_timestamps(context: &Context, count: libc::c_int) -> i64 {
+pub(crate) fn dc_create_smeared_timestamps(context: &Context, count: usize) -> i64 {
     /* get a range to timestamps that can be used uniquely */
     let now = time();
     let start = now + (if count < 5 { count } else { 5 }) as i64 - count as i64;
@@ -558,7 +292,7 @@ pub fn dc_create_smeared_timestamps(context: &Context, count: libc::c_int) -> i6
 }
 
 /* Message-ID tools */
-pub fn dc_create_id() -> String {
+pub(crate) fn dc_create_id() -> String {
     /* generate an id. the generated ID should be as short and as unique as possible:
     - short, because it may also used as part of Message-ID headers or in QR codes
     - unique as two IDs generated on two devices should not be the same. However, collisions are not world-wide but only by the few contacts.
@@ -571,7 +305,7 @@ pub fn dc_create_id() -> String {
     - the group-id should be a string with the characters [a-zA-Z0-9\-_] */
 
     let mut rng = thread_rng();
-    let buf: [uint32_t; 3] = [rng.gen(), rng.gen(), rng.gen()];
+    let buf: [u32; 3] = [rng.gen(), rng.gen(), rng.gen()];
 
     encode_66bits_as_base64(buf[0usize], buf[1usize], buf[2usize])
 }
@@ -594,27 +328,26 @@ fn encode_66bits_as_base64(v1: u32, v2: u32, fill: u32) -> String {
         enc.write_u8(((fill & 0x3) as u8) << 6).unwrap();
         enc.finish().unwrap();
     }
-    assert_eq!(wrapped_writer.pop(), Some('A' as u8)); // Remove last "A"
+    assert_eq!(wrapped_writer.pop(), Some(b'A')); // Remove last "A"
     String::from_utf8(wrapped_writer).unwrap()
 }
 
-pub unsafe fn dc_create_incoming_rfc724_mid(
+pub(crate) fn dc_create_incoming_rfc724_mid(
     message_timestamp: i64,
     contact_id_from: u32,
-    contact_ids_to: &Vec<u32>,
-) -> *mut libc::c_char {
+    contact_ids_to: &[u32],
+) -> Option<String> {
     if contact_ids_to.is_empty() {
-        return ptr::null_mut();
+        return None;
     }
     /* find out the largest receiver ID (we could also take the smallest, but it should be unique) */
-    let largest_id_to = max(contact_ids_to.iter());
+    let largest_id_to = contact_ids_to.iter().max().copied().unwrap_or_default();
 
-    dc_mprintf(
-        b"%lu-%lu-%lu@stub\x00" as *const u8 as *const libc::c_char,
-        message_timestamp as libc::c_ulong,
-        contact_id_from as libc::c_ulong,
-        *largest_id_to.unwrap() as libc::c_ulong,
-    )
+    let result = format!(
+        "{}-{}-{}@stub",
+        message_timestamp, contact_id_from, largest_id_to
+    );
+    Some(result)
 }
 
 pub fn dc_create_outgoing_rfc724_mid(
@@ -627,10 +360,10 @@ pub fn dc_create_outgoing_rfc724_mid(
     - the message ID should be globally unique
     - do not add a counter or any private data as as this may give unneeded information to the receiver	*/
 
-    let at_hostname = match from_addr.find('@') {
-        None => "@nohost",
-        Some(pos) => &from_addr[pos..]
-    };
+    let at_hostname = from_addr
+        .find('@')
+        .map(|k| &from_addr[k..])
+        .unwrap_or("@nohost");
 
     match group_id {
         None => {
@@ -704,8 +437,8 @@ const NEW_GROUP_ID_PREFIX: &str = "chat$group.";
 /// let grpid = dc_extract_grpid_from_rfc724_mid(mid);
 /// assert_eq!(grpid, Some("12345678901"));
 /// ```
-pub fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
-    if mid.len() < 9 {
+pub(crate) fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
+    if mid.len() < 9 || !mid.starts_with("Gr.") {
         return None;
     }
 
@@ -726,23 +459,15 @@ pub fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
     None
 }
 
-pub unsafe fn dc_extract_grpid_from_rfc724_mid_list(list: *const clist) -> *mut libc::c_char {
+pub(crate) fn dc_extract_grpid_from_rfc724_mid_list(list: *const clist) -> *mut libc::c_char {
     if !list.is_null() {
-        let mut cur: *mut clistiter = (*list).first;
-        while !cur.is_null() {
-            let mid = if !cur.is_null() {
-                as_str((*cur).data as *const libc::c_char)
-            } else {
-                ""
-            };
+        unsafe {
+            for cur in (*list).into_iter() {
+                let mid = as_str(cur as *const libc::c_char);
 
-            if let Some(grpid) = dc_extract_grpid_from_rfc724_mid(mid) {
-                return grpid.strdup();
-            }
-            cur = if !cur.is_null() {
-                (*cur).next
-            } else {
-                ptr::null_mut()
+                if let Some(grpid) = dc_extract_grpid_from_rfc724_mid(mid) {
+                    return grpid.strdup();
+                }
             }
         }
     }
@@ -750,88 +475,57 @@ pub unsafe fn dc_extract_grpid_from_rfc724_mid_list(list: *const clist) -> *mut 
     ptr::null_mut()
 }
 
-#[allow(non_snake_case)]
-unsafe fn dc_ensure_no_slash(pathNfilename: *mut libc::c_char) {
-    let path_len = strlen(pathNfilename);
-    if path_len > 0 && *pathNfilename.add(path_len - 1) as libc::c_int == '/' as i32
-        || *pathNfilename.add(path_len - 1) as libc::c_int == '\\' as i32
-    {
-        *pathNfilename.add(path_len - 1) = 0 as libc::c_char;
-    }
-}
-
-pub fn dc_ensure_no_slash_safe(path: &str) -> &str {
+pub(crate) fn dc_ensure_no_slash_safe(path: &str) -> &str {
     if path.ends_with('/') || path.ends_with('\\') {
         return &path[..path.len() - 1];
     }
     path
 }
 
-unsafe fn dc_validate_filename(filename: *mut libc::c_char) {
-    /* function modifies the given buffer and replaces all characters not valid in filenames by a "-" */
-    let mut p1: *mut libc::c_char = filename;
-    while 0 != *p1 {
-        if *p1 as libc::c_int == '/' as i32
-            || *p1 as libc::c_int == '\\' as i32
-            || *p1 as libc::c_int == ':' as i32
-        {
-            *p1 = '-' as i32 as libc::c_char
-        }
-        p1 = p1.offset(1isize)
+// Function returns a sanitized basename that does not contain
+// win/linux path separators and also not any non-ascii chars
+fn get_safe_basename(filename: &str) -> String {
+    // return the (potentially mangled) basename of the input filename
+    // this might be a path that comes in from another operating system
+    let mut index: usize = 0;
+
+    if let Some(unix_index) = filename.rfind('/') {
+        index = unix_index + 1;
+    }
+    if let Some(win_index) = filename.rfind('\\') {
+        index = max(index, win_index + 1);
+    }
+    if index >= filename.len() {
+        "nobasename".to_string()
+    } else {
+        // we don't allow any non-ascii to be super-safe
+        filename[index..].replace(|c: char| !c.is_ascii() || c == ':', "-")
     }
 }
 
-pub unsafe fn dc_get_filename(path_filename: impl AsRef<str>) -> *mut libc::c_char {
-    if let Some(p) = Path::new(path_filename.as_ref()).file_name() {
-        p.to_string_lossy().strdup()
+pub fn dc_derive_safe_stem_ext(filename: &str) -> (String, String) {
+    let basename = get_safe_basename(&filename);
+    let (mut stem, mut ext) = if let Some(index) = basename.rfind('.') {
+        (
+            basename[0..index].to_string(),
+            basename[index..].to_string(),
+        )
     } else {
-        ptr::null_mut()
-    }
-}
-
-// the case of the suffix is preserved
-#[allow(non_snake_case)]
-unsafe fn dc_split_filename(
-    pathNfilename: *const libc::c_char,
-    ret_basename: *mut *mut libc::c_char,
-    ret_all_suffixes_incl_dot: *mut *mut libc::c_char,
-) {
-    if pathNfilename.is_null() {
-        return;
-    }
-    /* splits a filename into basename and all suffixes, eg. "/path/foo.tar.gz" is split into "foo.tar" and ".gz",
-    (we use the _last_ dot which allows the usage inside the filename which are very usual;
-    maybe the detection could be more intelligent, however, for the moment, it is just file)
-    - if there is no suffix, the returned suffix string is empty, eg. "/path/foobar" is split into "foobar" and ""
-    - the case of the returned suffix is preserved; this is to allow reconstruction of (similar) names */
-    let basename: *mut libc::c_char = dc_get_filename(as_str(pathNfilename));
-    let suffix: *mut libc::c_char;
-    let p1: *mut libc::c_char = strrchr(basename, '.' as i32);
-    if !p1.is_null() {
-        suffix = dc_strdup(p1);
-        *p1 = 0 as libc::c_char
-    } else {
-        suffix = dc_strdup(ptr::null())
-    }
-    if !ret_basename.is_null() {
-        *ret_basename = basename
-    } else {
-        free(basename as *mut libc::c_void);
-    }
-    if !ret_all_suffixes_incl_dot.is_null() {
-        *ret_all_suffixes_incl_dot = suffix
-    } else {
-        free(suffix as *mut libc::c_void);
+        (basename, "".to_string())
     };
+    // limit length of stem and ext
+    stem.truncate(32);
+    ext.truncate(32);
+    (stem, ext)
 }
 
 // the returned suffix is lower-case
 #[allow(non_snake_case)]
-pub unsafe fn dc_get_filesuffix_lc(path_filename: impl AsRef<str>) -> *mut libc::c_char {
+pub fn dc_get_filesuffix_lc(path_filename: impl AsRef<str>) -> Option<String> {
     if let Some(p) = Path::new(path_filename.as_ref()).extension() {
-        p.to_string_lossy().to_lowercase().strdup()
+        Some(p.to_string_lossy().to_lowercase())
     } else {
-        ptr::null_mut()
+        None
     }
 }
 
@@ -846,85 +540,69 @@ pub fn dc_get_filemeta(buf: &[u8]) -> Result<(u32, u32), Error> {
 ///
 /// If `path` starts with "$BLOBDIR", replaces it with the blobdir path.
 /// Otherwise, returns path as is.
-pub fn dc_get_abs_path_safe<P: AsRef<std::path::Path>>(
+pub(crate) fn dc_get_abs_path<P: AsRef<std::path::Path>>(
     context: &Context,
     path: P,
 ) -> std::path::PathBuf {
     let p: &std::path::Path = path.as_ref();
     if let Ok(p) = p.strip_prefix("$BLOBDIR") {
-        assert!(
-            context.has_blobdir(),
-            "Expected context to have blobdir to substitute $BLOBDIR",
-        );
-        std::path::PathBuf::from(as_str(context.get_blobdir())).join(p)
+        context.get_blobdir().join(p)
     } else {
         p.into()
     }
 }
 
-pub unsafe fn dc_get_abs_path(
-    context: &Context,
-    path_filename: impl AsRef<str>,
-) -> *mut libc::c_char {
-    let starts = path_filename.as_ref().starts_with("$BLOBDIR");
-
-    if starts && !context.has_blobdir() {
-        return ptr::null_mut();
-    }
-
-    let mut path_filename_abs = path_filename.as_ref().strdup();
-    if starts && context.has_blobdir() {
-        dc_str_replace(
-            &mut path_filename_abs,
-            b"$BLOBDIR\x00" as *const u8 as *const libc::c_char,
-            context.get_blobdir(),
-        );
-    }
-    path_filename_abs
+pub(crate) fn dc_file_exist(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
+    dc_get_abs_path(context, &path).exists()
 }
 
-pub fn dc_file_exist(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
-    dc_get_abs_path_safe(context, &path).exists()
-}
-
-pub fn dc_get_filebytes(context: &Context, path: impl AsRef<std::path::Path>) -> uint64_t {
-    let path_abs = dc_get_abs_path_safe(context, &path);
+pub(crate) fn dc_get_filebytes(context: &Context, path: impl AsRef<std::path::Path>) -> u64 {
+    let path_abs = dc_get_abs_path(context, &path);
     match fs::metadata(&path_abs) {
-        Ok(meta) => meta.len() as uint64_t,
+        Ok(meta) => meta.len() as u64,
         Err(_err) => 0,
     }
 }
 
-pub fn dc_delete_file(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
-    let path_abs = dc_get_abs_path_safe(context, &path);
-    let res = if path_abs.is_file() {
-        fs::remove_file(path_abs)
-    } else {
-        fs::remove_dir_all(path_abs)
-    };
+pub(crate) fn dc_delete_file(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
+    let path_abs = dc_get_abs_path(context, &path);
+    if !path_abs.exists() {
+        return false;
+    }
+    if !path_abs.is_file() {
+        warn!(
+            context,
+            "refusing to delete non-file \"{}\".",
+            path.as_ref().display()
+        );
+        return false;
+    }
 
-    match res {
-        Ok(_) => true,
+    let dpath = format!("{}", path.as_ref().to_string_lossy());
+    match fs::remove_file(path_abs) {
+        Ok(_) => {
+            context.call_cb(Event::DeletedBlobFile(dpath));
+            true
+        }
         Err(_err) => {
-            warn!(context, 0, "Cannot delete \"{}\".", path.as_ref().display());
+            warn!(context, "Cannot delete \"{}\".", dpath);
             false
         }
     }
 }
 
-pub fn dc_copy_file(
+pub(crate) fn dc_copy_file(
     context: &Context,
     src: impl AsRef<std::path::Path>,
     dest: impl AsRef<std::path::Path>,
 ) -> bool {
-    let src_abs = dc_get_abs_path_safe(context, &src);
-    let dest_abs = dc_get_abs_path_safe(context, &dest);
+    let src_abs = dc_get_abs_path(context, &src);
+    let dest_abs = dc_get_abs_path(context, &dest);
     match fs::copy(&src_abs, &dest_abs) {
         Ok(_) => true,
         Err(_) => {
             error!(
                 context,
-                0,
                 "Cannot copy \"{}\" to \"{}\".",
                 src.as_ref().display(),
                 dest.as_ref().display(),
@@ -934,15 +612,14 @@ pub fn dc_copy_file(
     }
 }
 
-pub fn dc_create_folder(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
-    let path_abs = dc_get_abs_path_safe(context, &path);
+pub(crate) fn dc_create_folder(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
+    let path_abs = dc_get_abs_path(context, &path);
     if !path_abs.exists() {
         match fs::create_dir_all(path_abs) {
             Ok(_) => true,
             Err(_err) => {
                 warn!(
                     context,
-                    0,
                     "Cannot create directory \"{}\".",
                     path.as_ref().display(),
                 );
@@ -954,28 +631,12 @@ pub fn dc_create_folder(context: &Context, path: impl AsRef<std::path::Path>) ->
     }
 }
 
-#[allow(non_snake_case)]
-pub unsafe fn dc_write_file(
-    context: &Context,
-    pathNfilename: *const libc::c_char,
-    buf: *const libc::c_void,
-    buf_bytes: size_t,
-) -> libc::c_int {
-    let bytes = std::slice::from_raw_parts(buf as *const u8, buf_bytes);
-
-    dc_write_file_safe(context, as_str(pathNfilename), bytes) as libc::c_int
-}
-
-pub fn dc_write_file_safe<P: AsRef<std::path::Path>>(
-    context: &Context,
-    path: P,
-    buf: &[u8],
-) -> bool {
-    let path_abs = dc_get_abs_path_safe(context, &path);
+/// Write a the given content to provied file path.
+pub(crate) fn dc_write_file(context: &Context, path: impl AsRef<Path>, buf: &[u8]) -> bool {
+    let path_abs = dc_get_abs_path(context, &path);
     if let Err(_err) = fs::write(&path_abs, buf) {
         warn!(
             context,
-            0,
             "Cannot write {} bytes to \"{}\".",
             buf.len(),
             path.as_ref().display(),
@@ -986,140 +647,78 @@ pub fn dc_write_file_safe<P: AsRef<std::path::Path>>(
     }
 }
 
-#[allow(non_snake_case)]
-pub unsafe fn dc_read_file(
+pub fn dc_read_file<P: AsRef<std::path::Path>>(
     context: &Context,
-    pathNfilename: *const libc::c_char,
-    buf: *mut *mut libc::c_void,
-    buf_bytes: *mut size_t,
-) -> libc::c_int {
-    if pathNfilename.is_null() {
-        return 0;
-    }
-    if let Some(mut bytes) = dc_read_file_safe(context, as_str(pathNfilename)) {
-        *buf = &mut bytes[..] as *mut _ as *mut libc::c_void;
-        *buf_bytes = bytes.len();
-        std::mem::forget(bytes);
-        1
-    } else {
-        0
-    }
-}
+    path: P,
+) -> Result<Vec<u8>, Error> {
+    let path_abs = dc_get_abs_path(context, &path);
 
-pub fn dc_read_file_safe<P: AsRef<std::path::Path>>(context: &Context, path: P) -> Option<Vec<u8>> {
-    let path_abs = dc_get_abs_path_safe(context, &path);
     match fs::read(&path_abs) {
-        Ok(bytes) => Some(bytes),
-        Err(_err) => {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
             warn!(
                 context,
-                0,
                 "Cannot read \"{}\" or file is empty.",
                 path.as_ref().display()
             );
-            None
+            Err(err.into())
         }
     }
 }
 
-#[allow(non_snake_case)]
-pub unsafe fn dc_get_fine_pathNfilename(
-    context: &Context,
-    pathNfolder: *const libc::c_char,
-    desired_filenameNsuffix__: *const libc::c_char,
-) -> *mut libc::c_char {
-    let mut ret: *mut libc::c_char = ptr::null_mut();
-    let pathNfolder_wo_slash: *mut libc::c_char;
-    let filenameNsuffix: *mut libc::c_char;
-    let mut basename: *mut libc::c_char = ptr::null_mut();
-    let mut dotNSuffix: *mut libc::c_char = ptr::null_mut();
-    let now = time();
+pub(crate) fn dc_get_next_backup_path(
+    folder: impl AsRef<Path>,
+    backup_time: i64,
+) -> Result<PathBuf, Error> {
+    let folder = PathBuf::from(folder.as_ref());
+    let stem = chrono::NaiveDateTime::from_timestamp(backup_time, 0)
+        .format("delta-chat-%Y-%m-%d")
+        .to_string();
 
-    pathNfolder_wo_slash = dc_strdup(pathNfolder);
-    dc_ensure_no_slash(pathNfolder_wo_slash);
-    filenameNsuffix = dc_strdup(desired_filenameNsuffix__);
-    dc_validate_filename(filenameNsuffix);
-    dc_split_filename(filenameNsuffix, &mut basename, &mut dotNSuffix);
-
-    for i in 0..1000i64 {
-        /*no deadlocks, please*/
-        if 0 != i {
-            let idx = if i < 100 { i } else { now + i };
-            ret = dc_mprintf(
-                b"%s/%s-%lu%s\x00" as *const u8 as *const libc::c_char,
-                pathNfolder_wo_slash,
-                basename,
-                idx as libc::c_ulong,
-                dotNSuffix,
-            )
-        } else {
-            ret = dc_mprintf(
-                b"%s/%s%s\x00" as *const u8 as *const libc::c_char,
-                pathNfolder_wo_slash,
-                basename,
-                dotNSuffix,
-            )
+    // 64 backup files per day should be enough for everyone
+    for i in 0..64 {
+        let mut path = folder.clone();
+        path.push(format!("{}-{}.bak", stem, i));
+        if !path.exists() {
+            return Ok(path);
         }
-        if !dc_file_exist(context, as_path(ret)) {
-            /* fine filename found */
-            break;
-        }
-        free(ret as *mut libc::c_void);
-        ret = ptr::null_mut();
     }
-
-    free(filenameNsuffix as *mut libc::c_void);
-    free(basename as *mut libc::c_void);
-    free(dotNSuffix as *mut libc::c_void);
-    free(pathNfolder_wo_slash as *mut libc::c_void);
-
-    ret
+    bail!("could not create backup file, disk full?");
 }
 
-pub fn dc_is_blobdir_path(context: &Context, path: impl AsRef<str>) -> bool {
-    path.as_ref().starts_with(as_str(context.get_blobdir()))
+pub(crate) fn dc_is_blobdir_path(context: &Context, path: impl AsRef<str>) -> bool {
+    context
+        .get_blobdir()
+        .to_str()
+        .map(|s| path.as_ref().starts_with(s))
+        .unwrap_or_default()
         || path.as_ref().starts_with("$BLOBDIR")
 }
 
 fn dc_make_rel_path(context: &Context, path: &mut String) {
-    if path.starts_with(as_str(context.get_blobdir())) {
-        *path = path.replace("$BLOBDIR", as_str(context.get_blobdir()));
+    if context
+        .get_blobdir()
+        .to_str()
+        .map(|s| path.starts_with(s))
+        .unwrap_or_default()
+    {
+        *path = path.replace(
+            context.get_blobdir().to_str().unwrap_or_default(),
+            "$BLOBDIR",
+        );
     }
 }
 
-pub fn dc_make_rel_and_copy(context: &Context, path: &mut String) -> bool {
-    let mut success = false;
-    let mut filename = ptr::null_mut();
-    let mut blobdir_path = ptr::null_mut();
+pub(crate) fn dc_make_rel_and_copy(context: &Context, path: &mut String) -> bool {
     if dc_is_blobdir_path(context, &path) {
         dc_make_rel_path(context, path);
-        success = true;
-    } else {
-        filename = unsafe { dc_get_filename(&path) };
-        if !(filename.is_null()
-            || {
-                blobdir_path = unsafe {
-                    dc_get_fine_pathNfilename(
-                        context,
-                        b"$BLOBDIR\x00" as *const u8 as *const libc::c_char,
-                        filename,
-                    )
-                };
-                blobdir_path.is_null()
-            }
-            || !dc_copy_file(context, &path, as_path(blobdir_path)))
-        {
-            *path = to_string(blobdir_path);
-            blobdir_path = ptr::null_mut();
-            dc_make_rel_path(context, path);
-            success = true;
-        }
+        return true;
     }
-    unsafe {
-        free(blobdir_path.cast());
-        free(filename.cast());
+    if let Ok(blobdir_path) = context.copy_to_blobdir(&path) {
+        *path = blobdir_path;
+        return true;
     }
-    success
+    false
 }
 
 /// Error type for the [OsStrExt] trait
@@ -1267,22 +866,6 @@ impl<T: AsRef<str>> StrExt for T {
     }
 }
 
-pub fn to_string(s: *const libc::c_char) -> String {
-    if s.is_null() {
-        return "".into();
-    }
-
-    let cstr = unsafe { CStr::from_ptr(s) };
-
-    cstr.to_str().map(|s| s.to_string()).unwrap_or_else(|err| {
-        panic!(
-            "Non utf8 string: '{:?}' ({:?})",
-            cstr.to_string_lossy(),
-            err
-        );
-    })
-}
-
 pub fn to_string_lossy(s: *const libc::c_char) -> String {
     if s.is_null() {
         return "".into();
@@ -1355,7 +938,7 @@ fn as_path_unicode<'a>(s: *const libc::c_char) -> &'a std::path::Path {
     std::path::Path::new(as_str(s))
 }
 
-pub fn time() -> i64 {
+pub(crate) fn time() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -1425,10 +1008,52 @@ impl FromStr for EmailAddress {
     }
 }
 
+/// Utility to check if a in the binary represantion of listflags
+/// the bit at position bitindex is 1.
+pub(crate) fn listflags_has(listflags: u32, bitindex: usize) -> bool {
+    let listflags = listflags as usize;
+    (listflags & bitindex) == bitindex
+}
+
+pub(crate) unsafe fn strdup(s: *const libc::c_char) -> *mut libc::c_char {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let slen = strlen(s);
+    let result = libc::malloc(slen + 1);
+    if result.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    memcpy(result, s as *const _, slen + 1);
+    result as *mut _
+}
+
+pub(crate) unsafe fn strcasecmp(s1: *const libc::c_char, s2: *const libc::c_char) -> libc::c_int {
+    let s1 = std::ffi::CStr::from_ptr(s1)
+        .to_string_lossy()
+        .to_lowercase();
+    let s2 = std::ffi::CStr::from_ptr(s2)
+        .to_string_lossy()
+        .to_lowercase();
+    if s1 == s2 {
+        0
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use libc::{free, strcmp};
+    use std::convert::TryInto;
     use std::ffi::CStr;
+
+    use crate::constants::*;
+    use crate::test_utils::*;
 
     #[test]
     fn test_dc_strdup() {
@@ -1452,24 +1077,6 @@ mod tests {
                 CString::new("").unwrap().as_c_str()
             );
             assert_ne!(str_a, str_a_copy);
-        }
-    }
-
-    #[test]
-    fn test_dc_strdup_keep_null() {
-        unsafe {
-            let str_a = b"foobar\x00" as *const u8 as *const libc::c_char;
-            let str_a_copy = dc_strdup_keep_null(str_a);
-            assert_eq!(
-                CStr::from_ptr(str_a_copy),
-                CString::new("foobar").unwrap().as_c_str()
-            );
-            assert_ne!(str_a, str_a_copy);
-
-            let str_a = ptr::null();
-            let str_a_copy = dc_strdup_keep_null(str_a);
-            assert_eq!(str_a.is_null(), true);
-            assert_eq!(str_a_copy.is_null(), true);
         }
     }
 
@@ -1522,42 +1129,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dc_atof() {
-        let f: libc::c_double = dc_atof(b"1.23\x00" as *const u8 as *const libc::c_char);
-        assert!(f > 1.22f64);
-        assert!(f < 1.24f64);
-    }
-
-    #[test]
-    fn test_dc_ftoa() {
-        unsafe {
-            let s: *mut libc::c_char = dc_ftoa(1.23f64);
-            assert!(dc_atof(s) > 1.22f64);
-            assert!(dc_atof(s) < 1.24f64);
-            free(s as *mut libc::c_void);
-        }
-    }
-
-    #[test]
     fn test_rust_ftoa() {
         assert_eq!("1.22", format!("{}", 1.22));
-    }
-
-    #[test]
-    fn test_dc_str_replace() {
-        unsafe {
-            let mut str: *mut libc::c_char = strdup(b"aaa\x00" as *const u8 as *const libc::c_char);
-            dc_str_replace(
-                &mut str,
-                b"a\x00" as *const u8 as *const libc::c_char,
-                b"ab\x00" as *const u8 as *const libc::c_char,
-            );
-            assert_eq!(
-                CStr::from_ptr(str as *const libc::c_char).to_str().unwrap(),
-                "ababab"
-            );
-            free(str as *mut libc::c_void);
-        }
     }
 
     #[test]
@@ -1586,75 +1159,70 @@ mod tests {
     }
 
     #[test]
-    fn test_dc_null_terminate_1() {
-        unsafe {
-            let str: *mut libc::c_char =
-                dc_null_terminate(b"abcxyz\x00" as *const u8 as *const libc::c_char, 3);
-            assert_eq!(
-                CStr::from_ptr(str as *const libc::c_char).to_str().unwrap(),
-                "abc"
-            );
-            free(str as *mut libc::c_void);
+    fn test_dc_truncate_edge() {
+        assert_eq!(dc_truncate("", 4, false), "");
+        assert_eq!(dc_truncate("", 4, true), "");
+
+        assert_eq!(dc_truncate("\n  hello \n world", 4, false), "\n  [...]");
+        assert_eq!(dc_truncate("\n  hello \n world", 4, true), "\n  ...");
+
+        assert_eq!(
+            dc_truncate("𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ", 1, false),
+            "𐠈[...]"
+        );
+        assert_eq!(
+            dc_truncate("𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ", 0, false),
+            "𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ"
+        );
+
+        // 9 characters, so no truncation
+        assert_eq!(
+            dc_truncate("𑒀ὐ￠🜀\u{1e01b}A a🟠", 6, false),
+            "𑒀ὐ￠🜀\u{1e01b}A a🟠",
+        );
+
+        // 12 characters, truncation
+        assert_eq!(
+            dc_truncate("𑒀ὐ￠🜀\u{1e01b}A a🟠bcd", 6, false),
+            "𑒀ὐ￠🜀\u{1e01b}A[...]",
+        );
+    }
+
+    /* calls free() for each item content */
+    unsafe fn clist_free_content(haystack: *const clist) {
+        let mut iter = (*haystack).first;
+
+        while !iter.is_null() {
+            free((*iter).data);
+            (*iter).data = ptr::null_mut();
+            iter = if !iter.is_null() {
+                (*iter).next
+            } else {
+                ptr::null_mut()
+            }
         }
     }
 
-    #[test]
-    fn test_dc_null_terminate_2() {
-        unsafe {
-            let str: *mut libc::c_char =
-                dc_null_terminate(b"abcxyz\x00" as *const u8 as *const libc::c_char, 0);
-            assert_eq!(
-                CStr::from_ptr(str as *const libc::c_char).to_str().unwrap(),
-                ""
-            );
-            free(str as *mut libc::c_void);
+    fn strndup(s: *const libc::c_char, n: libc::c_ulong) -> *mut libc::c_char {
+        if s.is_null() {
+            return std::ptr::null_mut();
         }
-    }
 
-    #[test]
-    fn test_dc_null_terminate_3() {
+        let end = std::cmp::min(n as usize, unsafe { strlen(s) });
         unsafe {
-            let str: *mut libc::c_char =
-                dc_null_terminate(0 as *const u8 as *const libc::c_char, 0);
-            assert_eq!(
-                CStr::from_ptr(str as *const libc::c_char).to_str().unwrap(),
-                ""
-            );
-            free(str as *mut libc::c_void);
+            let result = libc::malloc(end + 1);
+            memcpy(result, s as *const _, end);
+            std::ptr::write_bytes(result.offset(end as isize), b'\x00', 1);
+
+            result as *mut _
         }
     }
 
     #[test]
     fn test_dc_str_to_clist_1() {
         unsafe {
-            let list = dc_str_to_clist(ptr::null(), b" \x00" as *const u8 as *const libc::c_char);
-            assert_eq!((*list).count, 0);
-            clist_free_content(list);
-            clist_free(list);
-        }
-    }
-
-    #[test]
-    fn test_dc_str_to_clist_2() {
-        unsafe {
-            let list: *mut clist = dc_str_to_clist(
-                b"\x00" as *const u8 as *const libc::c_char,
-                b" \x00" as *const u8 as *const libc::c_char,
-            );
+            let list = dc_str_to_clist("", " ");
             assert_eq!((*list).count, 1);
-            clist_free_content(list);
-            clist_free(list);
-        }
-    }
-
-    #[test]
-    fn test_dc_str_to_clist_3() {
-        unsafe {
-            let list: *mut clist = dc_str_to_clist(
-                b" \x00" as *const u8 as *const libc::c_char,
-                b" \x00" as *const u8 as *const libc::c_char,
-            );
-            assert_eq!((*list).count, 2);
             clist_free_content(list);
             clist_free(list);
         }
@@ -1663,10 +1231,7 @@ mod tests {
     #[test]
     fn test_dc_str_to_clist_4() {
         unsafe {
-            let list: *mut clist = dc_str_to_clist(
-                b"foo bar test\x00" as *const u8 as *const libc::c_char,
-                b" \x00" as *const u8 as *const libc::c_char,
-            );
+            let list: *mut clist = dc_str_to_clist("foo bar test", " ");
             assert_eq!((*list).count, 3);
             let str: *mut libc::c_char =
                 dc_str_from_clist(list, b" \x00" as *const u8 as *const libc::c_char);
@@ -1679,63 +1244,6 @@ mod tests {
             clist_free_content(list);
             clist_free(list);
             free(str as *mut libc::c_void);
-        }
-    }
-
-    #[test]
-    fn test_dc_replace_bad_utf8_chars_1() {
-        unsafe {
-            let buf1 = strdup(b"ol\xc3\xa1 mundo <>\"\'& \xc3\xa4\xc3\x84\xc3\xb6\xc3\x96\xc3\xbc\xc3\x9c\xc3\x9f foo\xc3\x86\xc3\xa7\xc3\x87 \xe2\x99\xa6&noent;\x00" as *const u8 as *const libc::c_char);
-            let buf2 = strdup(buf1);
-
-            dc_replace_bad_utf8_chars(buf2);
-
-            assert_eq!(strcmp(buf1, buf2), 0);
-
-            free(buf1 as *mut libc::c_void);
-            free(buf2 as *mut libc::c_void);
-        }
-    }
-
-    #[test]
-    fn test_dc_replace_bad_utf8_chars_2() {
-        unsafe {
-            let buf1 = strdup(b"ISO-String with Ae: \xc4\x00" as *const u8 as *const libc::c_char);
-            let buf2 = strdup(buf1);
-
-            dc_replace_bad_utf8_chars(buf2);
-
-            assert_eq!(
-                CStr::from_ptr(buf2 as *const libc::c_char)
-                    .to_str()
-                    .unwrap(),
-                "ISO-String with Ae: _"
-            );
-
-            free(buf1 as *mut libc::c_void);
-            free(buf2 as *mut libc::c_void);
-        }
-    }
-
-    #[test]
-    fn test_dc_replace_bad_utf8_chars_3() {
-        unsafe {
-            let buf1 = strdup(b"\x00" as *const u8 as *const libc::c_char);
-            let buf2 = strdup(buf1);
-
-            dc_replace_bad_utf8_chars(buf2);
-
-            assert_eq!(*buf2.offset(0), 0);
-
-            free(buf1 as *mut libc::c_void);
-            free(buf2 as *mut libc::c_void);
-        }
-    }
-
-    #[test]
-    fn test_dc_replace_bad_utf8_chars_4() {
-        unsafe {
-            dc_replace_bad_utf8_chars(ptr::null_mut());
         }
     }
 
@@ -1967,5 +1475,167 @@ mod tests {
         );
         assert_eq!(EmailAddress::new("u@.tt").is_ok(), false);
         assert_eq!(EmailAddress::new("@d.tt").is_ok(), false);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_dc_truncate(
+            buf: String,
+            approx_chars in 0..10000usize,
+            do_unwrap: bool,
+        ) {
+            let res = dc_truncate(&buf, approx_chars, do_unwrap);
+            let el_len = if do_unwrap { 3 } else { 5 };
+            let l = res.chars().count();
+            if approx_chars > 0 {
+                assert!(
+                    l <= approx_chars + el_len,
+                    "buf: '{}' - res: '{}' - len {}, approx {}",
+                    &buf, &res, res.len(), approx_chars
+                );
+            } else {
+                assert_eq!(&res, &buf);
+            }
+
+            if approx_chars > 0 && buf.chars().count() > approx_chars + el_len {
+                let l = res.len();
+                if do_unwrap {
+                    assert_eq!(&res[l-3..l], "...", "missing ellipsis in {}", &res);
+                } else {
+                    assert_eq!(&res[l-5..l], "[...]", "missing ellipsis in {}", &res);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dc_create_incoming_rfc724_mid() {
+        let res = dc_create_incoming_rfc724_mid(123, 45, &vec![6, 7]);
+        assert_eq!(res, Some("123-45-7@stub".into()));
+    }
+
+    #[test]
+    fn test_dc_make_rel_path() {
+        let t = dummy_context();
+        let mut foo: String = t
+            .ctx
+            .get_blobdir()
+            .join("foo")
+            .to_string_lossy()
+            .into_owned();
+        dc_make_rel_path(&t.ctx, &mut foo);
+        assert_eq!(foo, format!("$BLOBDIR{}foo", std::path::MAIN_SEPARATOR));
+    }
+
+    #[test]
+    fn test_strndup() {
+        unsafe {
+            let res = strndup(b"helloworld\x00" as *const u8 as *const libc::c_char, 4);
+            assert_eq!(
+                to_string_lossy(res),
+                to_string_lossy(b"hell\x00" as *const u8 as *const libc::c_char)
+            );
+            assert_eq!(strlen(res), 4);
+            free(res as *mut _);
+        }
+    }
+
+    #[test]
+    fn test_file_get_safe_basename() {
+        assert_eq!(get_safe_basename("12312/hello"), "hello");
+        assert_eq!(get_safe_basename("12312\\hello"), "hello");
+        assert_eq!(get_safe_basename("//12312\\hello"), "hello");
+        assert_eq!(get_safe_basename("//123:12\\hello"), "hello");
+        assert_eq!(get_safe_basename("//123:12/\\\\hello"), "hello");
+        assert_eq!(get_safe_basename("//123:12//hello"), "hello");
+        assert_eq!(get_safe_basename("//123:12//"), "nobasename");
+        assert_eq!(get_safe_basename("//123:12/"), "nobasename");
+        assert!(get_safe_basename("123\x012.hello").ends_with(".hello"));
+    }
+
+    #[test]
+    fn test_file_handling() {
+        let t = dummy_context();
+        let context = &t.ctx;
+
+        assert!(!dc_delete_file(context, "$BLOBDIR/lkqwjelqkwlje"));
+        if dc_file_exist(context, "$BLOBDIR/foobar")
+            || dc_file_exist(context, "$BLOBDIR/dada")
+            || dc_file_exist(context, "$BLOBDIR/foobar.dadada")
+            || dc_file_exist(context, "$BLOBDIR/foobar-folder")
+        {
+            dc_delete_file(context, "$BLOBDIR/foobar");
+            dc_delete_file(context, "$BLOBDIR/dada");
+            dc_delete_file(context, "$BLOBDIR/foobar.dadada");
+            dc_delete_file(context, "$BLOBDIR/foobar-folder");
+        }
+        assert!(dc_write_file(context, "$BLOBDIR/foobar", b"content"));
+        assert!(dc_file_exist(context, "$BLOBDIR/foobar",));
+        assert!(!dc_file_exist(context, "$BLOBDIR/foobarx"));
+        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/foobar"), 7);
+
+        let abs_path = context
+            .get_blobdir()
+            .join("foobar")
+            .to_string_lossy()
+            .to_string();
+
+        assert!(dc_is_blobdir_path(context, &abs_path));
+
+        assert!(dc_is_blobdir_path(context, "$BLOBDIR/fofo",));
+        assert!(!dc_is_blobdir_path(context, "/BLOBDIR/fofo",));
+        assert!(dc_file_exist(context, &abs_path));
+
+        assert!(dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada",));
+
+        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/dada",), 7);
+
+        let buf = dc_read_file(context, "$BLOBDIR/dada").unwrap();
+
+        assert_eq!(buf.len(), 7);
+        assert_eq!(&buf, b"content");
+
+        assert!(dc_delete_file(context, "$BLOBDIR/foobar"));
+        assert!(dc_delete_file(context, "$BLOBDIR/dada"));
+        assert!(dc_create_folder(context, "$BLOBDIR/foobar-folder"));
+        assert!(dc_file_exist(context, "$BLOBDIR/foobar-folder",));
+        assert!(!dc_delete_file(context, "$BLOBDIR/foobar-folder"));
+
+        let fn0 = "$BLOBDIR/data.data";
+        assert!(dc_write_file(context, &fn0, b"content"));
+
+        assert!(dc_delete_file(context, &fn0));
+        assert!(!dc_file_exist(context, &fn0));
+    }
+
+    #[test]
+    fn test_listflags_has() {
+        let listflags: u32 = 0x1101;
+        assert!(listflags_has(listflags, 0x1) == true);
+        assert!(listflags_has(listflags, 0x10) == false);
+        assert!(listflags_has(listflags, 0x100) == true);
+        assert!(listflags_has(listflags, 0x1000) == true);
+        let listflags: u32 = (DC_GCL_ADD_SELF | DC_GCL_VERIFIED_ONLY).try_into().unwrap();
+        assert!(listflags_has(listflags, DC_GCL_VERIFIED_ONLY) == true);
+        assert!(listflags_has(listflags, DC_GCL_ADD_SELF) == true);
+        let listflags: u32 = DC_GCL_VERIFIED_ONLY.try_into().unwrap();
+        assert!(listflags_has(listflags, DC_GCL_ADD_SELF) == false);
+    }
+
+    #[test]
+    fn test_dc_remove_cr_chars() {
+        unsafe {
+            let input = "foo\r\nbar".strdup();
+            dc_remove_cr_chars(input);
+            assert_eq!("foo\nbar", to_string_lossy(input));
+            free(input.cast());
+
+            let input = "\rfoo\r\rbar\r".strdup();
+            dc_remove_cr_chars(input);
+            assert_eq!("foobar", to_string_lossy(input));
+            free(input.cast());
+        }
     }
 }

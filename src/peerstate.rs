@@ -7,6 +7,7 @@ use crate::aheader::*;
 use crate::chat::*;
 use crate::constants::*;
 use crate::context::Context;
+use crate::error::*;
 use crate::key::*;
 use crate::sql::{self, Sql};
 
@@ -22,7 +23,7 @@ pub struct Peerstate<'a> {
     pub gossip_key: Option<Key>,
     pub gossip_timestamp: i64,
     pub gossip_key_fingerprint: Option<String>,
-    verified_key: VerifiedKey,
+    pub verified_key: Option<Key>,
     pub verified_key_fingerprint: Option<String>,
     pub to_save: Option<ToSave>,
     pub degrade_event: Option<DegradeEvent>,
@@ -84,32 +85,6 @@ pub enum DegradeEvent {
     FingerprintChanged = 0x02,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum VerifiedKey {
-    Gossip,
-    Public,
-    None,
-}
-
-impl Default for VerifiedKey {
-    fn default() -> Self {
-        VerifiedKey::None
-    }
-}
-
-impl VerifiedKey {
-    pub fn is_none(&self) -> bool {
-        match self {
-            VerifiedKey::None => true,
-            _ => false,
-        }
-    }
-
-    pub fn is_some(&self) -> bool {
-        !self.is_none()
-    }
-}
-
 impl<'a> Peerstate<'a> {
     pub fn new(context: &'a Context) -> Self {
         Peerstate {
@@ -123,18 +98,10 @@ impl<'a> Peerstate<'a> {
             gossip_key: None,
             gossip_key_fingerprint: None,
             gossip_timestamp: 0,
-            verified_key: Default::default(),
+            verified_key: None,
             verified_key_fingerprint: None,
             to_save: None,
             degrade_event: None,
-        }
-    }
-
-    pub fn verified_key(&self) -> Option<&Key> {
-        match self.verified_key {
-            VerifiedKey::Public => self.public_key.as_ref(),
-            VerifiedKey::Gossip => self.gossip_key.as_ref(),
-            VerifiedKey::None => None,
         }
     }
 
@@ -178,8 +145,11 @@ impl<'a> Peerstate<'a> {
                      OR gossip_key_fingerprint=? COLLATE NOCASE  \
                      ORDER BY public_key_fingerprint=? DESC;";
 
-        let fp = fingerprint.as_bytes();
-        Self::from_stmt(context, query, params![fp, fp, fp])
+        Self::from_stmt(
+            context,
+            query,
+            params![fingerprint, fingerprint, fingerprint],
+        )
     }
 
     fn from_stmt<P>(context: &'a Context, query: &str, params: P) -> Option<Self>
@@ -238,18 +208,10 @@ impl<'a> Peerstate<'a> {
                     .get(6)
                     .ok()
                     .and_then(|blob: Vec<u8>| Key::from_slice(&blob, KeyType::Public));
-                let vk = row
+                res.verified_key = row
                     .get(9)
                     .ok()
                     .and_then(|blob: Vec<u8>| Key::from_slice(&blob, KeyType::Public));
-
-                res.verified_key = if vk == res.gossip_key && res.gossip_key.is_some() {
-                    VerifiedKey::Gossip
-                } else if vk == res.public_key {
-                    VerifiedKey::Public
-                } else {
-                    VerifiedKey::None
-                };
 
                 Ok(res)
             })
@@ -370,7 +332,7 @@ impl<'a> Peerstate<'a> {
         }
 
         if 0 != min_verified {
-            return self.verified_key();
+            return self.verified_key.as_ref();
         }
         if self.public_key.is_some() {
             return self.public_key.as_ref();
@@ -387,7 +349,7 @@ impl<'a> Peerstate<'a> {
                 && self.public_key_fingerprint.as_ref().unwrap() == fingerprint
             {
                 self.to_save = Some(ToSave::All);
-                self.verified_key = VerifiedKey::Public;
+                self.verified_key = self.public_key.clone();
                 self.verified_key_fingerprint = self.public_key_fingerprint.clone();
                 success = true;
             }
@@ -396,7 +358,7 @@ impl<'a> Peerstate<'a> {
                 && self.gossip_key_fingerprint.as_ref().unwrap() == fingerprint
             {
                 self.to_save = Some(ToSave::All);
-                self.verified_key = VerifiedKey::Gossip;
+                self.verified_key = self.gossip_key.clone();
                 self.verified_key_fingerprint = self.gossip_key_fingerprint.clone();
                 success = true;
             }
@@ -405,28 +367,19 @@ impl<'a> Peerstate<'a> {
         success
     }
 
-    pub fn save_to_db(&self, sql: &Sql, create: bool) -> bool {
-        let mut success = false;
-
-        if self.addr.is_none() {
-            return success;
-        }
-
+    pub fn save_to_db(&self, sql: &Sql, create: bool) -> Result<()> {
+        ensure!(!self.addr.is_none(), "self.addr is not configured");
         if create {
-            if sql::execute(
+            sql::execute(
                 self.context,
                 sql,
                 "INSERT INTO acpeerstates (addr) VALUES(?);",
                 params![self.addr.as_ref().unwrap()],
-            )
-            .is_err()
-            {
-                return false;
-            }
+            )?;
         }
 
         if self.to_save == Some(ToSave::All) || create {
-            success = sql::execute(
+            sql::execute(
                 self.context,
                 sql,
 		"UPDATE acpeerstates \
@@ -443,14 +396,14 @@ impl<'a> Peerstate<'a> {
                     self.gossip_key.as_ref().map(|k| k.to_bytes()),
                     &self.public_key_fingerprint,
                     &self.gossip_key_fingerprint,
-                    self.verified_key().map(|k| k.to_bytes()),
+                    self.verified_key.as_ref().map(|k| k.to_bytes()),
                     &self.verified_key_fingerprint,
                     &self.addr,
                 ],
-            ).is_ok();
-            assert_eq!(success, true);
+            )?;
+            reset_gossiped_timestamp(self.context, 0);
         } else if self.to_save == Some(ToSave::Timestamps) {
-            success = sql::execute(
+            sql::execute(
                 self.context,
                 sql,
                 "UPDATE acpeerstates SET last_seen=?, last_seen_autocrypt=?, gossip_timestamp=? \
@@ -461,15 +414,10 @@ impl<'a> Peerstate<'a> {
                     self.gossip_timestamp,
                     &self.addr
                 ],
-            )
-            .is_ok();
+            )?;
         }
 
-        if self.to_save == Some(ToSave::All) || create {
-            reset_gossiped_timestamp(self.context, 0);
-        }
-
-        success
+        Ok(())
     }
 
     pub fn has_verified_key(&self, fingerprints: &HashSet<String>) -> bool {
@@ -496,7 +444,11 @@ mod tests {
         let ctx = crate::test_utils::dummy_context();
         let addr = "hello@mail.com";
 
-        let pub_key = crate::key::Key::from_base64("xsBNBFztUVkBCADYaQl/UOUpRPd32nLRzx8eU0eI+jQEnG+g5anjYA+3oct1rROGl5SygjMULDKdaUy27O3o9Srsti0YjA7uxZnavIqhSopJhFidqY1M1wA9JZa/duucZdNwUGbjGIRsS/4Cjr5+3svscK24hVYub1dvDWXpwUTnj3K6xOEnJdoM+MhCqtSD5+zcJhFc9vyZm9ZTGWUxAhKh0iJTcCD8V6CQ3XZ2z9GruwzZT/FTFovWrz7m3TUI2OdSSHh0eZLRGEoxMCT/vzflAFGAr8ijCaRsEIfqP6FW8uQWnFTqkjxEUCZG6XkeFHB84aj5jqYG/1KCLjL5vEKwfl1tz/WnPhY7ABEBAAHNEDxoZWxsb0BtYWlsLmNvbT7CwIkEEAEIADMCGQEFAlztUVoCGwMECwkIBwYVCAkKCwIDFgIBFiEEgMjHGVbvLXe6ioRROg8oKCvye7gACgkQOg8oKCvye7ijAwf+PTsuawUax9cNPn1bN90H+g9qyHZJMEwKXtUnNaXJxPW3iB7ThhpCiCzsZwP7+l7ArS8tmLeNDw2bENtcf1XCv4wovP2fdXOP3QOUUFX/GdakcTwv7DzC7CO0grB1HtaPhGw/6UX2o2cx2i9xiUf4Givq2MfCbgAW5zloH6WXGPb6yLQYJXxqDIphr4+uZDb+bMAyWHN/DUkAjHrV8nnVki7PMHqzzZpwglalxMX8RGeiGZE39ALJKL/Og87DMFah87/yoxQWGoS7Wqv0XDcCPKoTCPrpk8pOe2KEsq/lz215nefHd4aRpfUX5YCYa8HPvvfPQbGF73uvyQw5w7qjis7ATQRc7VFZAQgAt8ONdnX6KEEQ5Jw6ilJ+LBtY44SP5t0I3eK+goKepgIiKhjGDa+Mntyi4jdhH+HO6kvK5SHMh2sPp4rRO/WKHJwWFySyM1OdyiywhyH0J9R5rBY4vPHsJjf6vSKJdWLWT+ho1fNet2IIC+jVCYli91MAMbRvk6EKVj1nCc+67giOahXEkHt6xxkeCGlOvbw8hxGj1A8+AC1BLms/OR3oc4JMi9O3kq6uG0z9tlUEerac9HVwcjoO1XLe+hJhoT5H+TbnGjPuhuURP3pFiIKHpbRYgUfdSAY0dTObO7t4I5y/drPOrCTnWrBUg2wXAECUhpRKow9/ai2YemLv9KqhhwARAQABwsB2BBgBCAAgBQJc7VFaAhsMFiEEgMjHGVbvLXe6ioRROg8oKCvye7gACgkQOg8oKCvye7jmyggAhs4QzCzIbT2OsAReBxkxtm0AI+g1HZ1KFKof5NDHfgv9C/Qu1I8mKEjlZzA4qFyPmLqntgwJ0RuFy6gLbljZBNCFO7vB478AhYtnWjuKZmA40HUPwcB1hEJ31c42akzfUbioY1TLLepngdsJg7Cm8O+rhI9+1WRA66haJDgFs793SVUDyJh8f9NX50l5zR87/bsV30CFSw0q4OSSy9VI/z+2g5khn1LnuuOrCfFnYIPYtJED1BfkXkosxGlgbzy79VvGmI9d23x4atDK7oBPCzIj+lP8sytJ0u3HOguXi9OgDitKy+Pt1r8gH8frdktMJr5Ts6DW+tIn2vR23KR8aA==", KeyType::Public).unwrap();
+        let pub_key = crate::key::Key::from_base64(
+            include_str!("../test-data/key/public.asc"),
+            KeyType::Public,
+        )
+        .unwrap();
 
         let mut peerstate = Peerstate {
             context: &ctx.ctx,
@@ -509,20 +461,65 @@ mod tests {
             gossip_key: Some(pub_key.clone()),
             gossip_timestamp: 12,
             gossip_key_fingerprint: Some(pub_key.fingerprint()),
-            verified_key: VerifiedKey::Gossip,
+            verified_key: Some(pub_key.clone()),
             verified_key_fingerprint: Some(pub_key.fingerprint()),
             to_save: Some(ToSave::All),
             degrade_event: None,
         };
 
-        assert!(peerstate.save_to_db(&ctx.ctx.sql, true), "failed to save");
+        assert!(
+            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            "failed to save to db"
+        );
 
-        let peerstate_new = Peerstate::from_addr(&ctx.ctx, &ctx.ctx.sql, addr.into())
+        let peerstate_new = Peerstate::from_addr(&ctx.ctx, &ctx.ctx.sql, addr)
             .expect("failed to load peerstate from db");
 
         // clear to_save, as that is not persissted
         peerstate.to_save = None;
         assert_eq!(peerstate, peerstate_new);
+        let peerstate_new2 =
+            Peerstate::from_fingerprint(&ctx.ctx, &ctx.ctx.sql, &pub_key.fingerprint())
+                .expect("failed to load peerstate from db");
+        assert_eq!(peerstate, peerstate_new2);
+    }
+
+    #[test]
+    fn test_peerstate_double_create() {
+        let ctx = crate::test_utils::dummy_context();
+        let addr = "hello@mail.com";
+
+        let pub_key = crate::key::Key::from_base64(
+            include_str!("../test-data/key/public.asc"),
+            KeyType::Public,
+        )
+        .unwrap();
+
+        let peerstate = Peerstate {
+            context: &ctx.ctx,
+            addr: Some(addr.into()),
+            last_seen: 10,
+            last_seen_autocrypt: 11,
+            prefer_encrypt: EncryptPreference::Mutual,
+            public_key: Some(pub_key.clone()),
+            public_key_fingerprint: Some(pub_key.fingerprint()),
+            gossip_key: None,
+            gossip_timestamp: 12,
+            gossip_key_fingerprint: None,
+            verified_key: None,
+            verified_key_fingerprint: None,
+            to_save: Some(ToSave::All),
+            degrade_event: None,
+        };
+
+        assert!(
+            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            "failed to save"
+        );
+        assert!(
+            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            "double-call with create failed"
+        );
     }
 
     #[test]
@@ -530,7 +527,11 @@ mod tests {
         let ctx = crate::test_utils::dummy_context();
         let addr = "hello@mail.com";
 
-        let pub_key = crate::key::Key::from_base64("xsBNBFztUVkBCADYaQl/UOUpRPd32nLRzx8eU0eI+jQEnG+g5anjYA+3oct1rROGl5SygjMULDKdaUy27O3o9Srsti0YjA7uxZnavIqhSopJhFidqY1M1wA9JZa/duucZdNwUGbjGIRsS/4Cjr5+3svscK24hVYub1dvDWXpwUTnj3K6xOEnJdoM+MhCqtSD5+zcJhFc9vyZm9ZTGWUxAhKh0iJTcCD8V6CQ3XZ2z9GruwzZT/FTFovWrz7m3TUI2OdSSHh0eZLRGEoxMCT/vzflAFGAr8ijCaRsEIfqP6FW8uQWnFTqkjxEUCZG6XkeFHB84aj5jqYG/1KCLjL5vEKwfl1tz/WnPhY7ABEBAAHNEDxoZWxsb0BtYWlsLmNvbT7CwIkEEAEIADMCGQEFAlztUVoCGwMECwkIBwYVCAkKCwIDFgIBFiEEgMjHGVbvLXe6ioRROg8oKCvye7gACgkQOg8oKCvye7ijAwf+PTsuawUax9cNPn1bN90H+g9qyHZJMEwKXtUnNaXJxPW3iB7ThhpCiCzsZwP7+l7ArS8tmLeNDw2bENtcf1XCv4wovP2fdXOP3QOUUFX/GdakcTwv7DzC7CO0grB1HtaPhGw/6UX2o2cx2i9xiUf4Givq2MfCbgAW5zloH6WXGPb6yLQYJXxqDIphr4+uZDb+bMAyWHN/DUkAjHrV8nnVki7PMHqzzZpwglalxMX8RGeiGZE39ALJKL/Og87DMFah87/yoxQWGoS7Wqv0XDcCPKoTCPrpk8pOe2KEsq/lz215nefHd4aRpfUX5YCYa8HPvvfPQbGF73uvyQw5w7qjis7ATQRc7VFZAQgAt8ONdnX6KEEQ5Jw6ilJ+LBtY44SP5t0I3eK+goKepgIiKhjGDa+Mntyi4jdhH+HO6kvK5SHMh2sPp4rRO/WKHJwWFySyM1OdyiywhyH0J9R5rBY4vPHsJjf6vSKJdWLWT+ho1fNet2IIC+jVCYli91MAMbRvk6EKVj1nCc+67giOahXEkHt6xxkeCGlOvbw8hxGj1A8+AC1BLms/OR3oc4JMi9O3kq6uG0z9tlUEerac9HVwcjoO1XLe+hJhoT5H+TbnGjPuhuURP3pFiIKHpbRYgUfdSAY0dTObO7t4I5y/drPOrCTnWrBUg2wXAECUhpRKow9/ai2YemLv9KqhhwARAQABwsB2BBgBCAAgBQJc7VFaAhsMFiEEgMjHGVbvLXe6ioRROg8oKCvye7gACgkQOg8oKCvye7jmyggAhs4QzCzIbT2OsAReBxkxtm0AI+g1HZ1KFKof5NDHfgv9C/Qu1I8mKEjlZzA4qFyPmLqntgwJ0RuFy6gLbljZBNCFO7vB478AhYtnWjuKZmA40HUPwcB1hEJ31c42akzfUbioY1TLLepngdsJg7Cm8O+rhI9+1WRA66haJDgFs793SVUDyJh8f9NX50l5zR87/bsV30CFSw0q4OSSy9VI/z+2g5khn1LnuuOrCfFnYIPYtJED1BfkXkosxGlgbzy79VvGmI9d23x4atDK7oBPCzIj+lP8sytJ0u3HOguXi9OgDitKy+Pt1r8gH8frdktMJr5Ts6DW+tIn2vR23KR8aA==", KeyType::Public).unwrap();
+        let pub_key = crate::key::Key::from_base64(
+            include_str!("../test-data/key/public.asc"),
+            KeyType::Public,
+        )
+        .unwrap();
 
         let mut peerstate = Peerstate {
             context: &ctx.ctx,
@@ -543,15 +544,18 @@ mod tests {
             gossip_key: None,
             gossip_timestamp: 12,
             gossip_key_fingerprint: None,
-            verified_key: VerifiedKey::None,
+            verified_key: None,
             verified_key_fingerprint: None,
             to_save: Some(ToSave::All),
             degrade_event: None,
         };
 
-        assert!(peerstate.save_to_db(&ctx.ctx.sql, true), "failed to save");
+        assert!(
+            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            "failed to save"
+        );
 
-        let peerstate_new = Peerstate::from_addr(&ctx.ctx, &ctx.ctx.sql, addr.into())
+        let peerstate_new = Peerstate::from_addr(&ctx.ctx, &ctx.ctx.sql, addr)
             .expect("failed to load peerstate from db");
 
         // clear to_save, as that is not persissted

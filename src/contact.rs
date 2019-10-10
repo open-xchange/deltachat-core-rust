@@ -1,24 +1,23 @@
+use std::path::PathBuf;
+
+use deltachat_derive::*;
 use itertools::Itertools;
-use num_traits::{FromPrimitive, ToPrimitive};
 use rusqlite;
-use rusqlite::types::*;
 
 use crate::aheader::EncryptPreference;
 use crate::config::Config;
 use crate::constants::*;
 use crate::context::Context;
-use crate::dc_loginparam::*;
 use crate::dc_tools::*;
 use crate::e2ee;
 use crate::error::Result;
+use crate::events::Event;
 use crate::key::*;
+use crate::login_param::LoginParam;
 use crate::message::MessageState;
 use crate::peerstate::*;
 use crate::sql;
 use crate::stock::StockMessage;
-use crate::types::*;
-
-const DC_GCL_VERIFIED_ONLY: u32 = 0x01;
 
 /// Contacts with at least this origin value are shown in the contact list.
 const DC_ORIGIN_MIN_CONTACT_LIST: i32 = 0x100;
@@ -33,8 +32,8 @@ const DC_ORIGIN_MIN_CONTACT_LIST: i32 = 0x100;
 /// For this purpose, internally, two names are tracked -
 /// authorized-name and given-name.
 /// By default, these names are equal, but functions working with contact names
-pub struct Contact<'a> {
-    context: &'a Context,
+#[derive(Debug)]
+pub struct Contact {
     /// The contact ID.
     ///
     /// Special message IDs:
@@ -60,7 +59,9 @@ pub struct Contact<'a> {
 }
 
 /// Possible origins of a contact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromPrimitive, ToPrimitive)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromPrimitive, ToPrimitive, FromSql, ToSql,
+)]
 #[repr(i32)]
 pub enum Origin {
     Unknown = 0,
@@ -98,20 +99,9 @@ pub enum Origin {
     ManuallyCreated = 0x4000000,
 }
 
-impl ToSql for Origin {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput> {
-        let num: i64 = self
-            .to_i64()
-            .expect("impossible: Origin -> i64 conversion failed");
-
-        Ok(ToSqlOutput::Owned(Value::Integer(num)))
-    }
-}
-
-impl FromSql for Origin {
-    fn column_result(col: ValueRef) -> FromSqlResult<Self> {
-        let inner = FromSql::column_result(col)?;
-        FromPrimitive::from_i64(inner).ok_or(FromSqlError::InvalidType)
+impl Default for Origin {
+    fn default() -> Self {
+        Origin::Unknown
     }
 }
 
@@ -150,11 +140,10 @@ pub enum VerifiedStatus {
     BidirectVerified = 2,
 }
 
-impl<'a> Contact<'a> {
-    pub fn load_from_db(context: &'a Context, contact_id: u32) -> Result<Self> {
+impl Contact {
+    pub fn load_from_db(context: &Context, contact_id: u32) -> Result<Self> {
         if contact_id == DC_CONTACT_ID_SELF {
             let contact = Contact {
-                context,
                 id: contact_id,
                 name: context.stock_str(StockMessage::SelfMsg).into(),
                 authname: "".into(),
@@ -173,7 +162,6 @@ impl<'a> Contact<'a> {
             params![contact_id as i32],
             |row| {
                 let contact = Self {
-                    context,
                     id: contact_id,
                     name: row.get::<_, String>(0)?,
                     authname: row.get::<_, String>(4)?,
@@ -192,7 +180,7 @@ impl<'a> Contact<'a> {
     }
 
     /// Check if a contact is blocked.
-    pub fn is_blocked_load(context: &'a Context, id: u32) -> bool {
+    pub fn is_blocked_load(context: &Context, id: u32) -> bool {
         Self::load_from_db(context, id)
             .map(|contact| contact.blocked)
             .unwrap_or_default()
@@ -226,15 +214,13 @@ impl<'a> Contact<'a> {
         let (contact_id, sth_modified) =
             Contact::add_or_lookup(context, name, addr, Origin::ManuallyCreated)?;
         let blocked = Contact::is_blocked_load(context, contact_id);
-        context.call_cb(
-            Event::CONTACTS_CHANGED,
-            (if sth_modified == Modifier::Created {
-                contact_id
+        context.call_cb(Event::ContactsChanged(
+            if sth_modified == Modifier::Created {
+                Some(contact_id)
             } else {
-                0
-            }) as uintptr_t,
-            0 as uintptr_t,
-        );
+                None
+            },
+        ));
         if blocked {
             Contact::unblock(context, contact_id);
         }
@@ -255,7 +241,10 @@ impl<'a> Contact<'a> {
         )
         .is_ok()
         {
-            context.call_cb(Event::MSGS_CHANGED, 0, 0);
+            context.call_cb(Event::MsgsChanged {
+                chat_id: 0,
+                msg_id: 0,
+            });
         }
     }
 
@@ -278,7 +267,7 @@ impl<'a> Contact<'a> {
             return 1;
         }
 
-        context.sql.query_row_col(
+        context.sql.query_get_value(
             context,
             "SELECT id FROM contacts WHERE addr=?1 COLLATE NOCASE AND id>?2 AND origin>=?3 AND blocked=0;",
             params![
@@ -286,7 +275,6 @@ impl<'a> Contact<'a> {
                 DC_CONTACT_ID_LAST_SPECIAL as i32,
                 DC_ORIGIN_MIN_CONTACT_LIST,
             ],
-            0
         ).unwrap_or_default()
     }
 
@@ -319,7 +307,6 @@ impl<'a> Contact<'a> {
         if !may_be_valid_addr(&addr) {
             warn!(
                 context,
-                0,
                 "Bad address \"{}\" for contact \"{}\".",
                 addr,
                 if !name.as_ref().is_empty() {
@@ -343,19 +330,22 @@ impl<'a> Contact<'a> {
                 let row_id = row.get(0)?;
                 let row_name: String = row.get(1)?;
                 let row_addr: String = row.get(2)?;
-                let row_origin = row.get(3)?;
+                let row_origin: Origin = row.get(3)?;
                 let row_authname: String = row.get(4)?;
 
-                if !name.as_ref().is_empty() && !row_name.is_empty() {
-                    if origin >= row_origin && name.as_ref() != row_name {
+                if !name.as_ref().is_empty() {
+                    if !row_name.is_empty() {
+                        if origin >= row_origin && name.as_ref() != row_name {
+                            update_name = true;
+                        }
+                    } else {
                         update_name = true;
                     }
-                } else {
-                    update_name = true;
+                    if origin == Origin::IncomingUnknownFrom && name.as_ref() != row_authname {
+                        update_authname = true;
+                    }
                 }
-                if origin == Origin::IncomingUnknownFrom && name.as_ref() != row_authname {
-                    update_authname = true;
-                }
+
                 Ok((row_id, row_name, row_addr, row_origin, row_authname))
             },
         ) {
@@ -395,25 +385,23 @@ impl<'a> Contact<'a> {
                     context,
                     &context.sql,
                     "UPDATE chats SET name=? WHERE type=? AND id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?);",
-                    params![name.as_ref(), 100, row_id]
+                    params![name.as_ref(), Chattype::Single, row_id]
                 ).ok();
                 }
                 sth_modified = Modifier::Modified;
             }
+        } else if sql::execute(
+            context,
+            &context.sql,
+            "INSERT INTO contacts (name, addr, origin) VALUES(?, ?, ?);",
+            params![name.as_ref(), addr, origin,],
+        )
+        .is_ok()
+        {
+            row_id = sql::get_rowid(context, &context.sql, "contacts", "addr", addr);
+            sth_modified = Modifier::Created;
         } else {
-            if sql::execute(
-                context,
-                &context.sql,
-                "INSERT INTO contacts (name, addr, origin) VALUES(?, ?, ?);",
-                params![name.as_ref(), addr, origin,],
-            )
-            .is_ok()
-            {
-                row_id = sql::get_rowid(context, &context.sql, "contacts", "addr", addr);
-                sth_modified = Modifier::Created;
-            } else {
-                error!(context, 0, "Cannot add contact.");
-            }
+            error!(context, "Cannot add contact.");
         }
 
         Ok((row_id, sth_modified))
@@ -433,19 +421,13 @@ impl<'a> Contact<'a> {
     /// To add a single contact entered by the user, you should prefer `Contact::create`,
     /// however, for adding a bunch of addresses, this function is _much_ faster.
     ///
-    /// The `adr_book` is a multiline string in the format `Name one\nAddress one\nName two\nAddress two`.
+    /// The `addr_book` is a multiline string in the format `Name one\nAddress one\nName two\nAddress two`.
     ///
     /// Returns the number of modified contacts.
-    pub fn add_address_book(context: &Context, adr_book: impl AsRef<str>) -> Result<usize> {
+    pub fn add_address_book(context: &Context, addr_book: impl AsRef<str>) -> Result<usize> {
         let mut modify_cnt = 0;
 
-        for chunk in &adr_book.as_ref().lines().chunks(2) {
-            let chunk = chunk.collect::<Vec<_>>();
-            if chunk.len() < 2 {
-                break;
-            }
-            let name = chunk[0];
-            let addr = chunk[1];
+        for (name, addr) in split_address_book(addr_book.as_ref()).into_iter() {
             let name = normalize_name(name);
             let (_, modified) = Contact::add_or_lookup(context, name, addr, Origin::AdressBook)?;
             if modified != Modifier::None {
@@ -453,7 +435,7 @@ impl<'a> Contact<'a> {
             }
         }
         if modify_cnt > 0 {
-            context.call_cb(Event::CONTACTS_CHANGED, 0 as uintptr_t, 0 as uintptr_t);
+            context.call_cb(Event::ContactsChanged(None));
         }
 
         Ok(modify_cnt)
@@ -479,8 +461,10 @@ impl<'a> Contact<'a> {
 
         let mut add_self = false;
         let mut ret = Vec::new();
+        let flag_verified_only = listflags_has(listflags, DC_GCL_VERIFIED_ONLY);
+        let flag_add_self = listflags_has(listflags, DC_GCL_ADD_SELF);
 
-        if (listflags & DC_GCL_VERIFIED_ONLY) > 0 || query.is_some() {
+        if flag_verified_only || query.is_some() {
             let s3str_like_cmd = format!(
                 "%{}%",
                 query
@@ -504,7 +488,7 @@ impl<'a> Contact<'a> {
                     0x100,
                     &s3str_like_cmd,
                     &s3str_like_cmd,
-                    if 0 != listflags & 0x1 { 0 } else { 1 },
+                    if flag_verified_only { 0 } else { 1 },
                 ],
                 |row| row.get::<_, i32>(0),
                 |ids| {
@@ -544,7 +528,7 @@ impl<'a> Contact<'a> {
             )?;
         }
 
-        if 0 != listflags & DC_GCL_ADD_SELF as u32 && add_self {
+        if flag_add_self && add_self {
             ret.push(DC_CONTACT_ID_SELF);
         }
 
@@ -554,11 +538,10 @@ impl<'a> Contact<'a> {
     pub fn get_blocked_cnt(context: &Context) -> usize {
         context
             .sql
-            .query_row_col::<_, isize>(
+            .query_get_value::<_, isize>(
                 context,
                 "SELECT COUNT(*) FROM contacts WHERE id>? AND blocked!=0",
                 params![DC_CONTACT_ID_LAST_SPECIAL as i32],
-                0,
             )
             .unwrap_or_default() as usize
     }
@@ -589,7 +572,7 @@ impl<'a> Contact<'a> {
 
         if let Ok(contact) = Contact::load_from_db(context, contact_id) {
             let peerstate = Peerstate::from_addr(context, &context.sql, &contact.addr);
-            let loginparam = dc_loginparam_read(context, &context.sql, "configured_");
+            let loginparam = LoginParam::from_database(context, "configured_");
 
             let mut self_key = Key::from_self_public(context, &loginparam.addr, &context.sql);
 
@@ -661,22 +644,20 @@ impl<'a> Contact<'a> {
 
         let count_contacts: i32 = context
             .sql
-            .query_row_col(
+            .query_get_value(
                 context,
                 "SELECT COUNT(*) FROM chats_contacts WHERE contact_id=?;",
                 params![contact_id as i32],
-                0,
             )
             .unwrap_or_default();
 
         let count_msgs: i32 = if count_contacts > 0 {
             context
                 .sql
-                .query_row_col(
+                .query_get_value(
                     context,
                     "SELECT COUNT(*) FROM msgs WHERE from_id=? OR to_id=?;",
                     params![contact_id as i32, contact_id as i32],
-                    0,
                 )
                 .unwrap_or_default()
         } else {
@@ -691,11 +672,11 @@ impl<'a> Contact<'a> {
                 params![contact_id as i32],
             ) {
                 Ok(_) => {
-                    context.call_cb(Event::CONTACTS_CHANGED, 0, 0);
+                    context.call_cb(Event::ContactsChanged(None));
                     return Ok(());
                 }
                 Err(err) => {
-                    error!(context, 0, "delete_contact {} failed ({})", contact_id, err);
+                    error!(context, "delete_contact {} failed ({})", contact_id, err);
                     return Err(err);
                 }
             }
@@ -703,7 +684,7 @@ impl<'a> Contact<'a> {
 
         info!(
             context,
-            0, "could not delete contact {}, there are {} messages with it", contact_id, count_msgs
+            "could not delete contact {}, there are {} messages with it", contact_id, count_msgs
         );
         bail!("Could not delete contact with messages in it");
     }
@@ -779,9 +760,11 @@ impl<'a> Contact<'a> {
     /// Get the contact's profile image.
     /// This is the image set by each remote user on their own
     /// using dc_set_config(context, "selfavatar", image).
-    pub fn get_profile_image(&self) -> Option<String> {
+    pub fn get_profile_image(&self, context: &Context) -> Option<PathBuf> {
         if self.id == DC_CONTACT_ID_SELF {
-            return self.context.get_config(Config::Selfavatar);
+            if let Some(p) = context.get_config(Config::Selfavatar) {
+                return Some(PathBuf::from(p));
+            }
         }
         // TODO: else get image_abs from contact param
         None
@@ -800,14 +783,18 @@ impl<'a> Contact<'a> {
     ///
     /// The UI may draw a checkbox or something like that beside verified contacts.
     ///
-    pub fn is_verified(&self) -> VerifiedStatus {
-        self.is_verified_ex(None)
+    pub fn is_verified(&self, context: &Context) -> VerifiedStatus {
+        self.is_verified_ex(context, None)
     }
 
     /// Same as `Contact::is_verified` but allows speeding up things
     /// by adding the peerstate belonging to the contact.
     /// If you do not have the peerstate available, it is loaded automatically.
-    pub fn is_verified_ex(&self, peerstate: Option<&Peerstate<'a>>) -> VerifiedStatus {
+    pub fn is_verified_ex(
+        &self,
+        context: &Context,
+        peerstate: Option<&Peerstate>,
+    ) -> VerifiedStatus {
         // We're always sort of secured-verified as we could verify the key on this device any time with the key
         // on this device
         if self.id == DC_CONTACT_ID_SELF {
@@ -815,14 +802,14 @@ impl<'a> Contact<'a> {
         }
 
         if let Some(peerstate) = peerstate {
-            if peerstate.verified_key().is_some() {
+            if peerstate.verified_key.is_some() {
                 return VerifiedStatus::BidirectVerified;
             }
         }
 
-        let peerstate = Peerstate::from_addr(self.context, &self.context.sql, &self.addr);
+        let peerstate = Peerstate::from_addr(context, &context.sql, &self.addr);
         if let Some(ps) = peerstate {
-            if ps.verified_key().is_some() {
+            if ps.verified_key.is_some() {
                 return VerifiedStatus::BidirectVerified;
             }
         }
@@ -838,7 +825,7 @@ impl<'a> Contact<'a> {
         if let Ok(contact) = Contact::load_from_db(context, contact_id) {
             if !contact.addr.is_empty() {
                 let normalized_addr = addr_normalize(addr.as_ref());
-                if &contact.addr == &normalized_addr {
+                if contact.addr == normalized_addr {
                     return true;
                 }
             }
@@ -854,11 +841,10 @@ impl<'a> Contact<'a> {
 
         context
             .sql
-            .query_row_col::<_, isize>(
+            .query_get_value::<_, isize>(
                 context,
                 "SELECT COUNT(*) FROM contacts WHERE id>?;",
                 params![DC_CONTACT_ID_LAST_SPECIAL as i32],
-                0,
             )
             .unwrap_or_default() as usize
     }
@@ -951,11 +937,7 @@ fn set_block_contact(context: &Context, contact_id: u32, new_blocking: bool) {
                     params![new_blocking, 100, contact_id as i32],
                 ).is_ok() {
                     Contact::mark_noticed(context, contact_id);
-                    context.call_cb(
-                        Event::CONTACTS_CHANGED,
-                        0,
-                        0,
-                    );
+                    context.call_cb(Event::ContactsChanged(None));
                 }
             }
         }
@@ -979,9 +961,9 @@ pub fn normalize_name(full_name: impl AsRef<str>) -> String {
     if len > 0 {
         let firstchar = full_name.as_bytes()[0];
         let lastchar = full_name.as_bytes()[len - 1];
-        if firstchar == '\'' as u8 && lastchar == '\'' as u8
-            || firstchar == '\"' as u8 && lastchar == '\"' as u8
-            || firstchar == '<' as u8 && lastchar == '>' as u8
+        if firstchar == b'\'' && lastchar == b'\''
+            || firstchar == b'\"' && lastchar == b'\"'
+            || firstchar == b'<' && lastchar == b'>'
         {
             full_name = &full_name[1..len - 1];
         }
@@ -1043,6 +1025,21 @@ pub fn addr_equals_self(context: &Context, addr: impl AsRef<str>) -> bool {
     false
 }
 
+fn split_address_book(book: &str) -> Vec<(&str, &str)> {
+    book.lines()
+        .chunks(2)
+        .into_iter()
+        .filter_map(|mut chunk| {
+            let name = chunk.next().unwrap();
+            let addr = match chunk.next() {
+                Some(a) => a,
+                None => return None,
+            };
+            Some((name, addr))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,5 +1075,15 @@ mod tests {
     #[test]
     fn test_get_first_name() {
         assert_eq!(get_first_name("John Doe"), "John");
+    }
+
+    #[test]
+    fn test_split_address_book() {
+        let book = "Name one\nAddress one\nName two\nAddress two\nrest name";
+        let list = split_address_book(&book);
+        assert_eq!(
+            list,
+            vec![("Name one", "Address one"), ("Name two", "Address two")]
+        )
     }
 }

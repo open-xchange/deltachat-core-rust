@@ -14,20 +14,19 @@ extern crate lazy_static;
 extern crate rusqlite;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
-use std::ptr;
+use std::io::{self, Write};
+use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use deltachat::config;
 use deltachat::configure::*;
-use deltachat::constants::*;
 use deltachat::context::*;
-use deltachat::dc_securejoin::*;
-use deltachat::dc_tools::*;
 use deltachat::job::*;
 use deltachat::oauth2::*;
-use deltachat::types::*;
-use deltachat::x::*;
+use deltachat::securejoin::*;
+use deltachat::Event;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::config::OutputStreamType;
 use rustyline::error::ReadlineError;
@@ -42,96 +41,75 @@ use self::cmdline::*;
 
 // Event Handler
 
-unsafe extern "C" fn receive_event(
-    _context: &Context,
-    event: Event,
-    data1: uintptr_t,
-    data2: uintptr_t,
-) -> uintptr_t {
+fn receive_event(_context: &Context, event: Event) -> libc::uintptr_t {
     match event {
-        Event::GET_STRING => {}
-        Event::INFO => {
+        Event::GetString { .. } => {}
+        Event::Info(msg) => {
             /* do not show the event as this would fill the screen */
-            println!("{}", to_string(data2 as *const _),);
+            println!("{}", msg);
         }
-        Event::SMTP_CONNECTED => {
-            println!("[DC_EVENT_SMTP_CONNECTED] {}", to_string(data2 as *const _));
+        Event::SmtpConnected(msg) => {
+            println!("[DC_EVENT_SMTP_CONNECTED] {}", msg);
         }
-        Event::IMAP_CONNECTED => {
-            println!("[DC_EVENT_IMAP_CONNECTED] {}", to_string(data2 as *const _),);
+        Event::ImapConnected(msg) => {
+            println!("[DC_EVENT_IMAP_CONNECTED] {}", msg);
         }
-        Event::SMTP_MESSAGE_SENT => {
-            println!(
-                "[DC_EVENT_SMTP_MESSAGE_SENT] {}",
-                to_string(data2 as *const _),
-            );
+        Event::SmtpMessageSent(msg) => {
+            println!("[DC_EVENT_SMTP_MESSAGE_SENT] {}", msg);
         }
-        Event::WARNING => {
-            println!("[Warning] {}", to_string(data2 as *const _),);
+        Event::Warning(msg) => {
+            println!("[Warning] {}", msg);
         }
-        Event::ERROR => {
-            println!(
-                "\x1b[31m[DC_EVENT_ERROR] {}\x1b[0m",
-                to_string(data2 as *const _),
-            );
+        Event::Error(msg) => {
+            println!("\x1b[31m[DC_EVENT_ERROR] {}\x1b[0m", msg);
         }
-        Event::ERROR_NETWORK => {
-            println!(
-                "\x1b[31m[DC_EVENT_ERROR_NETWORK] first={}, msg={}\x1b[0m",
-                data1 as usize,
-                to_string(data2 as *const _),
-            );
+        Event::ErrorNetwork(msg) => {
+            println!("\x1b[31m[DC_EVENT_ERROR_NETWORK] msg={}\x1b[0m", msg);
         }
-        Event::ERROR_SELF_NOT_IN_GROUP => {
-            println!(
-                "\x1b[31m[DC_EVENT_ERROR_SELF_NOT_IN_GROUP] {}\x1b[0m",
-                to_string(data2 as *const _),
-            );
+        Event::ErrorSelfNotInGroup(msg) => {
+            println!("\x1b[31m[DC_EVENT_ERROR_SELF_NOT_IN_GROUP] {}\x1b[0m", msg);
         }
-        Event::MSGS_CHANGED => {
+        Event::MsgsChanged { chat_id, msg_id } => {
             print!(
-                "\x1b[33m{{Received DC_EVENT_MSGS_CHANGED({}, {})}}\n\x1b[0m",
-                data1 as usize, data2 as usize,
+                "\x1b[33m{{Received DC_EVENT_MSGS_CHANGED(chat_id={}, msg_id={})}}\n\x1b[0m",
+                chat_id, msg_id,
             );
         }
-        Event::CONTACTS_CHANGED => {
+        Event::ContactsChanged(_) => {
             print!("\x1b[33m{{Received DC_EVENT_CONTACTS_CHANGED()}}\n\x1b[0m");
         }
-        Event::LOCATION_CHANGED => {
+        Event::LocationChanged(contact) => {
             print!(
-                "\x1b[33m{{Received DC_EVENT_LOCATION_CHANGED(contact={})}}\n\x1b[0m",
-                data1 as usize,
+                "\x1b[33m{{Received DC_EVENT_LOCATION_CHANGED(contact={:?})}}\n\x1b[0m",
+                contact,
             );
         }
-        Event::CONFIGURE_PROGRESS => {
+        Event::ConfigureProgress(progress) => {
             print!(
                 "\x1b[33m{{Received DC_EVENT_CONFIGURE_PROGRESS({} ‰)}}\n\x1b[0m",
-                data1 as usize,
+                progress,
             );
         }
-        Event::IMEX_PROGRESS => {
+        Event::ImexProgress(progress) => {
             print!(
                 "\x1b[33m{{Received DC_EVENT_IMEX_PROGRESS({} ‰)}}\n\x1b[0m",
-                data1 as usize,
+                progress,
             );
         }
-        Event::IMEX_FILE_WRITTEN => {
+        Event::ImexFileWritten(file) => {
             print!(
                 "\x1b[33m{{Received DC_EVENT_IMEX_FILE_WRITTEN({})}}\n\x1b[0m",
-                to_string(data1 as *const _)
+                file.display()
             );
         }
-        Event::CHAT_MODIFIED => {
+        Event::ChatModified(chat) => {
             print!(
                 "\x1b[33m{{Received DC_EVENT_CHAT_MODIFIED({})}}\n\x1b[0m",
-                data1 as usize,
+                chat
             );
         }
         _ => {
-            print!(
-                "\x1b[33m{{Received {:?}({}, {})}}\n\x1b[0m",
-                event, data1 as usize, data2 as usize,
-            );
+            print!("\x1b[33m{{Received {:?}}}\n\x1b[0m", event);
         }
     }
 
@@ -385,17 +363,15 @@ impl Highlighter for DcHelper {
 impl Helper for DcHelper {}
 
 fn main_0(args: Vec<String>) -> Result<(), failure::Error> {
-    let mut context = dc_context_new(Some(receive_event), ptr::null_mut(), Some("CLI".into()));
-
-    unsafe { dc_cmdline_skip_auth() };
-
-    if args.len() == 2 {
-        if unsafe { !dc_open(&mut context, &args[1], None) } {
-            println!("Error: Cannot open {}.", args[0],);
-        }
-    } else if args.len() != 1 {
+    if args.len() < 2 {
         println!("Error: Bad arguments, expected [db-name].");
+        return Err(format_err!("No db-name specified"));
     }
+    let context = Context::new(
+        Box::new(receive_event),
+        "CLI".into(),
+        Path::new(&args[1]).to_path_buf(),
+    )?;
 
     println!("Delta Chat Core is awaiting your commands.");
 
@@ -463,11 +439,6 @@ unsafe fn handle_cmd(line: &str, ctx: Arc<RwLock<Context>>) -> Result<ExitResult
     let mut args = line.splitn(2, ' ');
     let arg0 = args.next().unwrap_or_default();
     let arg1 = args.next().unwrap_or_default();
-    let arg1_c = if arg1.is_empty() {
-        std::ptr::null()
-    } else {
-        arg1.strdup()
-    };
 
     match arg0 {
         "connect" => {
@@ -516,37 +487,32 @@ unsafe fn handle_cmd(line: &str, ctx: Arc<RwLock<Context>>) -> Result<ExitResult
         }
         "getqr" | "getbadqr" => {
             start_threads(ctx.clone());
-            let qrstr =
-                dc_get_securejoin_qr(&ctx.read().unwrap(), arg1.parse().unwrap_or_default());
-            if !qrstr.is_null() && 0 != *qrstr.offset(0isize) as libc::c_int {
-                if arg0 == "getbadqr" && strlen(qrstr) > 40 {
-                    let mut i: libc::c_int = 12i32;
-                    while i < 22i32 {
-                        *qrstr.offset(i as isize) = '0' as i32 as libc::c_char;
-                        i += 1
+            if let Some(mut qr) =
+                dc_get_securejoin_qr(&ctx.read().unwrap(), arg1.parse().unwrap_or_default())
+            {
+                if !qr.is_empty() {
+                    if arg0 == "getbadqr" && qr.len() > 40 {
+                        qr.replace_range(12..22, "0000000000")
                     }
+                    println!("{}", qr);
+                    let output = Command::new("qrencode")
+                        .args(&["-t", "ansiutf8", qr.as_str(), "-o", "-"])
+                        .output()
+                        .expect("failed to execute process");
+                    io::stdout().write_all(&output.stdout).unwrap();
+                    io::stderr().write_all(&output.stderr).unwrap();
                 }
-                println!("{}", to_string(qrstr as *const _));
-                let syscmd = dc_mprintf(
-                    b"qrencode -t ansiutf8 \"%s\" -o -\x00" as *const u8 as *const libc::c_char,
-                    qrstr,
-                );
-                system(syscmd);
-                free(syscmd as *mut libc::c_void);
             }
-            free(qrstr as *mut libc::c_void);
         }
         "joinqr" => {
             start_threads(ctx.clone());
             if !arg0.is_empty() {
-                dc_join_securejoin(&ctx.read().unwrap(), arg1_c);
+                dc_join_securejoin(&ctx.read().unwrap(), arg1);
             }
         }
         "exit" | "quit" => return Ok(ExitResult::Exit),
         _ => dc_cmdline(&ctx.read().unwrap(), line)?,
     }
-
-    free(arg1_c as *mut _);
 
     Ok(ExitResult::Continue)
 }

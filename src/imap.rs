@@ -1,4 +1,3 @@
-use std::ffi::CString;
 use std::net;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -9,8 +8,12 @@ use std::time::{Duration, SystemTime};
 use crate::coi::{CoiConfig, CoiMessageFilter};
 use crate::constants::*;
 use crate::context::Context;
-use crate::dc_loginparam::*;
-use crate::dc_tools::CStringExt;
+use crate::dc_receive_imf::dc_receive_imf;
+use crate::error::Error;
+use crate::events::Event;
+use crate::job::{connect_to_inbox, job_add, Action};
+use crate::login_param::{dc_build_tls, CertificateChecks, LoginParam};
+use crate::message::{self, update_msg_move_state, update_server_uid};
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::types::*;
 use crate::webpush::WebPushConfig;
@@ -20,27 +23,26 @@ use imap::extensions::metadata::{get_metadata, set_metadata};
 pub use imap::extensions::metadata::MetadataDepth;
 pub use imap_proto::types::{Metadata, Capability};
 use imap::extensions::idle::Waker;
+use crate::param::Params;
+use crate::wrapmime;
 
 const DC_IMAP_SEEN: usize = 0x0001;
-const DC_REGENERATE: usize = 0x01;
 
-const DC_SUCCESS: usize = 3;
-const DC_ALREADY_DONE: usize = 2;
-const DC_RETRY_LATER: usize = 1;
-const DC_FAILED: usize = 0;
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq)]
+pub enum ImapResult {
+    Failed,
+    RetryLater,
+    AlreadyDone,
+    Success,
+}
 
 const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
-const FETCH_FLAGS: &str = "(FLAGS)";
 
+#[derive(Debug)]
 pub struct Imap {
     config: Arc<RwLock<ImapConfig>>,
     stop: Arc<Mutex<Option<Box<dyn FnOnce() -> imap::error::Result<()>>>>>,
-
-    get_config: dc_get_config_t,
-    set_config: dc_set_config_t,
-    precheck_imf: dc_precheck_imf_t,
-    receive_imf: dc_receive_imf_t,
 
     session: Arc<Mutex<Option<Session>>>,
     stream: Arc<RwLock<Option<net::TcpStream>>>,
@@ -49,6 +51,7 @@ pub struct Imap {
     should_reconnect: AtomicBool,
 }
 
+#[derive(Debug)]
 struct OAuth2 {
     user: String,
     access_token: String,
@@ -73,6 +76,7 @@ enum FolderMeaning {
     Other,
 }
 
+#[derive(Debug)]
 enum Client {
     Secure(
         imap::Client<native_tls::TlsStream<net::TcpStream>>,
@@ -81,11 +85,13 @@ enum Client {
     Insecure(imap::Client<net::TcpStream>, net::TcpStream),
 }
 
+#[derive(Debug)]
 enum Session {
     Secure(imap::Session<native_tls::TlsStream<net::TcpStream>>),
     Insecure(imap::Session<net::TcpStream>),
 }
 
+#[derive(Debug)]
 enum IdleHandle<'a> {
     Secure(imap::extensions::idle::Handle<'a, native_tls::TlsStream<net::TcpStream>>),
     Insecure(imap::extensions::idle::Handle<'a, net::TcpStream>),
@@ -118,12 +124,10 @@ impl Client {
     pub fn connect_secure<A: net::ToSocketAddrs, S: AsRef<str>>(
         addr: A,
         domain: S,
+        certificate_checks: CertificateChecks,
     ) -> imap::error::Result<Self> {
         let stream = net::TcpStream::connect(addr)?;
-        let tls = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_hostnames(true)
-            .build()
-            .unwrap();
+        let tls = dc_build_tls(certificate_checks).unwrap();
 
         let s = stream.try_clone().expect("cloning the stream failed");
         let tls_stream = native_tls::TlsConnector::connect(&tls, domain.as_ref(), s)?;
@@ -143,13 +147,14 @@ impl Client {
         Ok(Client::Insecure(client, stream))
     }
 
-    pub fn secure<S: AsRef<str>>(self, domain: S) -> imap::error::Result<Client> {
+    pub fn secure<S: AsRef<str>>(
+        self,
+        domain: S,
+        certificate_checks: CertificateChecks,
+    ) -> imap::error::Result<Client> {
         match self {
             Client::Insecure(client, stream) => {
-                let tls = native_tls::TlsConnector::builder()
-                    .danger_accept_invalid_hostnames(true)
-                    .build()
-                    .unwrap();
+                let tls = dc_build_tls(certificate_checks).unwrap();
 
                 let client_sec = client.secure(domain, &tls)?;
 
@@ -354,12 +359,14 @@ fn cap_to_str<'a>(cap: &'a Capability) -> &'a str {
     }
 }
 
+#[derive(Debug)]
 struct ImapConfig {
     pub addr: String,
     pub imap_server: String,
     pub imap_port: u16,
     pub imap_user: String,
     pub imap_pw: String,
+    pub certificate_checks: CertificateChecks,
     pub server_flags: usize,
     pub selected_folder: Option<String>,
     pub selected_mailbox: Option<imap::types::Mailbox>,
@@ -380,6 +387,7 @@ impl Default for ImapConfig {
             imap_port: 0,
             imap_user: "".into(),
             imap_pw: "".into(),
+            certificate_checks: Default::default(),
             server_flags: 0,
             selected_folder: None,
             selected_mailbox: None,
@@ -395,12 +403,7 @@ impl Default for ImapConfig {
 }
 
 impl Imap {
-    pub fn new(
-        get_config: dc_get_config_t,
-        set_config: dc_set_config_t,
-        precheck_imf: dc_precheck_imf_t,
-        receive_imf: dc_receive_imf_t,
-    ) -> Self {
+    pub fn new() -> Self {
         Imap {
             session: Arc::new(Mutex::new(None)),
             stream: Arc::new(RwLock::new(None)),
@@ -410,6 +413,7 @@ impl Imap {
             set_config,
             precheck_imf,
             receive_imf,
+            watch: Arc::new((Mutex::new(false), Condvar::new())),
             connected: Arc::new(Mutex::new(false)),
             should_reconnect: AtomicBool::new(false),
         }
@@ -437,7 +441,7 @@ impl Imap {
             return true;
         }
 
-        let server_flags = self.config.read().unwrap().server_flags;
+        let server_flags = self.config.read().unwrap().server_flags as i32;
 
         let connection_res: imap::error::Result<Client> =
             if (server_flags & (DC_LP_IMAP_SOCKET_STARTTLS | DC_LP_IMAP_SOCKET_PLAIN)) != 0 {
@@ -447,7 +451,7 @@ impl Imap {
 
                 Client::connect_insecure((imap_server, imap_port)).and_then(|client| {
                     if (server_flags & DC_LP_IMAP_SOCKET_STARTTLS) != 0 {
-                        client.secure(imap_server)
+                        client.secure(imap_server, config.certificate_checks)
                     } else {
                         Ok(client)
                     }
@@ -457,7 +461,11 @@ impl Imap {
                 let imap_server: &str = config.imap_server.as_ref();
                 let imap_port = config.imap_port;
 
-                Client::connect_secure((imap_server, imap_port), imap_server)
+                Client::connect_secure(
+                    (imap_server, imap_port),
+                    imap_server,
+                    config.certificate_checks,
+                )
             };
 
         let login_res = match connection_res {
@@ -469,9 +477,7 @@ impl Imap {
                 if (server_flags & DC_LP_AUTH_OAUTH2) != 0 {
                     let addr: &str = config.addr.as_ref();
 
-                    if let Some(token) =
-                        dc_get_oauth2_access_token(context, addr, imap_pw, DC_REGENERATE as usize)
-                    {
+                    if let Some(token) = dc_get_oauth2_access_token(context, addr, imap_pw, true) {
                         let auth = OAuth2 {
                             user: imap_user.into(),
                             access_token: token,
@@ -489,14 +495,12 @@ impl Imap {
                 let imap_server: &str = config.imap_server.as_ref();
                 let imap_port = config.imap_port;
 
-                log_event!(
+                emit_event!(
                     context,
-                    Event::ERROR_NETWORK,
-                    0,
-                    "Could not connect to IMAP-server {}:{}. ({})",
-                    imap_server,
-                    imap_port,
-                    err
+                    Event::ErrorNetwork(format!(
+                        "Could not connect to IMAP-server {}:{}. ({})",
+                        imap_server, imap_port, err
+                    ))
                 );
 
                 return false;
@@ -512,7 +516,10 @@ impl Imap {
                 true
             }
             Err((err, _)) => {
-                log_event!(context, Event::ERROR_NETWORK, 0, "Cannot login ({})", err);
+                emit_event!(
+                    context,
+                    Event::ErrorNetwork(format!("Cannot login ({})", err))
+                );
                 self.unsetup_handle(context);
 
                 false
@@ -521,12 +528,9 @@ impl Imap {
     }
 
     fn unsetup_handle(&self, context: &Context) {
-        info!(context, 0, "IMAP unsetup_handle starts");
+        info!(context, "IMAP unsetup_handle starts");
 
-        info!(
-            context,
-            0, "IMAP unsetup_handle step 1 (closing down stream)."
-        );
+        info!(context, "IMAP unsetup_handle step 1 (closing down stream).");
         if let Some(stream) = self.stream.write().unwrap().take() {
             if let Err(err) = stream.shutdown(net::Shutdown::Both) {
                 eprintln!("failed to shutdown connection: {:?}", err);
@@ -535,7 +539,7 @@ impl Imap {
 
         info!(
             context,
-            0, "IMAP unsetup_handle step 2 (acquiring session.lock)"
+            "IMAP unsetup_handle step 2 (acquiring session.lock)"
         );
         if let Some(mut session) = self.session.lock().unwrap().take() {
             if let Err(err) = session.close() {
@@ -543,10 +547,10 @@ impl Imap {
             }
         }
 
-        info!(context, 0, "IMAP unsetup_handle step 3 (clearing config).");
+        info!(context, "IMAP unsetup_handle step 3 (clearing config).");
         self.config.write().unwrap().selected_folder = None;
         self.config.write().unwrap().selected_mailbox = None;
-        info!(context, 0, "IMAP unsetup_handle step 4 (disconnected).",);
+        info!(context, "IMAP unsetup_handle step 4 (disconnected).",);
     }
 
     fn free_connect_params(&self) {
@@ -564,7 +568,7 @@ impl Imap {
         cfg.watch_folder = None;
     }
 
-    pub fn connect(&self, context: &Context, lp: &dc_loginparam_t) -> bool {
+    pub fn connect(&self, context: &Context, lp: &LoginParam) -> bool {
         if lp.mail_server.is_empty() || lp.mail_user.is_empty() || lp.mail_pw.is_empty() {
             return false;
         }
@@ -587,6 +591,7 @@ impl Imap {
             config.imap_port = imap_port;
             config.imap_user = imap_user.to_string();
             config.imap_pw = imap_pw.to_string();
+            config.certificate_checks = lp.imap_certificate_checks;
             config.server_flags = server_flags;
         }
 
@@ -622,13 +627,12 @@ impl Imap {
                 .collect::<Vec<&str>>()
                 .join(" ");
 
-            log_event!(
+            emit_event!(
                 context,
-                Event::IMAP_CONNECTED,
-                0,
-                "IMAP-LOGIN as {}, capabilities: {}",
-                lp.mail_user,
-                caps_list,
+                Event::ImapConnected(format!(
+                    "IMAP-LOGIN as {}, capabilities: {}",
+                    lp.mail_user, caps_list,
+                ))
             );
 
             let mut config = self.config.write().unwrap();
@@ -772,7 +776,7 @@ impl Imap {
         // deselect existing folder, if needed (it's also done implicitly by SELECT, however, without EXPUNGE then)
         if self.config.read().unwrap().selected_folder_needs_expunge {
             if let Some(ref folder) = self.config.read().unwrap().selected_folder {
-                info!(context, 0, "Expunge messages in \"{}\".", folder);
+                info!(context, "Expunge messages in \"{}\".", folder);
 
                 // A CLOSE-SELECT is considerably faster than an EXPUNGE-SELECT, see
                 // https://tools.ietf.org/html/rfc3501#section-6.4.2
@@ -802,7 +806,6 @@ impl Imap {
                     Err(err) => {
                         info!(
                             context,
-                            0,
                             "Cannot select folder: {}; {:?}.",
                             folder.as_ref(),
                             err
@@ -814,7 +817,7 @@ impl Imap {
                     }
                 }
             } else {
-                return 0;
+                unreachable!();
             }
         }
 
@@ -823,12 +826,20 @@ impl Imap {
 
     fn get_config_last_seen_uid<S: AsRef<str>>(&self, context: &Context, folder: S) -> (u32, u32) {
         let key = format!("imap.mailbox.{}", folder.as_ref());
-        if let Some(entry) = (self.get_config)(context, &key) {
+        if let Some(entry) = context.sql.get_raw_config(context, &key) {
             // the entry has the format `imap.mailbox.<folder>=<uidvalidity>:<lastseenuid>`
             let mut parts = entry.split(':');
             (
-                parts.next().unwrap().parse().unwrap_or_else(|_| 0),
-                parts.next().unwrap().parse().unwrap_or_else(|_| 0),
+                parts
+                    .next()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_else(|_| 0),
+                parts
+                    .next()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_else(|_| 0),
             )
         } else {
             (0, 0)
@@ -839,7 +850,6 @@ impl Imap {
         if !self.is_connected() {
             info!(
                 context,
-                0,
                 "Cannot fetch from \"{}\" - not connected.",
                 folder.as_ref()
             );
@@ -850,7 +860,6 @@ impl Imap {
         if self.select_folder(context, Some(&folder)) == 0 {
             info!(
                 context,
-                0,
                 "Cannot select folder \"{}\" for fetching.",
                 folder.as_ref()
             );
@@ -867,7 +876,6 @@ impl Imap {
         if mailbox.uid_validity.is_none() {
             error!(
                 context,
-                0,
                 "Cannot get UIDVALIDITY for folder \"{}\".",
                 folder.as_ref(),
             );
@@ -875,17 +883,22 @@ impl Imap {
             return 0;
         }
 
-        if mailbox.uid_validity.unwrap() != uid_validity {
+        if mailbox.uid_validity.unwrap_or_default() != uid_validity {
             // first time this folder is selected or UIDVALIDITY has changed, init lastseenuid and save it to config
 
             if mailbox.exists == 0 {
-                info!(context, 0, "Folder \"{}\" is empty.", folder.as_ref());
+                info!(context, "Folder \"{}\" is empty.", folder.as_ref());
 
                 // set lastseenuid=0 for empty folders.
                 // id we do not do this here, we'll miss the first message
                 // as we will get in here again and fetch from lastseenuid+1 then
 
-                self.set_config_last_seen_uid(context, &folder, mailbox.uid_validity.unwrap(), 0);
+                self.set_config_last_seen_uid(
+                    context,
+                    &folder,
+                    mailbox.uid_validity.unwrap_or_default(),
+                    0,
+                );
                 return 0;
             }
 
@@ -898,7 +911,6 @@ impl Imap {
                         self.should_reconnect.store(true, Ordering::Relaxed);
                         info!(
                             context,
-                            0,
                             "No result returned for folder \"{}\".",
                             folder.as_ref()
                         );
@@ -917,11 +929,10 @@ impl Imap {
                 last_seen_uid -= 1;
             }
 
-            uid_validity = mailbox.uid_validity.unwrap();
+            uid_validity = mailbox.uid_validity.unwrap_or_default();
             self.set_config_last_seen_uid(context, &folder, uid_validity, last_seen_uid);
             info!(
                 context,
-                0,
                 "lastseenuid initialized to {} for {}@{}",
                 last_seen_uid,
                 folder.as_ref(),
@@ -940,7 +951,7 @@ impl Imap {
             match session.uid_fetch(set, PREFETCH_FLAGS) {
                 Ok(list) => list,
                 Err(err) => {
-                    warn!(context, 0, "failed to fetch uids: {}", err);
+                    warn!(context, "failed to fetch uids: {}", err);
                     return 0;
                 }
             }
@@ -954,21 +965,13 @@ impl Imap {
             if cur_uid > last_seen_uid {
                 read_cnt += 1;
 
-                let message_id = msg
-                    .envelope()
-                    .expect("missing envelope")
-                    .message_id
-                    .expect("missing message id");
+                let message_id = prefetch_get_message_id(msg).unwrap_or_default();
 
-                if 0 == unsafe {
-                    let message_id_c = CString::yolo(message_id);
-                    (self.precheck_imf)(context, message_id_c.as_ptr(), folder.as_ref(), cur_uid)
-                } {
+                if !precheck_imf(context, &message_id, folder.as_ref(), cur_uid) {
                     // check passed, go fetch the rest
                     if self.fetch_single_msg(context, &folder, cur_uid) == 0 {
                         info!(
                             context,
-                            0,
                             "Read error for message {} from \"{}\", trying over later.",
                             message_id,
                             folder.as_ref()
@@ -980,7 +983,6 @@ impl Imap {
                     // check failed
                     info!(
                         context,
-                        0,
                         "Skipping message {} from \"{}\" by precheck.",
                         message_id,
                         folder.as_ref(),
@@ -1001,7 +1003,6 @@ impl Imap {
         if read_errors > 0 {
             warn!(
                 context,
-                0,
                 "{} mails read from \"{}\" with {} errors.",
                 read_cnt,
                 folder.as_ref(),
@@ -1010,7 +1011,6 @@ impl Imap {
         } else {
             info!(
                 context,
-                0,
                 "{} mails read from \"{}\".",
                 read_cnt,
                 folder.as_ref()
@@ -1030,7 +1030,7 @@ impl Imap {
         let key = format!("imap.mailbox.{}", folder.as_ref());
         let val = format!("{}:{}", uidvalidity, lastseenuid);
 
-        (self.set_config)(context, &key, Some(&val));
+        context.sql.set_raw_config(context, &key, Some(&val)).ok();
     }
 
     fn fetch_single_msg<S: AsRef<str>>(
@@ -1055,7 +1055,6 @@ impl Imap {
                     self.should_reconnect.store(true, Ordering::Relaxed);
                     warn!(
                         context,
-                        0,
                         "Error on fetching message #{} from folder \"{}\"; retry={}; error={}.",
                         server_uid,
                         folder.as_ref(),
@@ -1072,7 +1071,6 @@ impl Imap {
         if msgs.is_empty() {
             warn!(
                 context,
-                0,
                 "Message #{} does not exist in folder \"{}\".",
                 server_uid,
                 folder.as_ref()
@@ -1080,36 +1078,22 @@ impl Imap {
         } else {
             let msg = &msgs[0];
 
-            let is_deleted = msg
-                .flags()
-                .iter()
-                .find(|flag| match flag {
-                    imap::types::Flag::Deleted => true,
-                    _ => false,
-                })
-                .is_some();
-            let is_seen = msg
-                .flags()
-                .iter()
-                .find(|flag| match flag {
-                    imap::types::Flag::Seen => true,
-                    _ => false,
-                })
-                .is_some();
+            // XXX put flags into a set and pass them to dc_receive_imf
+            let is_deleted = msg.flags().iter().any(|flag| match flag {
+                imap::types::Flag::Deleted => true,
+                _ => false,
+            });
+            let is_seen = msg.flags().iter().any(|flag| match flag {
+                imap::types::Flag::Seen => true,
+                _ => false,
+            });
 
             let flags = if is_seen { DC_IMAP_SEEN } else { 0 };
 
             if !is_deleted && msg.body().is_some() {
-                let body = msg.body().unwrap();
+                let body = msg.body().unwrap_or_default();
                 unsafe {
-                    (self.receive_imf)(
-                        context,
-                        body.as_ptr() as *const libc::c_char,
-                        body.len(),
-                        folder.as_ref(),
-                        server_uid,
-                        flags as u32,
-                    );
+                    dc_receive_imf(context, &body, folder.as_ref(), server_uid, flags as u32);
                 }
             }
         }
@@ -1126,7 +1110,7 @@ impl Imap {
 
         let watch_folder = self.config.read().unwrap().watch_folder.clone();
         if self.select_folder(context, watch_folder.as_ref()) == 0 {
-            warn!(context, 0, "IMAP-IDLE not setup.",);
+            warn!(context, "IMAP-IDLE not setup.",);
 
             return self.fake_idle(context);
         }
@@ -1166,7 +1150,7 @@ impl Imap {
         let fake_idle_start_time = SystemTime::now();
         let mut wait_long = false;
 
-        info!(context, 0, "IMAP-fake-IDLEing...");
+        info!(context, "IMAP-fake-IDLEing...");
 
         let watch = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_watch = watch.clone();
@@ -1182,13 +1166,14 @@ impl Imap {
         let mut do_fake_idle = true;
         while do_fake_idle {
             // wait a moment: every 5 seconds in the first 3 minutes after a new message, after that every 60 seconds.
-            let seconds_to_wait =
-                if fake_idle_start_time.elapsed().unwrap() < Duration::new(3 * 60, 0) && !wait_long
-                {
-                    Duration::new(5, 0)
-                } else {
-                    Duration::new(60, 0)
-                };
+            let seconds_to_wait = if fake_idle_start_time.elapsed().unwrap_or_default()
+                < Duration::new(3 * 60, 0)
+                && !wait_long
+            {
+                Duration::new(5, 0)
+            } else {
+                Duration::new(60, 0)
+            };
 
             let &(ref lock, ref cvar) = &*watch.clone();
             let mut watch = lock.lock().unwrap();
@@ -1236,375 +1221,223 @@ impl Imap {
         }
     }
 
-    pub fn mv<S1: AsRef<str>, S2: AsRef<str>>(
+    pub fn mv(
         &self,
         context: &Context,
-        folder: S1,
+        folder: &str,
         uid: u32,
-        dest_folder: S2,
+        dest_folder: &str,
         dest_uid: &mut u32,
-    ) -> usize {
-        let mut res = DC_RETRY_LATER;
+    ) -> ImapResult {
+        if folder == dest_folder {
+            info!(
+                context,
+                "Skip moving message; message {}/{} is already in {}...", folder, uid, dest_folder,
+            );
+            return ImapResult::AlreadyDone;
+        }
+        if let Some(imapresult) = self.prepare_imap_operation_on_msg(context, folder, uid) {
+            return imapresult;
+        }
+        // we are connected, and the folder is selected
+
+        // XXX Rust-Imap provides no target uid on mv, so just set it to 0
+        *dest_uid = 0;
+
         let set = format!("{}", uid);
-
-        if uid == 0 {
-            res = DC_FAILED;
-        } else if folder.as_ref() == dest_folder.as_ref() {
-            info!(
-                context,
-                0,
-                "Skip moving message; message {}/{} is already in {}...",
-                folder.as_ref(),
-                uid,
-                dest_folder.as_ref()
-            );
-
-            res = DC_ALREADY_DONE;
-        } else {
-            info!(
-                context,
-                0,
-                "Moving message {}/{} to {}...",
-                folder.as_ref(),
-                uid,
-                dest_folder.as_ref()
-            );
-
-            if self.select_folder(context, Some(folder.as_ref())) == 0 {
-                warn!(
-                    context,
-                    0,
-                    "Cannot select folder {} for moving message.",
-                    folder.as_ref()
-                );
-            } else {
-                let moved = if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
-                    match session.uid_mv(&set, &dest_folder) {
-                        Ok(_) => {
-                            res = DC_SUCCESS;
-                            true
-                        }
-                        Err(err) => {
-                            info!(
-                                context,
-                                0,
-                                "Cannot move message, fallback to COPY/DELETE {}/{} to {}: {}",
-                                folder.as_ref(),
-                                uid,
-                                dest_folder.as_ref(),
-                                err
-                            );
-
-                            false
-                        }
-                    }
-                } else {
-                    unreachable!();
-                };
-
-                if !moved {
-                    let copied = if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
-                        match session.uid_copy(&set, &dest_folder) {
-                            Ok(_) => true,
-                            Err(err) => {
-                                eprintln!("error copy: {:?}", err);
-                                info!(context, 0, "Cannot copy message.",);
-
-                                false
-                            }
-                        }
-                    } else {
-                        unreachable!();
-                    };
-
-                    if copied {
-                        if self.add_flag(context, uid, "\\Deleted") == 0 {
-                            warn!(context, 0, "Cannot mark message as \"Deleted\".",);
-                        }
-                        self.config.write().unwrap().selected_folder_needs_expunge = true;
-                        res = DC_SUCCESS;
-                    }
+        let display_folder_id = format!("{}/{}", folder, uid);
+        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
+            match session.uid_mv(&set, &dest_folder) {
+                Ok(_) => {
+                    emit_event!(
+                        context,
+                        Event::ImapMessageMoved(format!(
+                            "IMAP Message {} moved to {}",
+                            display_folder_id, dest_folder
+                        ))
+                    );
+                    return ImapResult::Success;
+                }
+                Err(err) => {
+                    warn!(
+                        context,
+                        "Cannot move message, fallback to COPY/DELETE {}/{} to {}: {}",
+                        folder,
+                        uid,
+                        dest_folder,
+                        err
+                    );
                 }
             }
-        }
+        } else {
+            unreachable!();
+        };
 
-        if res == DC_SUCCESS {
-            // TODO: is this correct?
-            *dest_uid = uid;
-        }
-
-        if res == DC_RETRY_LATER {
-            if self.should_reconnect() {
-                DC_RETRY_LATER
-            } else {
-                DC_FAILED
+        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
+            match session.uid_copy(&set, &dest_folder) {
+                Ok(_) => {
+                    if !self.add_flag_finalized(context, uid, "\\Deleted") {
+                        warn!(context, "Cannot mark {} as \"Deleted\" after copy.", uid);
+                        ImapResult::Failed
+                    } else {
+                        self.config.write().unwrap().selected_folder_needs_expunge = true;
+                        ImapResult::Success
+                    }
+                }
+                Err(err) => {
+                    warn!(context, "Could not copy message: {}", err);
+                    ImapResult::Failed
+                }
             }
         } else {
-            res
+            unreachable!();
         }
     }
 
-    fn add_flag<S: AsRef<str>>(&self, context: &Context, server_uid: u32, flag: S) -> usize {
+    fn add_flag_finalized(&self, context: &Context, server_uid: u32, flag: &str) -> bool {
+        // return true if we successfully set the flag or we otherwise
+        // think add_flag should not be retried: Disconnection during setting
+        // the flag, or other imap-errors, returns true as well.
+        //
+        // returning false means that the operation can be retried.
         if server_uid == 0 {
-            return 0;
+            return true; // might be moved but we don't want to have a stuck job
+        }
+        if self.should_reconnect() {
+            return false;
         }
         if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
             let set = format!("{}", server_uid);
-            let query = format!("+FLAGS ({})", flag.as_ref());
+            let query = format!("+FLAGS ({})", flag);
             match session.uid_store(&set, &query) {
                 Ok(_) => {}
                 Err(err) => {
                     warn!(
                         context,
-                        0, "IMAP failed to store: ({}, {}) {:?}", set, query, err
+                        "IMAP failed to store: ({}, {}) {:?}", set, query, err
                     );
                 }
             }
-        }
-
-        // All non-connection states are treated as success - the mail may
-        // already be deleted or moved away on the server.
-        if self.should_reconnect() {
-            0
+            true // we tried once, that's probably enough for setting flag
         } else {
-            1
+            unreachable!();
         }
     }
 
-    pub fn set_seen<S: AsRef<str>>(&self, context: &Context, folder: S, uid: u32) -> usize {
-        let mut res = DC_RETRY_LATER;
-
+    pub fn prepare_imap_operation_on_msg(
+        &self,
+        context: &Context,
+        folder: &str,
+        uid: u32,
+    ) -> Option<ImapResult> {
         if uid == 0 {
-            res = DC_FAILED
-        } else if self.is_connected() {
-            info!(
-                context,
-                0,
-                "Marking message {}/{} as seen...",
-                folder.as_ref(),
-                uid,
-            );
-
-            if self.select_folder(context, Some(folder.as_ref())) == 0 {
-                warn!(
-                    context,
-                    0,
-                    "Cannot select folder {} for setting SEEN flag.",
-                    folder.as_ref(),
-                );
-            } else if self.add_flag(context, uid, "\\Seen") == 0 {
-                warn!(context, 0, "Cannot mark message as seen.",);
-            } else {
-                res = DC_SUCCESS
+            return Some(ImapResult::Failed);
+        } else if !self.is_connected() {
+            connect_to_inbox(context, &self);
+            if !self.is_connected() {
+                return Some(ImapResult::RetryLater);
             }
         }
-
-        if res == DC_RETRY_LATER {
-            if self.should_reconnect() {
-                DC_RETRY_LATER
-            } else {
-                DC_FAILED
-            }
+        if self.select_folder(context, Some(&folder)) == 0 {
+            warn!(
+                context,
+                "Cannot select folder {} for preparing IMAP operation", folder
+            );
+            Some(ImapResult::RetryLater)
         } else {
-            res
+            None
         }
     }
 
-    pub fn set_mdnsent<S: AsRef<str>>(&self, context: &Context, folder: S, uid: u32) -> usize {
-        // returns 0=job should be retried later, 1=job done, 2=job done and flag just set
-        let mut res = DC_RETRY_LATER;
-        let set = format!("{}", uid);
-
-        if uid == 0 {
-            res = DC_FAILED;
-        } else if self.is_connected() {
-            info!(
-                context,
-                0,
-                "Marking message {}/{} as $MDNSent...",
-                folder.as_ref(),
-                uid,
-            );
-
-            if self.select_folder(context, Some(folder.as_ref())) == 0 {
-                warn!(
-                    context,
-                    0,
-                    "Cannot select folder {} for setting $MDNSent flag.",
-                    folder.as_ref()
-                );
-            } else {
-                // Check if the folder can handle the `$MDNSent` flag (see RFC 3503).  If so, and not
-                // set: set the flags and return this information.
-                // If the folder cannot handle the `$MDNSent` flag, we risk duplicated MDNs; it's up
-                // to the receiving MUA to handle this then (eg. Delta Chat has no problem with this).
-
-                let can_create_flag = self
-                    .config
-                    .read()
-                    .unwrap()
-                    .selected_mailbox
-                    .as_ref()
-                    .map(|mbox| {
-                        // empty means, everything can be stored
-                        mbox.permanent_flags.is_empty()
-                            || mbox
-                                .permanent_flags
-                                .iter()
-                                .find(|flag| match flag {
-                                    imap::types::Flag::Custom(s) => s == "$MDNSent",
-                                    _ => false,
-                                })
-                                .is_some()
-                    })
-                    .expect("just selected folder");
-
-                if can_create_flag {
-                    let fetched_msgs =
-                        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
-                            match session.uid_fetch(set, FETCH_FLAGS) {
-                                Ok(res) => Some(res),
-                                Err(err) => {
-                                    eprintln!("fetch error: {:?}", err);
-                                    None
-                                }
-                            }
-                        } else {
-                            unreachable!();
-                        };
-
-                    if let Some(msgs) = fetched_msgs {
-                        let flag_set = msgs
-                            .first()
-                            .map(|msg| {
-                                msg.flags()
-                                    .iter()
-                                    .find(|flag| match flag {
-                                        imap::types::Flag::Custom(s) => s == "$MDNSent",
-                                        _ => false,
-                                    })
-                                    .is_some()
-                            })
-                            .unwrap_or_else(|| false);
-
-                        res = if flag_set {
-                            DC_ALREADY_DONE
-                        } else if self.add_flag(context, uid, "$MDNSent") != 0 {
-                            DC_SUCCESS
-                        } else {
-                            res
-                        };
-
-                        if res == DC_SUCCESS {
-                            info!(context, 0, "$MDNSent just set and MDN will be sent.");
-                        } else {
-                            info!(context, 0, "$MDNSent already set and MDN already sent.");
-                        }
-                    }
-                } else {
-                    res = DC_SUCCESS;
-                    info!(
-                        context,
-                        0, "Cannot store $MDNSent flags, risk sending duplicate MDN.",
-                    );
-                }
-            }
+    pub fn set_seen(&self, context: &Context, folder: &str, uid: u32) -> ImapResult {
+        if let Some(imapresult) = self.prepare_imap_operation_on_msg(context, folder, uid) {
+            return imapresult;
         }
+        // we are connected, and the folder is selected
+        info!(context, "Marking message {}/{} as seen...", folder, uid,);
 
-        if res == DC_RETRY_LATER {
-            if self.should_reconnect() {
-                DC_RETRY_LATER
-            } else {
-                DC_FAILED
-            }
+        if self.add_flag_finalized(context, uid, "\\Seen") {
+            ImapResult::Success
         } else {
-            res
+            warn!(
+                context,
+                "Cannot mark message {} in folder {} as seen, ignoring.", uid, folder
+            );
+            ImapResult::Failed
         }
     }
 
     // only returns 0 on connection problems; we should try later again in this case *
-    pub fn delete_msg<S1: AsRef<str>, S2: AsRef<str>>(
+    pub fn delete_msg(
         &self,
         context: &Context,
-        message_id: S1,
-        folder: S2,
-        server_uid: &mut u32,
-    ) -> usize {
-        let mut success = false;
-        if *server_uid == 0 {
-            success = true
-        } else {
-            info!(
-                context,
-                0,
-                "Marking message \"{}\", {}/{} for deletion...",
-                message_id.as_ref(),
-                folder.as_ref(),
-                server_uid,
-            );
+        message_id: &str,
+        folder: &str,
+        uid: &mut u32,
+    ) -> ImapResult {
+        if let Some(imapresult) = self.prepare_imap_operation_on_msg(context, folder, *uid) {
+            return imapresult;
+        }
+        // we are connected, and the folder is selected
 
-            if self.select_folder(context, Some(&folder)) == 0 {
-                warn!(
-                    context,
-                    0,
-                    "Cannot select folder {} for deleting message.",
-                    folder.as_ref()
-                );
-            } else {
-                let set = format!("{}", server_uid);
-                if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
-                    match session.uid_fetch(set, PREFETCH_FLAGS) {
-                        Ok(msgs) => {
-                            if msgs.is_empty()
-                                || msgs
-                                    .first()
-                                    .unwrap()
-                                    .envelope()
-                                    .expect("missing envelope")
-                                    .message_id
-                                    .expect("missing message id")
-                                    != message_id.as_ref()
-                            {
-                                warn!(
-                                    context,
-                                    0,
-                                    "Cannot delete on IMAP, {}/{} does not match {}.",
-                                    folder.as_ref(),
-                                    server_uid,
-                                    message_id.as_ref(),
-                                );
-                                *server_uid = 0;
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("fetch error: {:?}", err);
+        let set = format!("{}", uid);
+        let display_imap_id = format!("{}/{}", folder, uid);
 
-                            warn!(
-                                context,
-                                0,
-                                "Cannot delete on IMAP, {}/{} not found.",
-                                folder.as_ref(),
-                                server_uid,
-                            );
-                            *server_uid = 0;
-                        }
+        // double-check that we are deleting the correct message-id
+        // this comes at the expense of another imap query
+        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
+            match session.uid_fetch(set, PREFETCH_FLAGS) {
+                Ok(msgs) => {
+                    if msgs.is_empty() {
+                        warn!(
+                            context,
+                            "Cannot delete on IMAP, {}: imap entry gone '{}'",
+                            display_imap_id,
+                            message_id,
+                        );
+                        return ImapResult::Failed;
                     }
-                }
+                    let remote_message_id =
+                        prefetch_get_message_id(msgs.first().unwrap()).unwrap_or_default();
 
-                // mark the message for deletion
-                if self.add_flag(context, *server_uid, "\\Deleted") == 0 {
-                    warn!(context, 0, "Cannot mark message as \"Deleted\".");
-                } else {
-                    self.config.write().unwrap().selected_folder_needs_expunge = true;
-                    success = true
+                    if remote_message_id != message_id {
+                        warn!(
+                            context,
+                            "Cannot delete on IMAP, {}: remote message-id '{}' != '{}'",
+                            display_imap_id,
+                            remote_message_id,
+                            message_id,
+                        );
+                    }
+                    *uid = 0;
+                }
+                Err(err) => {
+                    warn!(
+                        context,
+                        "Cannot delete {} on IMAP: {}", display_imap_id, err
+                    );
+                    *uid = 0;
                 }
             }
         }
 
-        if success {
-            1
+        // mark the message for deletion
+        if !self.add_flag_finalized(context, *uid, "\\Deleted") {
+            warn!(
+                context,
+                "Cannot mark message {} as \"Deleted\".", display_imap_id
+            );
+            ImapResult::Failed
         } else {
-            self.is_connected() as usize
+            emit_event!(
+                context,
+                Event::ImapMessageDeleted(format!(
+                    "IMAP Message {} marked as deleted [{}]",
+                    display_imap_id, message_id
+                ))
+            );
+            self.config.write().unwrap().selected_folder_needs_expunge = true;
+            ImapResult::Success
         }
     }
 
@@ -1613,7 +1446,7 @@ impl Imap {
             return;
         }
 
-        info!(context, 0, "Configuring IMAP-folders.");
+        info!(context, "Configuring IMAP-folders.");
 
         let folders = self.list_folders(context).unwrap();
         let delimiter = self.config.read().unwrap().imap_delimiter;
@@ -1632,21 +1465,19 @@ impl Imap {
             });
 
         if mvbox_folder.is_none() && 0 != (flags as usize & DC_CREATE_MVBOX) {
-            info!(context, 0, "Creating MVBOX-folder \"DeltaChat\"...",);
+            info!(context, "Creating MVBOX-folder \"DeltaChat\"...",);
 
             if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
                 match session.create("DeltaChat") {
                     Ok(_) => {
                         mvbox_folder = Some("DeltaChat".into());
 
-                        info!(context, 0, "MVBOX-folder created.",);
+                        info!(context, "MVBOX-folder created.",);
                     }
                     Err(err) => {
                         warn!(
                             context,
-                            0,
-                            "Cannot create MVBOX-folder, using trying INBOX subfolder. ({})",
-                            err
+                            "Cannot create MVBOX-folder, using trying INBOX subfolder. ({})", err
                         );
 
                         match session.create(&fallback_folder) {
@@ -1654,11 +1485,11 @@ impl Imap {
                                 mvbox_folder = Some(fallback_folder);
                                 info!(
                                     context,
-                                    0, "MVBOX-folder created as INBOX subfolder. ({})", err
+                                    "MVBOX-folder created as INBOX subfolder. ({})", err
                                 );
                             }
                             Err(err) => {
-                                warn!(context, 0, "Cannot create MVBOX-folder. ({})", err);
+                                warn!(context, "Cannot create MVBOX-folder. ({})", err);
                             }
                         }
                     }
@@ -1675,18 +1506,18 @@ impl Imap {
 
         context
             .sql
-            .set_config_int(context, "folders_configured", 3)
+            .set_raw_config_int(context, "folders_configured", 3)
             .ok();
         if let Some(ref mvbox_folder) = mvbox_folder {
             context
                 .sql
-                .set_config(context, "configured_mvbox_folder", Some(mvbox_folder))
+                .set_raw_config(context, "configured_mvbox_folder", Some(mvbox_folder))
                 .ok();
         }
         if let Some(ref sentbox_folder) = sentbox_folder {
             context
                 .sql
-                .set_config(
+                .set_raw_config(
                     context,
                     "configured_sentbox_folder",
                     Some(sentbox_folder.name()),
@@ -1704,13 +1535,13 @@ impl Imap {
             match session.list(Some(""), Some("*")) {
                 Ok(list) => {
                     if list.is_empty() {
-                        warn!(context, 0, "Folder list is empty.",);
+                        warn!(context, "Folder list is empty.",);
                     }
                     Some(list)
                 }
                 Err(err) => {
                     eprintln!("list error: {:?}", err);
-                    warn!(context, 0, "Cannot get folder list.",);
+                    warn!(context, "Cannot get folder list.",);
 
                     None
                 }
@@ -1809,4 +1640,36 @@ fn get_folder_meaning(folder_name: &imap::types::Name) -> FolderMeaning {
         FolderMeaning::Unknown => get_folder_meaning_by_name(folder_name),
         _ => res,
     }
+}
+
+fn precheck_imf(context: &Context, rfc724_mid: &str, server_folder: &str, server_uid: u32) -> bool {
+    if let Ok((old_server_folder, old_server_uid, msg_id)) =
+        message::rfc724_mid_exists(context, &rfc724_mid)
+    {
+        if old_server_folder.is_empty() && old_server_uid == 0 {
+            info!(context, "[move] detected bbc-self {}", rfc724_mid,);
+            job_add(
+                context,
+                Action::MarkseenMsgOnImap,
+                msg_id as libc::c_int,
+                Params::new(),
+                0,
+            );
+        } else if old_server_folder != server_folder {
+            info!(context, "[move] detected moved message {}", rfc724_mid,);
+            update_msg_move_state(context, &rfc724_mid, MoveState::Stay);
+        }
+
+        if old_server_folder != server_folder || old_server_uid != server_uid {
+            update_server_uid(context, &rfc724_mid, server_folder, server_uid);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn prefetch_get_message_id(prefetch_msg: &imap::types::Fetch) -> Result<String, Error> {
+    let message_id = prefetch_msg.envelope().unwrap().message_id.unwrap();
+    wrapmime::parse_message_id(&message_id)
 }

@@ -1,6 +1,7 @@
 """ chatting related objects: Contact, Chat, Message. """
 
 import mimetypes
+import os
 from . import props
 from .cutil import as_dc_charpointer, from_dc_charpointer, iter_array
 from .capi import lib, ffi
@@ -108,6 +109,13 @@ class Chat(object):
         """
         return not lib.dc_chat_is_unpromoted(self._dc_chat)
 
+    def is_verified(self):
+        """ return True if this chat is a verified group.
+
+        :returns: True if chat is verified, False otherwise.
+        """
+        return lib.dc_chat_is_verified(self._dc_chat)
+
     def get_name(self):
         """ return name of this chat.
 
@@ -130,6 +138,16 @@ class Chat(object):
         :returns: one of const.DC_CHAT_TYPE_*
         """
         return lib.dc_chat_get_type(self._dc_chat)
+
+    def get_join_qr(self):
+        """ get/create Join-Group QR Code as ascii-string.
+
+        this string needs to be transferred to another DC account
+        in a second channel (typically used by mobiles with QRcode-show + scan UX)
+        where account.join_with_qrcode(qr) needs to be called.
+        """
+        res = lib.dc_get_securejoin_qr(self._dc_context, self.id)
+        return from_dc_charpointer(res)
 
     # ------  chat messaging API ------------------------------
 
@@ -294,7 +312,6 @@ class Chat(object):
     def get_contacts(self):
         """ get all contacts for this chat.
         :params: contact object.
-        :raises ValueError: if contact could not be added
         :returns: list of :class:`deltachat.chatting.Contact` objects for this chat
 
         """
@@ -305,3 +322,46 @@ class Chat(object):
         return list(iter_array(
             dc_array, lambda id: Contact(self._dc_context, id))
         )
+
+    def set_profile_image(self, img_path):
+        """Set group profile image.
+
+        If the group is already promoted (any message was sent to the group),
+        all group members are informed by a special status message that is sent
+        automatically by this function.
+        :params img_path: path to image object
+        :raises ValueError: if profile image could not be set
+        :returns: None
+        """
+        assert os.path.exists(img_path), img_path
+        p = as_dc_charpointer(img_path)
+        res = lib.dc_set_chat_profile_image(self._dc_context, self.id, p)
+        if res != 1:
+            raise ValueError("Setting Profile Image {!r} failed".format(p))
+
+    def remove_profile_image(self):
+        """remove group profile image.
+
+        If the group is already promoted (any message was sent to the group),
+        all group members are informed by a special status message that is sent
+        automatically by this function.
+        :raises ValueError: if profile image could not be reset
+        :returns: None
+        """
+        res = lib.dc_set_chat_profile_image(self._dc_context, self.id, ffi.NULL)
+        if res != 1:
+            raise ValueError("Removing Profile Image failed")
+
+    def get_profile_image(self):
+        """Get group profile image.
+
+        For groups, this is the image set by any group member using
+        set_chat_profile_image(). For normal chats, this is the image
+        set by each remote user on their own using dc_set_config(context,
+        "selfavatar", image).
+        :returns: path to profile image, None if no profile image exists.
+        """
+        dc_res = lib.dc_chat_get_profile_image(self._dc_chat)
+        if dc_res == ffi.NULL:
+            return None
+        return from_dc_charpointer(dc_res)

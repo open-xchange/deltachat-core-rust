@@ -19,16 +19,20 @@ pub enum Config {
     MailUser,
     MailPw,
     MailPort,
+    ImapCertificateChecks,
     SendServer,
     SendUser,
     SendPw,
     SendPort,
+    SmtpCertificateChecks,
     ServerFlags,
     #[strum(props(default = "INBOX"))]
     ImapFolder,
     Displayname,
     Selfstatus,
     Selfavatar,
+    #[strum(props(default = "1"))]
+    BccSelf,
     #[strum(props(default = "1"))]
     E2eeEnabled,
     #[strum(props(default = "1"))]
@@ -50,10 +54,12 @@ pub enum Config {
     ConfiguredMailPw,
     ConfiguredMailPort,
     ConfiguredMailSecurity,
+    ConfiguredImapCertificateChecks,
     ConfiguredSendServer,
     ConfiguredSendUser,
     ConfiguredSendPw,
     ConfiguredSendPort,
+    ConfiguredSmtpCertificateChecks,
     ConfiguredServerFlags,
     ConfiguredSendSecurity,
     ConfiguredE2EEEnabled,
@@ -74,13 +80,13 @@ impl Context {
     pub fn get_config(&self, key: Config) -> Option<String> {
         let value = match key {
             Config::Selfavatar => {
-                let rel_path = self.sql.get_config(self, key);
-                rel_path.map(|p| dc_get_abs_path_safe(self, &p).to_str().unwrap().to_string())
+                let rel_path = self.sql.get_raw_config(self, key);
+                rel_path.map(|p| dc_get_abs_path(self, &p).to_string_lossy().into_owned())
             }
             Config::SysVersion => Some((&*DC_VERSION_STR).clone()),
             Config::SysMsgsizeMaxRecommended => Some(format!("{}", 24 * 1024 * 1024 / 4 * 3)),
             Config::SysConfigKeys => Some(get_config_keys_string()),
-            _ => self.sql.get_config(self, key),
+            _ => self.sql.get_raw_config(self, key),
         };
 
         if value.is_some() {
@@ -94,6 +100,16 @@ impl Context {
         }
     }
 
+    pub fn get_config_int(&self, key: Config) -> i32 {
+        self.get_config(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default()
+    }
+
+    pub fn get_config_bool(&self, key: Config) -> bool {
+        self.get_config_int(key) != 0
+    }
+
     /// Set the given config key.
     /// If `None` is passed as a value the value is cleared and set to the default if there is one.
     pub fn set_config(&self, key: Config, value: Option<&str>) -> Result<(), Error> {
@@ -101,20 +117,20 @@ impl Context {
             Config::Selfavatar if value.is_some() => {
                 let rel_path = std::fs::canonicalize(value.unwrap())?;
                 self.sql
-                    .set_config(self, key, Some(&rel_path.to_string_lossy()))
+                    .set_raw_config(self, key, Some(&rel_path.to_string_lossy()))
             }
             Config::InboxWatch => {
-                let ret = self.sql.set_config(self, key, value);
+                let ret = self.sql.set_raw_config(self, key, value);
                 interrupt_imap_idle(self);
                 ret
             }
             Config::SentboxWatch => {
-                let ret = self.sql.set_config(self, key, value);
+                let ret = self.sql.set_raw_config(self, key, value);
                 interrupt_sentbox_idle(self);
                 ret
             }
             Config::MvboxWatch => {
-                let ret = self.sql.set_config(self, key, value);
+                let ret = self.sql.set_raw_config(self, key, value);
                 interrupt_mvbox_idle(self);
                 ret
             }
@@ -126,9 +142,9 @@ impl Context {
                     value
                 };
 
-                self.sql.set_config(self, key, val)
+                self.sql.set_raw_config(self, key, val)
             }
-            _ => self.sql.set_config(self, key, value),
+            _ => self.sql.set_raw_config(self, key, value),
         }
     }
 }

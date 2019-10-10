@@ -1,6 +1,5 @@
 extern crate deltachat;
 
-use std::ffi::CStr;
 use std::sync::{Arc, RwLock};
 use std::{thread, time};
 use tempfile::tempdir;
@@ -9,42 +8,43 @@ use deltachat::chat;
 use deltachat::chatlist::*;
 use deltachat::config;
 use deltachat::configure::*;
-use deltachat::constants::Event;
 use deltachat::contact::*;
 use deltachat::context::*;
 use deltachat::job::{
     perform_imap_fetch, perform_imap_idle, perform_imap_jobs, perform_smtp_idle, perform_smtp_jobs,
 };
+use deltachat::Event;
 
-extern "C" fn cb(_ctx: &Context, event: Event, data1: usize, data2: usize) -> usize {
-    println!("[{:?}]", event);
+fn cb(_ctx: &Context, event: Event) -> usize {
+    print!("[{:?}]", event);
 
     match event {
-        Event::CONFIGURE_PROGRESS => {
-            println!("  progress: {}", data1);
+        Event::ConfigureProgress(progress) => {
+            print!("  progress: {}\n", progress);
             0
         }
-        Event::INFO | Event::WARNING | Event::ERROR | Event::ERROR_NETWORK => {
-            println!(
-                "  {}",
-                unsafe { CStr::from_ptr(data2 as *const _) }
-                    .to_str()
-                    .unwrap()
-            );
+        Event::Info(msg) | Event::Warning(msg) | Event::Error(msg) | Event::ErrorNetwork(msg) => {
+            print!("  {}\n", msg);
             0
         }
-        _ => 0,
+        _ => {
+            print!("\n");
+            0
+        }
     }
 }
 
 fn main() {
     unsafe {
-        let ctx = dc_context_new(Some(cb), std::ptr::null_mut(), None);
+        let dir = tempdir().unwrap();
+        let dbfile = dir.path().join("db.sqlite");
+        println!("creating database {:?}", dbfile);
+        let ctx =
+            Context::new(Box::new(cb), "FakeOs".into(), dbfile).expect("Failed to create context");
         let running = Arc::new(RwLock::new(true));
-        let info = dc_get_info(&ctx);
-        let info_s = CStr::from_ptr(info);
+        let info = ctx.get_info();
         let duration = time::Duration::from_millis(4000);
-        println!("info: {}", info_s.to_str().unwrap());
+        println!("info: {:#?}", info);
 
         let ctx = Arc::new(ctx);
         let ctx1 = ctx.clone();
@@ -73,13 +73,6 @@ fn main() {
             }
         });
 
-        let dir = tempdir().unwrap();
-        let dbfile = dir.path().join("db.sqlite");
-
-        println!("opening database {:?}", dbfile);
-
-        assert!(dc_open(&ctx, dbfile.to_str().unwrap(), None));
-
         println!("configuring");
         let args = std::env::args().collect::<Vec<String>>();
         assert_eq!(args.len(), 2, "missing password");
@@ -101,7 +94,7 @@ fn main() {
         let chats = Chatlist::try_load(&ctx, 0, None, None).unwrap();
 
         for i in 0..chats.len() {
-            let summary = chats.get_summary(0, None);
+            let summary = chats.get_summary(&ctx, 0, None);
             let text1 = summary.get_text1();
             let text2 = summary.get_text2();
             println!("chat: {} - {:?} - {:?}", i, text1, text2,);
@@ -130,6 +123,5 @@ fn main() {
         t2.join().unwrap();
 
         println!("closing");
-        dc_close(&ctx);
     }
 }

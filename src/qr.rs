@@ -37,7 +37,7 @@ impl Into<Lot> for Error {
 pub fn check_qr(context: &Context, qr: impl AsRef<str>) -> Lot {
     let qr = qr.as_ref();
 
-    info!(context, 0, "Scanned QR code: {}", qr);
+    info!(context, "Scanned QR code: {}", qr);
 
     if qr.starts_with(OPENPGP4FPR_SCHEME) {
         decode_openpgp(context, qr)
@@ -70,19 +70,14 @@ fn decode_openpgp(context: &Context, qr: &str) -> Lot {
         None => return format_err!("Invalid OPENPGP4FPR found").into(),
     };
 
-    dbg!(fingerprint);
-    dbg!(fragment);
-
     // replace & with \n to match expected param format
     let fragment = fragment.replace('&', "\n");
-    dbg!(&fragment);
 
     // Then parse the parameters
     let param: Params = match fragment.parse() {
         Ok(params) => params,
         Err(err) => return err.into(),
     };
-    dbg!(&param);
 
     let addr = if let Some(addr) = param.get(Param::Forwarded) {
         match normalize_address(addr) {

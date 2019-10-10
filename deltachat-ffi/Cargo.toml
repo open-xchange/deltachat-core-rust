@@ -1,6 +1,6 @@
 [package]
 name = "deltachat_ffi"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 description = "Deltachat FFI"
 authors = ["dignifiedquire <dignifiedquire@gmail.com>"]
 edition = "2018"
@@ -16,6 +16,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 deltachat = { path = "../", default-features = false }
+deltachat-provider-database = "0.2.1"
 libc = "0.2"
 human-panic = "1.0.1"
 num-traits = "0.2.6"

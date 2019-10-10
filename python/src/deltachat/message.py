@@ -101,6 +101,14 @@ class Message(object):
         """ return True if this message is a setup message. """
         return lib.dc_msg_is_setupmessage(self._dc_msg)
 
+    def get_setupcodebegin(self):
+        """ return the first characters of a setup code in a setup message. """
+        return from_dc_charpointer(lib.dc_msg_get_setupcodebegin(self._dc_msg))
+
+    def is_encrypted(self):
+        """ return True if this message was encrypted. """
+        return bool(lib.dc_msg_get_showpadlock(self._dc_msg))
+
     def get_message_info(self):
         """ Return informational text for a single message.
 
@@ -110,7 +118,13 @@ class Message(object):
 
     def continue_key_transfer(self, setup_code):
         """ extract key and use it as primary key for this account. """
-        lib.dc_continue_key_transfer(self._dc_context, self.id, as_dc_charpointer(setup_code))
+        res = lib.dc_continue_key_transfer(
+                self._dc_context,
+                self.id,
+                as_dc_charpointer(setup_code)
+        )
+        if res == 0:
+            raise ValueError("could not decrypt")
 
     @props.with_doc
     def time_sent(self):

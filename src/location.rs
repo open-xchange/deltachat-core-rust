@@ -3,17 +3,17 @@ use quick_xml;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 
 use crate::chat;
-use crate::constants::Event;
+use crate::config::Config;
 use crate::constants::*;
 use crate::context::*;
 use crate::dc_tools::*;
 use crate::error::Error;
+use crate::events::Event;
 use crate::job::*;
-use crate::message::*;
+use crate::message::Message;
 use crate::param::*;
 use crate::sql;
 use crate::stock::StockMessage;
-use crate::types::*;
 
 // location handling
 #[derive(Debug, Clone, Default)]
@@ -63,7 +63,7 @@ impl Kml {
 
     pub fn parse(context: &Context, content: impl AsRef<str>) -> Result<Self, Error> {
         ensure!(
-            content.as_ref().len() <= (1 * 1024 * 1024),
+            content.as_ref().len() <= (1024 * 1024),
             "A kml-files with {} bytes is larger than reasonably expected.",
             content.as_ref().len()
         );
@@ -84,7 +84,6 @@ impl Kml {
                 Err(e) => {
                     error!(
                         context,
-                        0,
                         "Location parsing: Error at position {}: {:?}",
                         reader.buffer_position(),
                         e
@@ -216,21 +215,17 @@ pub fn send_locations_to_chat(context: &Context, chat_id: u32, seconds: i64) {
         .is_ok()
         {
             if 0 != seconds && !is_sending_locations_before {
-                msg = dc_msg_new(context, Viewtype::Text);
+                msg = Message::new(Viewtype::Text);
                 msg.text =
                     Some(context.stock_system_msg(StockMessage::MsgLocationEnabled, "", "", 0));
                 msg.param.set_int(Param::Cmd, 8);
-                unsafe { chat::send_msg(context, chat_id, &mut msg).unwrap() };
+                chat::send_msg(context, chat_id, &mut msg).unwrap_or_default();
             } else if 0 == seconds && is_sending_locations_before {
                 let stock_str =
                     context.stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0);
                 chat::add_device_msg(context, chat_id, stock_str);
             }
-            context.call_cb(
-                Event::CHAT_MODIFIED,
-                chat_id as uintptr_t,
-                0i32 as uintptr_t,
-            );
+            context.call_cb(Event::ChatModified(chat_id));
             if 0 != seconds {
                 schedule_MAYBE_SEND_LOCATIONS(context, 0i32);
                 job_add(
@@ -266,16 +261,16 @@ pub fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> l
     if latitude == 0.0 && longitude == 0.0 {
         return 1;
     }
+    let mut continue_streaming = false;
 
-    context.sql.query_map(
+    if let Ok(chats) = context.sql.query_map(
         "SELECT id FROM chats WHERE locations_send_until>?;",
-        params![time()], |row| row.get::<_, i32>(0),
-        |chats| {
-            let mut continue_streaming = false;
-
-            for chat in chats {
-                let chat_id = chat?;
-                context.sql.execute(
+        params![time()],
+        |row| row.get::<_, i32>(0),
+        |chats| chats.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+    ) {
+        for chat_id in chats {
+            if let Err(err) = context.sql.execute(
                     "INSERT INTO locations  \
                      (latitude, longitude, accuracy, timestamp, chat_id, from_id) VALUES (?,?,?,?,?,?);",
                     params![
@@ -286,16 +281,19 @@ pub fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> l
                         chat_id,
                         1,
                     ]
-                )?;
+            ) {
+                warn!(context, "failed to store location {:?}", err);
+            } else {
                 continue_streaming = true;
             }
-            if continue_streaming {
-                context.call_cb(Event::LOCATION_CHANGED, 1, 0);
-            };
-            schedule_MAYBE_SEND_LOCATIONS(context, 0);
-            Ok(continue_streaming as libc::c_int)
         }
-    ).unwrap_or_default()
+        if continue_streaming {
+            context.call_cb(Event::LocationChanged(Some(1)));
+        };
+        schedule_MAYBE_SEND_LOCATIONS(context, 0);
+    }
+
+    continue_streaming as libc::c_int
 }
 
 pub fn get_range(
@@ -362,12 +360,12 @@ pub fn get_range(
 }
 
 fn is_marker(txt: &str) -> bool {
-    txt.len() == 1 && txt.chars().next().unwrap() != ' '
+    txt.len() == 1 && !txt.starts_with(' ')
 }
 
 pub fn delete_all(context: &Context) -> Result<(), Error> {
     sql::execute(context, &context.sql, "DELETE FROM locations;", params![])?;
-    context.call_cb(Event::LOCATION_CHANGED, 0, 0);
+    context.call_cb(Event::LocationChanged(None));
     Ok(())
 }
 
@@ -378,8 +376,7 @@ pub fn get_kml(context: &Context, chat_id: u32) -> Result<(String, u32), Error> 
     let mut last_added_location_id = 0;
 
     let self_addr = context
-        .sql
-        .get_config(context, "configured_addr")
+        .get_config(Config::ConfiguredAddr)
         .unwrap_or_default();
 
     let (locations_send_begin, locations_send_until, locations_last_sent) = context.sql.query_row(
@@ -546,76 +543,81 @@ pub fn job_do_DC_JOB_MAYBE_SEND_LOCATIONS(context: &Context, _job: &Job) {
     let mut continue_streaming: libc::c_int = 1;
     info!(
         context,
-        0, " ----------------- MAYBE_SEND_LOCATIONS -------------- ",
+        " ----------------- MAYBE_SEND_LOCATIONS -------------- ",
     );
 
-    context
-        .sql
-        .query_map(
-            "SELECT id, locations_send_begin, locations_last_sent \
-             FROM chats \
-             WHERE locations_send_until>?;",
-            params![now],
-            |row| {
-                let chat_id: i32 = row.get(0)?;
-                let locations_send_begin: i64 = row.get(1)?;
-                let locations_last_sent: i64 = row.get(2)?;
-                continue_streaming = 1;
+    if let Ok(rows) = context.sql.query_map(
+        "SELECT id, locations_send_begin, locations_last_sent \
+         FROM chats \
+         WHERE locations_send_until>?;",
+        params![now],
+        |row| {
+            let chat_id: i32 = row.get(0)?;
+            let locations_send_begin: i64 = row.get(1)?;
+            let locations_last_sent: i64 = row.get(2)?;
+            continue_streaming = 1;
 
-                // be a bit tolerant as the timer may not align exactly with time(NULL)
-                if now - locations_last_sent < (60 - 3) {
-                    Ok(None)
-                } else {
-                    Ok(Some((chat_id, locations_send_begin, locations_last_sent)))
-                }
-            },
-            |rows| {
-                context.sql.prepare(
-                    "SELECT id \
-                     FROM locations \
-                     WHERE from_id=? \
-                     AND timestamp>=? \
-                     AND timestamp>? \
-                     AND independent=0 \
-                     ORDER BY timestamp;",
-                    |mut stmt_locations, _| {
-                        for (chat_id, locations_send_begin, locations_last_sent) in
-                            rows.filter_map(|r| match r {
-                                Ok(Some(v)) => Some(v),
-                                _ => None,
-                            })
-                        {
-                            // TODO: do I need to reset?
+            // be a bit tolerant as the timer may not align exactly with time(NULL)
+            if now - locations_last_sent < (60 - 3) {
+                Ok(None)
+            } else {
+                Ok(Some((chat_id, locations_send_begin, locations_last_sent)))
+            }
+        },
+        |rows| {
+            rows.filter_map(|v| v.transpose())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        },
+    ) {
+        let msgs = context
+            .sql
+            .prepare(
+                "SELECT id \
+                 FROM locations \
+                 WHERE from_id=? \
+                 AND timestamp>=? \
+                 AND timestamp>? \
+                 AND independent=0 \
+                 ORDER BY timestamp;",
+                |mut stmt_locations, _| {
+                    let msgs = rows
+                        .into_iter()
+                        .filter_map(|(chat_id, locations_send_begin, locations_last_sent)| {
                             if !stmt_locations
                                 .exists(params![1, locations_send_begin, locations_last_sent,])
                                 .unwrap_or_default()
                             {
                                 // if there is no new location, there's nothing to send.
                                 // however, maybe we want to bypass this test eg. 15 minutes
-                                continue;
+                                None
+                            } else {
+                                // pending locations are attached automatically to every message,
+                                // so also to this empty text message.
+                                // DC_CMD_LOCATION is only needed to create a nicer subject.
+                                //
+                                // for optimisation and to avoid flooding the sending queue,
+                                // we could sending these messages only if we're really online.
+                                // the easiest way to determine this, is to check for an empty message queue.
+                                // (might not be 100%, however, as positions are sent combined later
+                                // and dc_set_location() is typically called periodically, this is ok)
+                                let mut msg = Message::new(Viewtype::Text);
+                                msg.hidden = true;
+                                msg.param.set_int(Param::Cmd, 9);
+                                Some((chat_id, msg))
                             }
-                            // pending locations are attached automatically to every message,
-                            // so also to this empty text message.
-                            // DC_CMD_LOCATION is only needed to create a nicer subject.
-                            //
-                            // for optimisation and to avoid flooding the sending queue,
-                            // we could sending these messages only if we're really online.
-                            // the easiest way to determine this, is to check for an empty message queue.
-                            // (might not be 100%, however, as positions are sent combined later
-                            // and dc_set_location() is typically called periodically, this is ok)
-                            let mut msg = dc_msg_new(context, Viewtype::Text);
-                            msg.hidden = true;
-                            msg.param.set_int(Param::Cmd, 9);
-                            // TODO: handle cleanup on error
-                            unsafe { chat::send_msg(context, chat_id as u32, &mut msg).unwrap() };
-                        }
-                        Ok(())
-                    },
-                )
-            },
-        )
-        .unwrap(); // TODO: Better error handling
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(msgs)
+                },
+            )
+            .unwrap_or_default(); // TODO: Better error handling
 
+        for (chat_id, mut msg) in msgs.into_iter() {
+            // TODO: better error handling
+            chat::send_msg(context, chat_id as u32, &mut msg).unwrap_or_default();
+        }
+    }
     if 0 != continue_streaming {
         schedule_MAYBE_SEND_LOCATIONS(context, 0x1);
     }
@@ -646,11 +648,7 @@ pub fn job_do_DC_JOB_MAYBE_SEND_LOC_ENDED(context: &Context, job: &mut Job) {
                 ).is_ok() {
                     let stock_str = context.stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0);
                     chat::add_device_msg(context, chat_id, stock_str);
-                    context.call_cb(
-                        Event::CHAT_MODIFIED,
-                        chat_id as usize,
-                        0,
-                    );
+                    context.call_cb(Event::ChatModified(chat_id));
                 }
             }
         }

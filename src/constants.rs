@@ -1,9 +1,8 @@
 //! Constants
 #![allow(non_camel_case_types, dead_code)]
 
-use lazy_static::lazy_static;
-
 use deltachat_derive::*;
+use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref DC_VERSION_STR: String = env!("CARGO_PKG_VERSION").to_string();
@@ -18,9 +17,14 @@ pub enum MoveState {
     Moving = 3,
 }
 
+impl Default for MoveState {
+    fn default() -> Self {
+        MoveState::Undefined
+    }
+}
+
 // some defaults
 const DC_E2EE_DEFAULT_ENABLED: i32 = 1;
-pub const DC_MDNS_DEFAULT_ENABLED: i32 = 1;
 const DC_INBOX_WATCH_DEFAULT: i32 = 1;
 const DC_SENTBOX_WATCH_DEFAULT: i32 = 1;
 const DC_MVBOX_WATCH_DEFAULT: i32 = 1;
@@ -42,7 +46,7 @@ impl Default for Blocked {
 
 pub const DC_IMAP_SEEN: u32 = 0x1;
 
-const DC_HANDSHAKE_CONTINUE_NORMAL_PROCESSING: i32 = 0x01;
+pub const DC_HANDSHAKE_CONTINUE_NORMAL_PROCESSING: i32 = 0x01;
 pub const DC_HANDSHAKE_STOP_NORMAL_PROCESSING: i32 = 0x02;
 pub const DC_HANDSHAKE_ADD_DELETE_JOB: i32 = 0x04;
 
@@ -52,17 +56,12 @@ pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
 
 const DC_GCM_ADDDAYMARKER: usize = 0x01;
 
-const DC_GCL_VERIFIED_ONLY: usize = 0x01;
+pub const DC_GCL_VERIFIED_ONLY: usize = 0x01;
 pub const DC_GCL_ADD_SELF: usize = 0x02;
 
-/// param1 is a directory where the keys are written to
-const DC_IMEX_EXPORT_SELF_KEYS: usize = 1;
-/// param1 is a directory where the keys are searched in and read from
-const DC_IMEX_IMPORT_SELF_KEYS: usize = 2;
-/// param1 is a directory where the backup is written to
-const DC_IMEX_EXPORT_BACKUP: usize = 11;
-/// param1 is the file with the backup to import
-const DC_IMEX_IMPORT_BACKUP: usize = 12;
+// values for DC_PARAM_FORCE_PLAINTEXT
+pub(crate) const DC_FP_NO_AUTOCRYPT_HEADER: i32 = 2;
+pub(crate) const DC_FP_ADD_AUTOCRYPT_HEADER: i32 = 1;
 
 /// virtual chat showing all messages belonging to chats flagged with chats.blocked=2
 pub(crate) const DC_CHAT_ID_DEADDROP: u32 = 1;
@@ -71,7 +70,7 @@ pub const DC_CHAT_ID_TRASH: u32 = 3;
 /// a message is just in creation but not yet assigned to a chat (eg. we may need the message ID to set up blobs; this avoids unready message to be sent and shown)
 const DC_CHAT_ID_MSGS_IN_CREATION: u32 = 4;
 /// virtual chat showing all messages flagged with msgs.starred=2
-const DC_CHAT_ID_STARRED: u32 = 5;
+pub const DC_CHAT_ID_STARRED: u32 = 5;
 /// only an indicator in a chatlist
 pub const DC_CHAT_ID_ARCHIVED_LINK: u32 = 6;
 /// only an indicator in a chatlist
@@ -117,7 +116,7 @@ const DC_MAX_GET_INFO_LEN: usize = 100000;
 
 pub const DC_CONTACT_ID_UNDEFINED: u32 = 0;
 pub const DC_CONTACT_ID_SELF: u32 = 1;
-const DC_CONTACT_ID_DEVICE: u32 = 2;
+pub const DC_CONTACT_ID_DEVICE: u32 = 2;
 pub const DC_CONTACT_ID_LAST_SPECIAL: u32 = 9;
 
 pub const DC_CREATE_MVBOX: usize = 1;
@@ -130,23 +129,23 @@ pub const DC_CREATE_MVBOX: usize = 1;
 /// Force OAuth2 authorization. This flag does not skip automatic configuration.
 /// Before calling configure() with DC_LP_AUTH_OAUTH2 set,
 /// the user has to confirm access at the URL returned by dc_get_oauth2_url().
-pub const DC_LP_AUTH_OAUTH2: usize = 0x2;
+pub const DC_LP_AUTH_OAUTH2: i32 = 0x2;
 
 /// Force NORMAL authorization, this is the default.
 /// If this flag is set, automatic configuration is skipped.
-const DC_LP_AUTH_NORMAL: usize = 0x4;
+pub const DC_LP_AUTH_NORMAL: i32 = 0x4;
 
 /// Connect to IMAP via STARTTLS.
 /// If this flag is set, automatic configuration is skipped.
-pub const DC_LP_IMAP_SOCKET_STARTTLS: usize = 0x100;
+pub const DC_LP_IMAP_SOCKET_STARTTLS: i32 = 0x100;
 
 /// Connect to IMAP via SSL.
 /// If this flag is set, automatic configuration is skipped.
-const DC_LP_IMAP_SOCKET_SSL: usize = 0x200;
+pub const DC_LP_IMAP_SOCKET_SSL: i32 = 0x200;
 
 /// Connect to IMAP unencrypted, this should not be used.
 /// If this flag is set, automatic configuration is skipped.
-pub const DC_LP_IMAP_SOCKET_PLAIN: usize = 0x400;
+pub const DC_LP_IMAP_SOCKET_PLAIN: i32 = 0x400;
 
 /// Connect to SMTP via STARTTLS.
 /// If this flag is set, automatic configuration is skipped.
@@ -154,20 +153,26 @@ pub const DC_LP_SMTP_SOCKET_STARTTLS: usize = 0x10000;
 
 /// Connect to SMTP via SSL.
 /// If this flag is set, automatic configuration is skipped.
-const DC_LP_SMTP_SOCKET_SSL: usize = 0x20000;
+pub const DC_LP_SMTP_SOCKET_SSL: usize = 0x20000;
 
 /// Connect to SMTP unencrypted, this should not be used.
 /// If this flag is set, automatic configuration is skipped.
 pub const DC_LP_SMTP_SOCKET_PLAIN: usize = 0x40000;
 
 /// if none of these flags are set, the default is chosen
-const DC_LP_AUTH_FLAGS: usize = (DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL);
+pub const DC_LP_AUTH_FLAGS: i32 = (DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL);
 /// if none of these flags are set, the default is chosen
-const DC_LP_IMAP_SOCKET_FLAGS: usize =
+pub const DC_LP_IMAP_SOCKET_FLAGS: i32 =
     (DC_LP_IMAP_SOCKET_STARTTLS | DC_LP_IMAP_SOCKET_SSL | DC_LP_IMAP_SOCKET_PLAIN);
 /// if none of these flags are set, the default is chosen
-const DC_LP_SMTP_SOCKET_FLAGS: usize =
+pub const DC_LP_SMTP_SOCKET_FLAGS: usize =
     (DC_LP_SMTP_SOCKET_STARTTLS | DC_LP_SMTP_SOCKET_SSL | DC_LP_SMTP_SOCKET_PLAIN);
+
+// QR code scanning (view from Bob, the joiner)
+pub const DC_VC_AUTH_REQUIRED: i32 = 2;
+pub const DC_VC_CONTACT_CONFIRM: i32 = 6;
+pub const DC_BOB_ERROR: i32 = 0;
+pub const DC_BOB_SUCCESS: i32 = 1;
 
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
 #[repr(i32)]
@@ -188,6 +193,11 @@ pub enum Viewtype {
     /// File, width and height are set via dc_msg_set_file(), dc_msg_set_dimension()
     /// and retrieved via dc_msg_get_file(), dc_msg_get_width(), dc_msg_get_height().
     Gif = 21,
+
+    /// Message containing a sticker, similar to image.
+    /// If possible, the ui should display the image without borders in a transparent way.
+    /// A click on a sticker will offer to install the sticker set in some future.
+    Sticker = 23,
 
     /// Message containing an Audio file.
     /// File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
@@ -212,6 +222,12 @@ pub enum Viewtype {
     /// The file is set via dc_msg_set_file()
     /// and retrieved via dc_msg_get_file().
     File = 60,
+}
+
+impl Default for Viewtype {
+    fn default() -> Self {
+        Viewtype::Unknown
+    }
 }
 
 #[cfg(test)]
@@ -536,7 +552,8 @@ const DC_STR_MSGACTIONBYME: usize = 63;
 const DC_STR_MSGLOCATIONENABLED: usize = 64;
 const DC_STR_MSGLOCATIONDISABLED: usize = 65;
 const DC_STR_LOCATION: usize = 66;
-const DC_STR_COUNT: usize = 66;
+const DC_STR_STICKER: usize = 67;
+const DC_STR_COUNT: usize = 67;
 
 pub const DC_JOB_DELETE_MSG_ON_IMAP: i32 = 110;
 
@@ -546,12 +563,3 @@ pub enum KeyType {
     Public = 0,
     Private = 1,
 }
-
-pub const DC_CMD_GROUPNAME_CHANGED: libc::c_int = 2;
-pub const DC_CMD_GROUPIMAGE_CHANGED: libc::c_int = 3;
-pub const DC_CMD_MEMBER_ADDED_TO_GROUP: libc::c_int = 4;
-pub const DC_CMD_MEMBER_REMOVED_FROM_GROUP: libc::c_int = 5;
-pub const DC_CMD_AUTOCRYPT_SETUP_MESSAGE: libc::c_int = 6;
-const DC_CMD_SECUREJOIN_MESSAGE: libc::c_int = 7;
-pub const DC_CMD_LOCATION_STREAMING_ENABLED: libc::c_int = 8;
-const DC_CMD_LOCATION_ONLY: libc::c_int = 9;

@@ -10,6 +10,7 @@ pub enum JobThreadKind {
     MoveBox,
 }
 
+#[derive(Debug)]
 pub struct JobThread {
     name: &'static str,
     job_thread_kind: JobThreadKind,
@@ -40,7 +41,7 @@ impl JobThread {
     }
 
     pub fn suspend(&self, context: &Context) {
-        info!(context, 0, "Suspending {}-thread.", self.name,);
+        info!(context, "Suspending {}-thread.", self.name,);
         {
             self.state.0.lock().unwrap().suspended = true;
         }
@@ -55,7 +56,7 @@ impl JobThread {
     }
 
     pub fn unsuspend(&self, context: &Context) {
-        info!(context, 0, "Unsuspending {}-thread.", self.name);
+        info!(context, "Unsuspending {}-thread.", self.name);
 
         let &(ref lock, ref cvar) = &*self.state.clone();
         let mut state = lock.lock().unwrap();
@@ -70,7 +71,7 @@ impl JobThread {
             self.state.0.lock().unwrap().jobs_needed = 1;
         }
 
-        info!(context, 0, "Interrupting {}-IDLE...", self.name);
+        info!(context, "Interrupting {}-IDLE...", self.name);
 
         self.imap.interrupt_idle();
 
@@ -96,16 +97,15 @@ impl JobThread {
         if use_network {
             let start = std::time::Instant::now();
             if self.connect_to_imap(context) {
-                info!(context, 0, "{}-fetch started...", self.name);
+                info!(context, "{}-fetch started...", self.name);
                 self.imap.fetch(context);
 
                 if self.imap.should_reconnect() {
-                    info!(context, 0, "{}-fetch aborted, starting over...", self.name,);
+                    info!(context, "{}-fetch aborted, starting over...", self.name,);
                     self.imap.fetch(context);
                 }
                 info!(
                     context,
-                    0,
                     "{}-fetch done in {:.3} ms.",
                     self.name,
                     start.elapsed().as_millis(),
@@ -143,14 +143,14 @@ impl JobThread {
         if ret_connected {
             if context
                 .sql
-                .get_config_int(context, "folders_configured")
+                .get_raw_config_int(context, "folders_configured")
                 .unwrap_or_default()
                 < 3
             {
                 self.imap.configure_folders(context, 0x1);
             }
 
-            if let Some(mvbox_name) = self.get_watch_folder(context) {
+            if let Some(mvbox_name) = context.sql.get_raw_config(context, self.folder_config_name) {
                 self.imap.set_watch_folder(mvbox_name);
             } else {
                 self.imap.disconnect(context);
@@ -169,7 +169,6 @@ impl JobThread {
             if 0 != state.jobs_needed {
                 info!(
                     context,
-                    0,
                     "{}-IDLE will not be started as it was interrupted while not ideling.",
                     self.name,
                 );
@@ -199,9 +198,9 @@ impl JobThread {
         }
 
         self.connect_to_imap(context);
-        info!(context, 0, "{}-IDLE started...", self.name,);
+        info!(context, "{}-IDLE started...", self.name,);
         self.imap.idle(context);
-        info!(context, 0, "{}-IDLE ended.", self.name);
+        info!(context, "{}-IDLE ended.", self.name);
 
         self.state.0.lock().unwrap().using_handle = false;
     }

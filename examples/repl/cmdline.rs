@@ -1,22 +1,20 @@
-use std::ffi::CString;
-use std::ptr;
+use std::path::Path;
 use std::str::FromStr;
 
 use deltachat::chat::{self, Chat};
 use deltachat::chatlist::*;
 use deltachat::config;
-use deltachat::configure::*;
 use deltachat::constants::*;
 use deltachat::contact::*;
 use deltachat::context::*;
-use deltachat::dc_imex::*;
 use deltachat::dc_receive_imf::*;
 use deltachat::dc_tools::*;
 use deltachat::error::Error;
+use deltachat::imex::*;
 use deltachat::job::*;
 use deltachat::location;
 use deltachat::lot::LotState;
-use deltachat::message::*;
+use deltachat::message::{self, Message, MessageState};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::sql;
@@ -24,15 +22,17 @@ use deltachat::types::*;
 use deltachat::x::*;
 use num_traits::FromPrimitive;
 use deltachat::coi::CoiMessageFilter;
+use deltachat::Event;
+use libc::free;
 
 /// Reset database tables. This function is called from Core cmdline.
 /// Argument is a bitmask, executing single or multiple actions in one call.
 /// e.g. bitmask 7 triggers actions definded with bits 1, 2 and 4.
 pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
-    info!(context, 0, "Resetting tables ({})...", bits);
+    info!(context, "Resetting tables ({})...", bits);
     if 0 != bits & 1 {
         sql::execute(context, &context.sql, "DELETE FROM jobs;", params![]).unwrap();
-        info!(context, 0, "(1) Jobs reset.");
+        info!(context, "(1) Jobs reset.");
     }
     if 0 != bits & 2 {
         sql::execute(
@@ -42,11 +42,11 @@ pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
             params![],
         )
         .unwrap();
-        info!(context, 0, "(2) Peerstates reset.");
+        info!(context, "(2) Peerstates reset.");
     }
     if 0 != bits & 4 {
         sql::execute(context, &context.sql, "DELETE FROM keypairs;", params![]).unwrap();
-        info!(context, 0, "(4) Private keypairs reset.");
+        info!(context, "(4) Private keypairs reset.");
     }
     if 0 != bits & 8 {
         sql::execute(
@@ -85,182 +85,139 @@ pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
         )
         .unwrap();
         sql::execute(context, &context.sql, "DELETE FROM leftgrps;", params![]).unwrap();
-        info!(context, 0, "(8) Rest but server config reset.");
+        info!(context, "(8) Rest but server config reset.");
     }
 
-    context.call_cb(Event::MSGS_CHANGED, 0, 0);
+    context.call_cb(Event::MsgsChanged {
+        chat_id: 0,
+        msg_id: 0,
+    });
 
     1
 }
 
-unsafe fn dc_poke_eml_file(context: &Context, filename: *const libc::c_char) -> libc::c_int {
-    /* mainly for testing, may be called by dc_import_spec() */
-    let mut success: libc::c_int = 0i32;
-    let mut data: *mut libc::c_char = ptr::null_mut();
-    let mut data_bytes: size_t = 0;
-    if !(dc_read_file(
-        context,
-        filename,
-        &mut data as *mut *mut libc::c_char as *mut *mut libc::c_void,
-        &mut data_bytes,
-    ) == 0i32)
-    {
-        dc_receive_imf(context, data, data_bytes, "import", 0, 0);
-        success = 1;
-    }
-    free(data as *mut libc::c_void);
+fn dc_poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<(), Error> {
+    let data = dc_read_file(context, filename)?;
 
-    success
+    unsafe { dc_receive_imf(context, &data, "import", 0, 0) };
+    Ok(())
 }
 
 /// Import a file to the database.
 /// For testing, import a folder with eml-files, a single eml-file, e-mail plus public key and so on.
-/// For normal importing, use dc_imex().
+/// For normal importing, use imex().
 ///
 /// @private @memberof Context
 /// @param context The context as created by dc_context_new().
 /// @param spec The file or directory to import. NULL for the last command.
 /// @return 1=success, 0=error.
-unsafe fn poke_spec(context: &Context, spec: *const libc::c_char) -> libc::c_int {
+fn poke_spec(context: &Context, spec: *const libc::c_char) -> libc::c_int {
     if !context.sql.is_open() {
-        error!(context, 0, "Import: Database not opened.");
+        error!(context, "Import: Database not opened.");
         return 0;
     }
 
-    let ok_to_continue;
-    let mut success: libc::c_int = 0;
-    let real_spec: *mut libc::c_char;
-    let mut suffix: *mut libc::c_char = ptr::null_mut();
-    let mut read_cnt: libc::c_int = 0;
+    let real_spec: String;
+    let mut read_cnt = 0;
 
     /* if `spec` is given, remember it for later usage; if it is not given, try to use the last one */
     if !spec.is_null() {
-        real_spec = dc_strdup(spec);
+        real_spec = to_string_lossy(spec);
         context
             .sql
-            .set_config(context, "import_spec", Some(as_str(real_spec)))
+            .set_raw_config(context, "import_spec", Some(&real_spec))
             .unwrap();
-        ok_to_continue = true;
     } else {
-        let rs = context.sql.get_config(context, "import_spec");
+        let rs = context.sql.get_raw_config(context, "import_spec");
         if rs.is_none() {
-            error!(context, 0, "Import: No file or folder given.");
-            ok_to_continue = false;
-        } else {
-            ok_to_continue = true;
+            error!(context, "Import: No file or folder given.");
+            return 0;
         }
-        real_spec = rs.unwrap_or_default().strdup();
+        real_spec = rs.unwrap();
     }
-    if ok_to_continue {
-        let ok_to_continue2;
-        suffix = dc_get_filesuffix_lc(as_str(real_spec));
-        if !suffix.is_null() && strcmp(suffix, b"eml\x00" as *const u8 as *const libc::c_char) == 0
-        {
-            if 0 != dc_poke_eml_file(context, real_spec) {
+    if let Some(suffix) = dc_get_filesuffix_lc(&real_spec) {
+        if suffix == "eml" {
+            if dc_poke_eml_file(context, &real_spec).is_ok() {
                 read_cnt += 1
             }
-            ok_to_continue2 = true;
+        }
+    } else {
+        /* import a directory */
+        let dir_name = std::path::Path::new(&real_spec);
+        let dir = std::fs::read_dir(dir_name);
+        if dir.is_err() {
+            error!(context, "Import: Cannot open directory \"{}\".", &real_spec,);
+            return 0;
         } else {
-            /* import a directory */
-            let dir_name = std::path::Path::new(as_str(real_spec));
-            let dir = std::fs::read_dir(dir_name);
-            if dir.is_err() {
-                error!(
-                    context,
-                    0,
-                    "Import: Cannot open directory \"{}\".",
-                    as_str(real_spec),
-                );
-                ok_to_continue2 = false;
-            } else {
-                let dir = dir.unwrap();
-                for entry in dir {
-                    if entry.is_err() {
-                        break;
-                    }
-                    let entry = entry.unwrap();
-                    let name_f = entry.file_name();
-                    let name = name_f.to_string_lossy();
-                    if name.ends_with(".eml") {
-                        let path_plus_name = format!("{}/{}", as_str(real_spec), name);
-                        info!(context, 0, "Import: {}", path_plus_name);
-                        let path_plus_name_c = CString::yolo(path_plus_name);
-                        if 0 != dc_poke_eml_file(context, path_plus_name_c.as_ptr()) {
-                            read_cnt += 1
-                        }
+            let dir = dir.unwrap();
+            for entry in dir {
+                if entry.is_err() {
+                    break;
+                }
+                let entry = entry.unwrap();
+                let name_f = entry.file_name();
+                let name = name_f.to_string_lossy();
+                if name.ends_with(".eml") {
+                    let path_plus_name = format!("{}/{}", &real_spec, name);
+                    info!(context, "Import: {}", path_plus_name);
+                    if dc_poke_eml_file(context, path_plus_name).is_ok() {
+                        read_cnt += 1
                     }
                 }
-                ok_to_continue2 = true;
             }
-        }
-        if ok_to_continue2 {
-            info!(
-                context,
-                0,
-                "Import: {} items read from \"{}\".",
-                read_cnt,
-                as_str(real_spec)
-            );
-            if read_cnt > 0 {
-                context.call_cb(Event::MSGS_CHANGED, 0 as uintptr_t, 0 as uintptr_t);
-            }
-            success = 1
         }
     }
-
-    free(real_spec as *mut libc::c_void);
-    free(suffix as *mut libc::c_void);
-    success
+    info!(
+        context,
+        "Import: {} items read from \"{}\".", read_cnt, &real_spec
+    );
+    if read_cnt > 0 {
+        context.call_cb(Event::MsgsChanged {
+            chat_id: 0,
+            msg_id: 0,
+        });
+    }
+    1
 }
 
 unsafe fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
-    let contact = Contact::get_by_id(context, dc_msg_get_from_id(msg)).expect("invalid contact");
+    let contact = Contact::get_by_id(context, msg.get_from_id()).expect("invalid contact");
     let contact_name = contact.get_name();
     let contact_id = contact.get_id();
 
-    let statestr = match dc_msg_get_state(msg) {
+    let statestr = match msg.get_state() {
         MessageState::OutPending => " o",
         MessageState::OutDelivered => " √",
         MessageState::OutMdnRcvd => " √√",
         MessageState::OutFailed => " !!",
         _ => "",
     };
-    let temp2 = dc_timestamp_to_str(dc_msg_get_timestamp(msg));
-    let msgtext = dc_msg_get_text(msg);
+    let temp2 = dc_timestamp_to_str(msg.get_timestamp());
+    let msgtext = msg.get_text();
     info!(
         context,
-        0,
         "{}#{}{}{}: {} (Contact#{}): {} {}{}{}{} [{}]",
         prefix.as_ref(),
-        dc_msg_get_id(msg) as libc::c_int,
-        if 0 != dc_msg_get_showpadlock(msg) {
-            "🔒"
-        } else {
-            ""
-        },
-        if dc_msg_has_location(msg) { "📍" } else { "" },
+        msg.get_id() as libc::c_int,
+        if msg.get_showpadlock() { "🔒" } else { "" },
+        if msg.has_location() { "📍" } else { "" },
         &contact_name,
         contact_id,
-        as_str(msgtext),
-        if dc_msg_is_starred(msg) { "★" } else { "" },
-        if dc_msg_get_from_id(msg) == 1 as libc::c_uint {
+        msgtext.unwrap_or_default(),
+        if msg.is_starred() { "★" } else { "" },
+        if msg.get_from_id() == 1 as libc::c_uint {
             ""
-        } else if dc_msg_get_state(msg) == MessageState::InSeen {
+        } else if msg.get_state() == MessageState::InSeen {
             "[SEEN]"
-        } else if dc_msg_get_state(msg) == MessageState::InNoticed {
+        } else if msg.get_state() == MessageState::InNoticed {
             "[NOTICED]"
         } else {
             "[FRESH]"
         },
-        if 0 != dc_msg_is_info(msg) {
-            "[INFO]"
-        } else {
-            ""
-        },
+        if msg.is_info() { "[INFO]" } else { "" },
         statestr,
         &temp2,
     );
-    free(msgtext as *mut libc::c_void);
 }
 
 unsafe fn log_msglist(context: &Context, msglist: &Vec<u32>) -> Result<(), Error> {
@@ -269,7 +226,6 @@ unsafe fn log_msglist(context: &Context, msglist: &Vec<u32>) -> Result<(), Error
         if msg_id == 9 as libc::c_uint {
             info!(
                 context,
-                0,
                 "--------------------------------------------------------------------------------"
             );
 
@@ -277,19 +233,19 @@ unsafe fn log_msglist(context: &Context, msglist: &Vec<u32>) -> Result<(), Error
         } else if msg_id > 0 {
             if lines_out == 0 {
                 info!(
-                    context, 0,
+                    context,
                     "--------------------------------------------------------------------------------",
                 );
                 lines_out += 1
             }
-            let msg = dc_get_msg(context, msg_id)?;
+            let msg = Message::load_from_db(context, msg_id)?;
             log_msg(context, "Msg", &msg);
         }
     }
     if lines_out > 0 {
         info!(
             context,
-            0, "--------------------------------------------------------------------------------"
+            "--------------------------------------------------------------------------------"
         );
     }
     Ok(())
@@ -306,7 +262,7 @@ unsafe fn log_contactlist(context: &Context, contacts: &Vec<u32>) {
         if let Ok(contact) = Contact::get_by_id(context, contact_id) {
             let name = contact.get_name();
             let addr = contact.get_addr();
-            let verified_state = contact.is_verified();
+            let verified_state = contact.is_verified(context);
             let verified_str = if VerifiedStatus::Unverified != verified_state {
                 if verified_state == VerifiedStatus::BidirectVerified {
                     " √√"
@@ -338,15 +294,9 @@ unsafe fn log_contactlist(context: &Context, contacts: &Vec<u32>) {
                 );
             }
 
-            info!(context, 0, "Contact#{}: {}{}", contact_id, line, line2);
+            info!(context, "Contact#{}: {}{}", contact_id, line, line2);
         }
     }
-}
-
-static mut S_IS_AUTH: libc::c_int = 0;
-
-pub unsafe fn dc_cmdline_skip_auth() {
-    S_IS_AUTH = 1;
 }
 
 fn chat_prefix(chat: &Chat) -> &'static str {
@@ -370,12 +320,8 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         arg1.strdup() as *const _
     };
     let arg2 = args.next().unwrap_or_default();
-    let arg2_c = if arg2.is_empty() {
-        std::ptr::null()
-    } else {
-        arg2.strdup() as *const _
-    };
 
+    let blobdir = context.get_blobdir();
     match arg0 {
         "help" | "?" => match arg1 {
             // TODO: reuse commands definition in main.rs.
@@ -429,7 +375,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                  send <text>\n\
                  send-garbage\n\
                  sendimage <file> [<text>]\n\
-                 sendfile <file>\n\
+                 sendfile <file> [<text>]\n\
                  draft [<text>]\n\
                  listmedia\n\
                  archive <chat-id>\n\
@@ -467,52 +413,24 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                  ============================================="
             ),
         },
-        "auth" => {
-            if 0 == S_IS_AUTH {
-                let is_pw = context
-                    .get_config(config::Config::MailPw)
-                    .unwrap_or_default();
-                if arg1 == is_pw {
-                    S_IS_AUTH = 1;
-                } else {
-                    println!("Bad password.");
-                }
-            } else {
-                println!("Already authorized.");
-            }
-        }
-        "open" => {
-            ensure!(!arg1.is_empty(), "Argument <file> missing");
-            dc_close(context);
-            ensure!(dc_open(context, arg1, None), "Open failed");
-        }
-        "close" => {
-            dc_close(context);
-        }
-        "initiate-key-transfer" => {
-            let setup_code = dc_initiate_key_transfer(context);
-            if !setup_code.is_null() {
-                println!(
-                    "Setup code for the transferred setup message: {}",
-                    as_str(setup_code),
-                );
-                free(setup_code as *mut libc::c_void);
-            } else {
-                bail!("Failed to generate setup code");
-            };
-        }
+        "initiate-key-transfer" => match initiate_key_transfer(context) {
+            Ok(setup_code) => println!(
+                "Setup code for the transferred setup message: {}",
+                setup_code,
+            ),
+            Err(err) => bail!("Failed to generate setup code: {}", err),
+        },
         "get-setupcodebegin" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let msg_id: u32 = arg1.parse()?;
-            let msg = dc_get_msg(context, msg_id)?;
-            if dc_msg_is_setupmessage(&msg) {
-                let setupcodebegin = dc_msg_get_setupcodebegin(&msg);
+            let msg = Message::load_from_db(context, msg_id)?;
+            if msg.is_setupmessage() {
+                let setupcodebegin = msg.get_setupcodebegin(context);
                 println!(
                     "The setup code for setup message Msg#{} starts with: {}",
                     msg_id,
-                    as_str(setupcodebegin),
+                    setupcodebegin.unwrap_or_default(),
                 );
-                free(setupcodebegin as *mut libc::c_void);
             } else {
                 bail!("Msg#{} is no setup message.", msg_id,);
             }
@@ -522,43 +440,34 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 !arg1.is_empty() && !arg2.is_empty(),
                 "Arguments <msg-id> <setup-code> expected"
             );
-            if 0 == dc_continue_key_transfer(context, arg1.parse()?, arg2_c) {
-                bail!("Continue key transfer failed");
-            }
+            continue_key_transfer(context, arg1.parse()?, &arg2)?;
         }
         "has-backup" => {
-            let ret = dc_imex_has_backup(context, context.get_blobdir());
-            if ret.is_null() {
-                println!("No backup found.");
-            }
+            has_backup(context, blobdir)?;
         }
         "export-backup" => {
-            dc_imex(context, 11, context.get_blobdir(), ptr::null());
+            imex(context, ImexMode::ExportBackup, Some(blobdir));
         }
         "import-backup" => {
             ensure!(!arg1.is_empty(), "Argument <backup-file> missing.");
-            dc_imex(context, 12, arg1_c, ptr::null());
+            imex(context, ImexMode::ImportBackup, Some(arg1));
         }
         "export-keys" => {
-            dc_imex(context, 1, context.get_blobdir(), ptr::null());
+            imex(context, ImexMode::ExportSelfKeys, Some(blobdir));
         }
         "import-keys" => {
-            dc_imex(context, 2, context.get_blobdir(), ptr::null());
+            imex(context, ImexMode::ImportSelfKeys, Some(blobdir));
         }
         "export-setup" => {
-            let setup_code = dc_create_setup_code(context);
-            let file_name: *mut libc::c_char = dc_mprintf(
-                b"%s/autocrypt-setup-message.html\x00" as *const u8 as *const libc::c_char,
-                context.get_blobdir(),
-            );
-            let file_content = dc_render_setup_file(context, &setup_code)?;
-            std::fs::write(as_str(file_name), file_content)?;
+            let setup_code = create_setup_code(context);
+            let file_name = blobdir.join("autocrypt-setup-message.html");
+            let file_content = render_setup_file(context, &setup_code)?;
+            std::fs::write(&file_name, file_content)?;
             println!(
                 "Setup message written to: {}\nSetup code: {}",
-                as_str(file_name),
+                file_name.display(),
                 &setup_code,
             );
-            free(file_name as *mut libc::c_void);
         }
         "poke" => {
             ensure!(0 != poke_spec(context, arg1_c), "Poke failed");
@@ -570,7 +479,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             ensure!(0 != dc_reset_tables(context, bits), "Reset failed");
         }
         "stop" => {
-            dc_stop_ongoing_process(context);
+            context.stop_ongoing();
         }
         "set" => {
             ensure!(!arg1.is_empty(), "Argument <key> missing.");
@@ -585,7 +494,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             println!("{}={:?}", key, val);
         }
         "info" => {
-            println!("{}", to_string(dc_get_info(context)));
+            println!("{:#?}", context.get_info());
         }
         "maybenetwork" => {
             maybe_network(context);
@@ -605,17 +514,16 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let cnt = chatlist.len();
             if cnt > 0 {
                 info!(
-                    context, 0,
+                    context,
                     "================================================================================"
                 );
 
                 for i in (0..cnt).rev() {
                     let chat = Chat::load_from_db(context, chatlist.get_chat_id(i))?;
-                    let temp_subtitle = chat.get_subtitle();
+                    let temp_subtitle = chat.get_subtitle(context);
                     let temp_name = chat.get_name();
                     info!(
                         context,
-                        0,
                         "{}#{}: {} [{}] [{} fresh]",
                         chat_prefix(&chat),
                         chat.get_id(),
@@ -623,7 +531,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                         temp_subtitle,
                         chat::get_fresh_msg_cnt(context, chat.get_id()),
                     );
-                    let lot = chatlist.get_summary(i, Some(&chat));
+                    let lot = chatlist.get_summary(context, i, Some(&chat));
                     let statestr = if chat.is_archived() {
                         " [Archived]"
                     } else {
@@ -640,7 +548,6 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                     let text2 = lot.get_text2();
                     info!(
                         context,
-                        0,
                         "{}{}{}{} [{}]{}",
                         text1.unwrap_or(""),
                         if text1.is_some() { ": " } else { "" },
@@ -654,13 +561,13 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                         },
                     );
                     info!(
-                        context, 0,
+                        context,
                         "================================================================================"
                     );
                 }
             }
-            if location::is_sending_locations_to_chat(context, 0 as uint32_t) {
-                info!(context, 0, "Location streaming enabled.");
+            if location::is_sending_locations_to_chat(context, 0) {
+                info!(context, "Location streaming enabled.");
             }
             println!("{} chats", cnt);
         }
@@ -679,11 +586,10 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let sel_chat = sel_chat.as_ref().unwrap();
 
             let msglist = chat::get_chat_msgs(context, sel_chat.get_id(), 0x1, 0);
-            let temp2 = sel_chat.get_subtitle();
+            let temp2 = sel_chat.get_subtitle(context);
             let temp_name = sel_chat.get_name();
             info!(
                 context,
-                0,
                 "{}#{}: {} [{}]{}",
                 chat_prefix(sel_chat),
                 sel_chat.get_id(),
@@ -696,7 +602,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 },
             );
             log_msglist(context, &msglist)?;
-            if let Ok(draft) = chat::get_draft(context, sel_chat.get_id()) {
+            if let Some(draft) = chat::get_draft(context, sel_chat.get_id())? {
                 log_msg(context, "Draft", &draft);
             }
 
@@ -709,7 +615,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         "createchat" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
             let contact_id: libc::c_int = arg1.parse()?;
-            let chat_id = chat::create_by_contact_id(context, contact_id as uint32_t)?;
+            let chat_id = chat::create_by_contact_id(context, contact_id as u32)?;
 
             println!("Single#{} created successfully.", chat_id,);
         }
@@ -738,10 +644,10 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
 
             let contact_id_0: libc::c_int = arg1.parse()?;
-            if 0 != chat::add_contact_to_chat(
+            if chat::add_contact_to_chat(
                 context,
                 sel_chat.as_ref().unwrap().get_id(),
-                contact_id_0 as uint32_t,
+                contact_id_0 as u32,
             ) {
                 println!("Contact added to chat.");
             } else {
@@ -755,7 +661,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             chat::remove_contact_from_chat(
                 context,
                 sel_chat.as_ref().unwrap().get_id(),
-                contact_id_1 as uint32_t,
+                contact_id_1 as u32,
             )?;
 
             println!("Contact added to chat.");
@@ -779,7 +685,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             ensure!(sel_chat.is_some(), "No chat selected.");
 
             let contacts = chat::get_chat_contacts(context, sel_chat.as_ref().unwrap().get_id());
-            info!(context, 0, "Memberlist:");
+            info!(context, "Memberlist:");
 
             log_contactlist(context, &contacts);
             println!(
@@ -807,7 +713,6 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 let marker = location.marker.as_ref().unwrap_or(&default_marker);
                 info!(
                     context,
-                    0,
                     "Loc#{}: {}: lat={} lng={} acc={} Chat#{} Contact#{} Msg#{} {}",
                     location.location_id,
                     dc_timestamp_to_str(location.timestamp),
@@ -821,7 +726,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 );
             }
             if locations.is_empty() {
-                info!(context, 0, "No locations.");
+                info!(context, "No locations.");
             }
         }
         "sendlocations" => {
@@ -868,18 +773,17 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         }
         "sendimage" | "sendfile" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
-            ensure!(!arg1.is_empty() && !arg2.is_empty(), "No file given.");
+            ensure!(!arg1.is_empty(), "No file given.");
 
-            let mut msg = dc_msg_new(
-                context,
-                if arg0 == "sendimage" {
-                    Viewtype::Image
-                } else {
-                    Viewtype::File
-                },
-            );
-            dc_msg_set_file(&mut msg, arg1_c, ptr::null());
-            dc_msg_set_text(&mut msg, arg2_c);
+            let mut msg = Message::new(if arg0 == "sendimage" {
+                Viewtype::Image
+            } else {
+                Viewtype::File
+            });
+            msg.set_file(arg1, None);
+            if !arg2.is_empty() {
+                msg.set_text(Some(arg2.to_string()));
+            }
             chat::send_msg(context, sel_chat.as_ref().unwrap().get_id(), &mut msg)?;
         }
         "listmsgs" => {
@@ -891,7 +795,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 0 as libc::c_uint
             };
 
-            let msglist = dc_search_msgs(context, chat, arg1_c);
+            let msglist = context.search_msgs(chat, arg1);
 
             log_msglist(context, &msglist)?;
             println!("{} messages.", msglist.len());
@@ -900,8 +804,8 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             ensure!(sel_chat.is_some(), "No chat selected.");
 
             if !arg1.is_empty() {
-                let mut draft = dc_msg_new(context, Viewtype::Text);
-                dc_msg_set_text(&mut draft, arg1_c);
+                let mut draft = Message::new(Viewtype::Text);
+                draft.set_text(Some(arg1.to_string()));
                 chat::set_draft(
                     context,
                     sel_chat.as_ref().unwrap().get_id(),
@@ -950,11 +854,11 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         "msginfo" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let id = arg1.parse()?;
-            let res = dc_get_msg_info(context, id);
-            println!("{}", as_str(res));
+            let res = message::get_msg_info(context, id);
+            println!("{}", res);
         }
         "listfresh" => {
-            let msglist = dc_get_fresh_msgs(context);
+            let msglist = context.get_fresh_msgs();
 
             log_msglist(context, &msglist)?;
             print!("{} fresh messages.", msglist.len());
@@ -968,30 +872,25 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let mut msg_ids = [0; 1];
             let chat_id = arg2.parse()?;
             msg_ids[0] = arg1.parse()?;
-            chat::forward_msgs(context, msg_ids.as_mut_ptr(), 1, chat_id);
+            chat::forward_msgs(context, &msg_ids, chat_id)?;
         }
         "markseen" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let mut msg_ids = [0; 1];
             msg_ids[0] = arg1.parse()?;
-            dc_markseen_msgs(context, msg_ids.as_mut_ptr(), 1);
+            message::markseen_msgs(context, &msg_ids);
         }
         "star" | "unstar" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let mut msg_ids = [0; 1];
             msg_ids[0] = arg1.parse()?;
-            dc_star_msgs(
-                context,
-                msg_ids.as_mut_ptr(),
-                1,
-                if arg0 == "star" { 1 } else { 0 },
-            );
+            message::star_msgs(context, &msg_ids, arg0 == "star");
         }
         "delmsg" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let mut ids = [0; 1];
             ids[0] = arg1.parse()?;
-            dc_delete_msgs(context, ids.as_mut_ptr(), 1);
+            message::delete_msgs(context, &ids);
         }
         "listcontacts" | "contacts" | "listverified" => {
             let contacts = Contact::get_all(
@@ -1060,20 +959,21 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 res.get_text2()
             );
         }
-        "event" => {
-            ensure!(!arg1.is_empty(), "Argument <id> missing.");
-            let event = arg1.parse()?;
-            let event = Event::from_u32(event).ok_or(format_err!("Event::from_u32({})", event))?;
-            let r = context.call_cb(event, 0 as uintptr_t, 0 as uintptr_t);
-            println!(
-                "Sending event {:?}({}), received value {}.",
-                event, event as usize, r as libc::c_int,
-            );
-        }
+        // TODO: implement this again, unclear how to match this through though, without writing a parser.
+        // "event" => {
+        //     ensure!(!arg1.is_empty(), "Argument <id> missing.");
+        //     let event = arg1.parse()?;
+        //     let event = Event::from_u32(event).ok_or(format_err!("Event::from_u32({})", event))?;
+        //     let r = context.call_cb(event, 0 as libc::uintptr_t, 0 as libc::uintptr_t);
+        //     println!(
+        //         "Sending event {:?}({}), received value {}.",
+        //         event, event as usize, r as libc::c_int,
+        //     );
+        // }
         "fileinfo" => {
             ensure!(!arg1.is_empty(), "Argument <file> missing.");
 
-            if let Some(buf) = dc_read_file_safe(context, &arg1) {
+            if let Ok(buf) = dc_read_file(context, &arg1) {
                 let (width, height) = dc_get_filemeta(&buf)?;
                 println!("width={}, height={}", width, height);
             } else {
@@ -1111,7 +1011,6 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
     }
 
     free(arg1_c as *mut _);
-    free(arg2_c as *mut _);
 
     Ok(())
 }
