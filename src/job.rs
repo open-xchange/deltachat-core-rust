@@ -19,8 +19,6 @@ use crate::message::{self, Message, MessageState};
 use crate::mimefactory::{vec_contains_lowercase, Loaded, MimeFactory};
 use crate::param::*;
 use crate::sql;
-use crate::types::*;
-use crate::x::*;
 use crate::coi::deltachat_mode::CoiDeltachatMode;
 
 /// Thread IDs

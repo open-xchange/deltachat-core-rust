@@ -59,9 +59,7 @@ pub mod securejoin;
 mod smtp;
 pub mod sql;
 mod stock;
-pub mod types;
 pub mod webpush;
-pub mod x;
 mod token;
 #[macro_use]
 mod wrapmime;

@@ -15,7 +15,6 @@ use crate::job::{connect_to_inbox, job_add, Action};
 use crate::login_param::{dc_build_tls, CertificateChecks, LoginParam};
 use crate::message::{self, update_msg_move_state, update_server_uid};
 use crate::oauth2::dc_get_oauth2_access_token;
-use crate::types::*;
 use crate::webpush::WebPushConfig;
 use std::str::FromStr;
 

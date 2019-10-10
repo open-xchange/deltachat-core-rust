@@ -19,8 +19,6 @@ use crate::param::*;
 use crate::peerstate::*;
 use crate::qr::check_qr;
 use crate::stock::StockMessage;
-use crate::types::*;
-use crate::x::*;
 
 pub unsafe fn dc_get_securejoin_qr(
     context: &Context,
