@@ -38,11 +38,13 @@ pub enum ImapResult {
 const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 
-#[derive(Debug)]
+pub type StopCallback = dyn FnOnce() -> imap::error::Result<()>;
+
+#[derive(DebugStub)]
 pub struct Imap {
     config: Arc<RwLock<ImapConfig>>,
-    stop: Arc<Mutex<Option<Box<dyn FnOnce() -> imap::error::Result<()>>>>>,
-
+    #[debug_stub = "Stop"]
+    stop: Arc<Mutex<Option<Box<StopCallback>>>>,
     session: Arc<Mutex<Option<Session>>>,
     stream: Arc<RwLock<Option<net::TcpStream>>>,
     connected: Arc<Mutex<bool>>,

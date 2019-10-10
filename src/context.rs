@@ -25,7 +25,6 @@ use crate::param::Params;
 use crate::smtp::*;
 use crate::sql::Sql;
 use crate::webpush::WebPushConfig;
-use std::ptr;
 use crate::coi::CoiDeltachatMode;
 
 use rand::{thread_rng, Rng};
@@ -139,18 +138,18 @@ impl Context {
             last_smeared_timestamp: Arc::new(RwLock::new(0)),
             cmdline_sel_chat_id: Arc::new(RwLock::new(0)),
             sentbox_thread: Arc::new(RwLock::new(JobThread::new(
-                "SENTBOX",
-                "configured_sentbox_folder",
+                JobThreadKind::SentBox,
                 Imap::new(),
             ))),
             mvbox_thread: Arc::new(RwLock::new(JobThread::new(
-                "MVBOX",
-                "configured_mvbox_folder",
+                JobThreadKind::MoveBox,
                 Imap::new(),
             ))),
             probe_imap_network: Arc::new(RwLock::new(false)),
             perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
             generating_key_mutex: Mutex::new(()),
+            webpush_config: None,
+            coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
         };
 
         ensure!(

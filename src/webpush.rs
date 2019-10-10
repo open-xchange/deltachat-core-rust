@@ -2,7 +2,7 @@ use crate::context::*;
 use crate::job::*;
 use crate::param::*;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct WebPushConfig {
     pub vapid: Option<String>,
 }

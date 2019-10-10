@@ -276,8 +276,7 @@ impl Job {
                     context.call_cb(Event::SetMetadataDone { foreign_id: self.foreign_id });
                 },
                 Err(e) => {
-                    error!(context, self.foreign_id,
-                           "Cannot set metadata: {}", e);
+                    error!(context, "Cannot set metadata: {} ({})", e, self.foreign_id);
                 },
             };
         }

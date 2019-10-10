@@ -2,6 +2,7 @@ use crate::coi::{CoiConfig, CoiDeltachatMode, CoiMessageFilter};
 use crate::context::*;
 use crate::job::*;
 use crate::param::*;
+use crate::config::Config;
 
 const COI_METADATA_ENABLED: &str = "/private/vendor/vendor.dovecot/coi/config/enabled";
 const COI_METADATA_MESSAGE_FILTER: &str =
@@ -60,7 +61,7 @@ impl Context {
         if self.with_coi_deltachat_mode(|mode| mode.is_server_side_move_enabled()) {
             false
         } else {
-            self.get_config_bool("mvbox_move")
+            self.get_config_bool(Config::MvboxMove)
         }
     }
 
