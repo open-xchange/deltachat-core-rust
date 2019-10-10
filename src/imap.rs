@@ -1148,6 +1148,12 @@ impl Imap {
                 idle.wait_interruptible()
             })();
             match res {
+                Err(imap::error::Error::Io(ref err))
+                    if err.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    info!(context, 0, "IMAP-IDLE wait cancelled, we will reconnect soon.");
+                    self.should_reconnect.store(true, Ordering::Relaxed);
+                },
                 Err(imap::error::Error::ConnectionLost) => {
                     info!(context, 0, "IMAP-IDLE wait cancelled, we will reconnect soon.");
                     self.should_reconnect.store(true, Ordering::Relaxed);
