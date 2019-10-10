@@ -118,7 +118,7 @@ impl JobThread {
 
     // XXX: This might be broken!
     fn folder_config_name(&self) -> &str {
-        self.job_thread_kind {
+        match self.job_thread_kind {
             JobThreadKind::SentBox => "configured_sentbox_folder",
             JobThreadKind::MoveBox => "configured_mvbox_folder",
         }

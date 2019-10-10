@@ -245,6 +245,7 @@ impl Chat {
         let mut msg_id = 0;
         let mut to_id = 0;
         let mut location_id = 0;
+        let mut new_rfc724_mid;
 
         if !(self.typ == Chattype::Single
             || self.typ == Chattype::Group
@@ -264,8 +265,7 @@ impl Chat {
             return Ok(0);
         } else {
 
-            if let Some(from) = context.sql.get_config(context, "configured_addr")
-            {
+            if let Some(from) = context.get_config(Config::ConfiguredAddr) {
                 new_rfc724_mid = dc_create_outgoing_rfc724_mid(
                     context,
                     if self.typ == Chattype::Group || self.typ == Chattype::VerifiedGroup {
@@ -274,17 +274,17 @@ impl Chat {
                         None
                     },
                     from.as_ref(),
-                ).strdup();
+                );
             }
         }
 
         if let Some(from) = context.get_config(Config::ConfiguredAddr) {
-            let new_rfc724_mid = {
+            new_rfc724_mid = {
                 let grpid = match self.typ {
                     Chattype::Group | Chattype::VerifiedGroup => Some(self.grpid.as_str()),
                     _ => None,
                 };
-                dc_create_outgoing_rfc724_mid(grpid, &from)
+                dc_create_outgoing_rfc724_mid(context, grpid, from.as_ref())
             };
 
             if self.typ == Chattype::Single {
@@ -1423,75 +1423,11 @@ pub(crate) fn add_contact_to_chat_ex(
         if chat.typ == Chattype::VerifiedGroup
             && contact.is_verified(context) != VerifiedStatus::BidirectVerified
         {
-            if !(is_contact_in_chat(context, chat_id, 1 as u32) == 1) {
-                log_event!(
-                    context,
-                    Event::ERROR_SELF_NOT_IN_GROUP,
-                    0,
-                    "Cannot add contact to group; self not in group.",
-                );
-            } else {
-                /* we should respect this - whatever we send to the group, it gets discarded anyway! */
-                if 0 != flags & 0x1
-                    && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1
-                {
-                    chat.param.remove(Param::Unpromoted);
-                    chat.update_param().unwrap();
-                }
-                let self_addr = context
-                    .sql
-                    .get_config(context, "configured_addr")
-                    .unwrap_or_default();
-                if contact.get_addr() != &self_addr {
-                    // ourself is added using DC_CONTACT_ID_SELF, do not add it explicitly.
-                    // if SELF is not in the group, members cannot be added at all.
-
-                    if 0 != is_contact_in_chat(context, chat_id, contact_id) {
-                        if 0 == flags & 0x1 {
-                            success = 1;
-                            OK_TO_CONTINUE = false;
-                        }
-                    } else {
-                        // else continue and send status mail
-                        if chat.typ == Chattype::VerifiedGroup {
-                            if contact.is_verified() != VerifiedStatus::BidirectVerified {
-                                error!(
-                                    context, 0,
-                                    "Only bidirectional verified contacts can be added to verified groups."
-                                );
-                                OK_TO_CONTINUE = false;
-                            }
-                        }
-                        if OK_TO_CONTINUE {
-                            if 0 == add_to_chat_contacts_table(context, chat_id, contact_id) {
-                                OK_TO_CONTINUE = false;
-                            }
-                        }
-                    }
-                    if OK_TO_CONTINUE {
-                        if chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 0 {
-                            msg.type_0 = Viewtype::Text;
-                            msg.text = Some(context.stock_system_msg(
-                                StockMessage::MsgAddMember,
-                                contact.get_addr(),
-                                "",
-                                DC_CONTACT_ID_SELF as u32,
-                            ));
-                            msg.param.set_int(Param::Cmd, 4);
-                            msg.param.set(Param::Arg, contact.get_addr());
-                            msg.param.set_int(Param::Arg2, flags);
-                            msg.id = send_msg(context, chat_id, &mut msg).unwrap_or_default();
-                            context.call_cb(
-                                Event::MSGS_CHANGED,
-                                chat_id as uintptr_t,
-                                msg.id as uintptr_t,
-                            );
-                        }
-                        context.call_cb(Event::CHAT_MODIFIED, chat_id as uintptr_t, 0 as uintptr_t);
-                        success = 1;
-                    }
-                }
-            }
+            error!(
+                context,
+                "Only bidirectional verified contacts can be added to verified groups."
+            );
+            return Ok(false);
         }
         if !add_to_chat_contacts_table(context, chat_id, contact_id) {
             return Ok(false);
@@ -1964,11 +1900,7 @@ pub fn add_device_msg(context: &Context, chat_id: u32, text: impl AsRef<str>) {
         "rfc724_mid",
         rfc724_mid.as_str(),
     );
-    context.call_cb(
-        Event::MSGS_CHANGED,
-        chat_id as uintptr_t,
-        msg_id as uintptr_t,
-    );
+    context.call_cb(Event::MsgsChanged { chat_id, msg_id });
 }
 
 #[cfg(test)]
