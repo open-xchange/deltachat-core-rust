@@ -367,10 +367,7 @@ pub fn dc_create_outgoing_rfc724_mid(
 
     match group_id {
         None => {
-            let mid_prefix = match context.get_config(Config::Rfc724MsgIdPrefix) {
-                Some(ref s) if s == "1" => "chat$",
-                _ => "Mr."
-            };
+            let mid_prefix = if context.get_config_bool(Config::Rfc724MsgIdPrefix) { "chat$" } else { "Mr." };
             format!("{mid_prefix}{group}.{rand2}{hostname}",
                 mid_prefix = mid_prefix,
                 group = dc_create_id(),
@@ -378,10 +375,7 @@ pub fn dc_create_outgoing_rfc724_mid(
                 hostname = at_hostname)
         }
         Some(group) => {
-            let mid_prefix = match context.get_config(Config::Rfc724MsgIdPrefix) {
-                Some(ref s) if s == "1" => "chat$group.",
-                _ => "Gr."
-            };
+            let mid_prefix = if context.get_config_bool(Config::Rfc724MsgIdPrefix) { "chat$group." } else { "Gr." };
             format!("{mid_prefix}{group}.{rand2}{hostname}",
                 mid_prefix = mid_prefix,
                 group = group,
