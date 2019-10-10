@@ -60,10 +60,7 @@ impl Context {
         if self.with_coi_deltachat_mode(|mode| mode.is_server_side_move_enabled()) {
             false
         } else {
-            self.sql
-                .get_config_int(self, "mvbox_move")
-                .map(|value| value == 1)
-                .unwrap_or(true)
+            self.get_config_bool("mvbox_move")
         }
     }
 
