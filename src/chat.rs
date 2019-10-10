@@ -275,6 +275,7 @@ impl Chat {
                     },
                     from.as_ref(),
                 ).strdup();
+            }
         }
 
         if let Some(from) = context.get_config(Config::ConfiguredAddr) {
