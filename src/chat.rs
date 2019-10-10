@@ -245,7 +245,7 @@ impl Chat {
         let mut msg_id = 0;
         let mut to_id = 0;
         let mut location_id = 0;
-        let mut new_rfc724_mid;
+        let new_rfc724_mid;
 
         if !(self.typ == Chattype::Single
             || self.typ == Chattype::Group
@@ -263,19 +263,6 @@ impl Chat {
                 Event::ErrorSelfNotInGroup("Cannot send message; self not in group.".into())
             );
             return Ok(0);
-        } else {
-
-            if let Some(from) = context.get_config(Config::ConfiguredAddr) {
-                new_rfc724_mid = dc_create_outgoing_rfc724_mid(
-                    context,
-                    if self.typ == Chattype::Group || self.typ == Chattype::VerifiedGroup {
-                        Some(self.grpid.as_ref())
-                    } else {
-                        None
-                    },
-                    from.as_ref(),
-                );
-            }
         }
 
         if let Some(from) = context.get_config(Config::ConfiguredAddr) {
