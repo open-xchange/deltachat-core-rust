@@ -77,31 +77,31 @@ pub type dc_context_t = ContextWrapper;
 impl ContextWrapper {
 
     fn get_coi_config(&self)->Option<CoiConfig> {
-        self.inner.into_inner().expect("Missing Context").unwrap().get_coi_config()
+        self.inner.write().expect("Missing Context").as_ref().unwrap().get_coi_config()
     }
 
     fn get_webpush_config(&self)->Option<WebPushConfig> {
-        self.inner.into_inner().expect("Missing Context").unwrap().get_webpush_config()
+        self.inner.write().expect("Missing Context").as_ref().unwrap().get_webpush_config()
     }
 
     fn set_coi_enabled(&self, enable: bool, id: i32) {
-        self.inner.into_inner().expect("Missing Context").unwrap().set_coi_enabled(enable, id)
+        self.inner.write().expect("Missing Context").as_ref().unwrap().set_coi_enabled(enable, id)
     }
 
     fn set_coi_message_filter(&self, message_filter: CoiMessageFilter, id: i32) {
-        self.inner.into_inner().expect("Missing Context").unwrap().set_coi_message_filter(message_filter, id)
+        self.inner.write().expect("Missing Context").as_ref().unwrap().set_coi_message_filter(message_filter, id)
     }
 
     fn subscribe_webpush(&self, uid: &str, json: Option<&str>, id: i32) {
-        self.inner.into_inner().expect("Missing Context").unwrap().subscribe_webpush(uid, json, id)
+        self.inner.write().expect("Missing Context").as_ref().unwrap().subscribe_webpush(uid, json, id)
     }
 
     fn get_webpush_subscription(&self, uid: &str, id: i32) {
-        self.inner.into_inner().expect("Missing Context").unwrap().get_webpush_subscription(uid, id)
+        self.inner.write().expect("Missing Context").as_ref().unwrap().get_webpush_subscription(uid, id)
     }
 
     fn validate_webpush(&self, uid: &str, msg: &str, id: i32) {
-        self.inner.into_inner().expect("Missing Context").unwrap().validate_webpush(uid, msg, id)
+        self.inner.write().expect("Missing Context").as_ref().unwrap().validate_webpush(uid, msg, id)
     }
 
     /// Log an error on the FFI context.
