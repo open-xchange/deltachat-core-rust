@@ -14,7 +14,6 @@ extern crate num_traits;
 use num_traits::{FromPrimitive, ToPrimitive};
 use std::convert::{TryFrom, TryInto};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::ffi::CString;
 use std::fmt::Write;
 use std::ptr;
@@ -22,9 +21,8 @@ use std::str::FromStr;
 use std::sync::RwLock;
 
 use libc::uintptr_t;
-use num_traits::{FromPrimitive, ToPrimitive};
 
-use deltachat::coi::CoiMessageFilter;
+use deltachat::coi::{CoiMessageFilter, CoiConfig};
 use deltachat::contact::Contact;
 use deltachat::context::Context;
 use deltachat::dc_tools::{as_path, as_str, dc_strdup, to_string_lossy, OsStrExt, StrExt};
@@ -176,6 +174,11 @@ impl ContextWrapper {
                         id.to_u32().unwrap_or_default() as uintptr_t,
                         count as uintptr_t,
                     ),
+                    Event::SetMetadataDone {foreign_id} => ffi_cb(self, event_id, foreign_id as usize, 0),
+                    Event::Metadata {foreign_id, json} => {
+                        let data = CString::new(json.unwrap_or(String::from(""))).unwrap_or_default();
+                        ffi_cb(self, event_id, foreign_id as usize, data.as_ptr() as uintptr_t)
+                    }
                 }
             }
             None => 0,
