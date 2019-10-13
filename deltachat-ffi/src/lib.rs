@@ -399,16 +399,28 @@ pub unsafe extern "C" fn dc_get_oauth2_url(
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_coi_supported(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    (*context).get_coi_config().is_some() as libc::c_int
+    println!("%%%% dc_is_coi_supported");
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.get_coi_config().is_some() as libc::c_int
+        })
+        .unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_coi_enabled(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    (*context)
-        .get_coi_config()
-        .map(|c| c.enabled)
-        .unwrap_or(false) as libc::c_int
+    println!("%%%% dc_is_coi_enabled");
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx
+                .get_coi_config()
+                .map(|c| c.enabled)
+                .unwrap_or(false) as libc::c_int
+        })
+        .unwrap_or(0)
 }
 
 /// Returns one of the DC_COI_FILTER_* values depending on the setting of the message filter.
@@ -417,9 +429,15 @@ pub unsafe extern "C" fn dc_get_coi_message_filter(
     context: *mut dc_context_t,
 ) -> libc::c_int {
     assert!(!context.is_null());
-    (*context).get_coi_config()
-        .map(|c| c.message_filter)
-        .unwrap_or(CoiMessageFilter::None) as libc::c_int
+    println!("%%%% dc_get_coi_message_filter");
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.get_coi_config()
+                .map(|c| c.message_filter)
+                .unwrap_or(CoiMessageFilter::None) as libc::c_int
+        })
+        .unwrap_or(0)
 }
 
 /// Enable (enable != 0) or disable (enable == 0) COI.
@@ -432,7 +450,11 @@ pub unsafe extern "C" fn dc_set_coi_enabled(
     id: libc::c_int,
 ) {
     assert!(!context.is_null());
-    (*context).set_coi_enabled(enable != 0, id);
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.set_coi_enabled(enable != 0, id);
+        }).unwrap_or_default();
 }
 
 /// mode: one of the DC_COI_FILTER_* constants
@@ -447,7 +469,10 @@ pub unsafe extern "C" fn dc_set_coi_message_filter(
     assert!(!context.is_null());
 
     if let Ok(message_filter) = CoiMessageFilter::try_from(mode) {
-        (*context).set_coi_message_filter(message_filter, id);
+        let ffi_context = &*context;
+        ffi_context.with_inner(|ctx| {
+            ctx.set_coi_message_filter(message_filter, id);
+        }).unwrap_or_default();
         1
     } else {
         0
@@ -458,7 +483,12 @@ pub unsafe extern "C" fn dc_set_coi_message_filter(
 pub unsafe extern "C" fn dc_is_webpush_supported(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
 
-    (*context).get_webpush_config().is_some() as libc::c_int
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.get_webpush_config().is_some() as libc::c_int
+        })
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -467,7 +497,12 @@ pub unsafe extern "C" fn dc_get_webpush_vapid_key(
 ) -> *mut libc::c_char {
     assert!(!context.is_null());
 
-    if let Some(WebPushConfig { vapid: Some(v) }) = (*context).get_webpush_config() {
+    if let Some(WebPushConfig { vapid: Some(v) }) = {
+        let ffi_context = &*context;
+        ffi_context
+            .with_inner(|ctx| {ctx.get_webpush_config()})
+            .unwrap_or(None)
+    } {
         v.strdup()
     } else {
         std::ptr::null_mut()
@@ -486,7 +521,9 @@ pub unsafe extern "C" fn dc_subscribe_webpush(
 
     let uid = dc_tools::as_str(uid);
     let json = dc_tools::as_opt_str(json);
-    (*context).subscribe_webpush(uid, json, id);
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {ctx.subscribe_webpush(uid, json, id);}).unwrap_or_default();
 }
 
 #[no_mangle]
@@ -499,7 +536,9 @@ pub unsafe extern "C" fn dc_get_webpush_subscription(
     assert!(!uid.is_null());
 
     let uid = dc_tools::as_str(uid);
-    (*context).get_webpush_subscription(uid, id);
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {ctx.get_webpush_subscription(uid, id);}).unwrap_or_default();
 }
 
 #[no_mangle]
@@ -515,7 +554,9 @@ pub unsafe extern "C" fn dc_validate_webpush(
 
     let uid = dc_tools::as_str(uid);
     let msg = dc_tools::as_str(msg);
-    (*context).validate_webpush(uid, msg, id);
+    let ffi_context = &*context;
+    ffi_context
+    .with_inner(|ctx| {ctx.validate_webpush(uid, msg, id);}).unwrap_or_default();
 }
 
 #[no_mangle]
