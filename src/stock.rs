@@ -3,11 +3,10 @@ use std::borrow::Cow;
 use strum::EnumProperty;
 use strum_macros::EnumProperty;
 
-use crate::constants::Event;
 use crate::contact::*;
 use crate::context::Context;
 use crate::dc_tools::*;
-use libc::free;
+use crate::events::Event;
 
 /// Stock strings
 ///
@@ -110,6 +109,8 @@ pub enum StockMessage {
     MsgLocationDisabled = 65,
     #[strum(props(fallback = "Location"))]
     Location = 66,
+    #[strum(props(fallback = "Sticker"))]
+    Sticker = 67,
 }
 
 impl StockMessage {
@@ -117,7 +118,7 @@ impl StockMessage {
     ///
     /// These could be used in logging calls, so no logging here.
     fn fallback(&self) -> &'static str {
-        self.get_str("fallback").unwrap()
+        self.get_str("fallback").unwrap_or_default()
     }
 }
 
@@ -128,24 +129,26 @@ impl Context {
     /// translation, then this string will be returned.  Otherwise a
     /// default (English) string is returned.
     pub fn stock_str(&self, id: StockMessage) -> Cow<str> {
-        let ptr = self.call_cb(Event::GET_STRING, id as usize, 0) as *mut libc::c_char;
+        let ptr = self.call_cb(Event::GetString { id, count: 0 }) as *mut libc::c_char;
         if ptr.is_null() {
             Cow::Borrowed(id.fallback())
         } else {
-            let ret = to_string(ptr);
-            unsafe { free(ptr as *mut libc::c_void) };
+            let ret = to_string_lossy(ptr);
+            unsafe { libc::free(ptr as *mut libc::c_void) };
             Cow::Owned(ret)
         }
     }
 
     /// Return stock string, replacing placeholders with provided string.
     ///
-    /// This replaces both the *first* `%1$s` **and** `%1$d`
+    /// This replaces both the *first* `%1$s`, `%1$d` and `%1$@`
     /// placeholders with the provided string.
+    /// (the `%1$@` variant is used on iOS, the other are used on Android and Desktop)
     pub fn stock_string_repl_str(&self, id: StockMessage, insert: impl AsRef<str>) -> String {
         self.stock_str(id)
             .replacen("%1$s", insert.as_ref(), 1)
             .replacen("%1$d", insert.as_ref(), 1)
+            .replacen("%1$@", insert.as_ref(), 1)
     }
 
     /// Return stock string, replacing placeholders with provided int.
@@ -158,9 +161,10 @@ impl Context {
 
     /// Return stock string, replacing 2 placeholders with provided string.
     ///
-    /// This replaces both the *first* `%1$s` **and** `%1$d`
+    /// This replaces both the *first* `%1$s`, `%1$d` and `%1$@`
     /// placeholders with the string in `insert` and does the same for
-    /// `%2$s` and `%2$d` for `insert2`.
+    /// `%2$s`, `%2$d` and `%2$@` for `insert2`.
+    /// (the `%1$@` variant is used on iOS, the other are used on Android and Desktop)
     fn stock_string_repl_str2(
         &self,
         id: StockMessage,
@@ -170,8 +174,10 @@ impl Context {
         self.stock_str(id)
             .replacen("%1$s", insert.as_ref(), 1)
             .replacen("%1$d", insert.as_ref(), 1)
+            .replacen("%1$@", insert.as_ref(), 1)
             .replacen("%2$s", insert2.as_ref(), 1)
             .replacen("%2$d", insert2.as_ref(), 1)
+            .replacen("%2$@", insert2.as_ref(), 1)
     }
 
     /// Return some kind of stock message
@@ -232,11 +238,8 @@ mod tests {
     use super::*;
     use crate::test_utils::*;
 
-    use std::ffi::CString;
-
     use crate::constants::DC_CONTACT_ID_SELF;
-    use crate::context::dc_context_new;
-    use crate::types::uintptr_t;
+    use libc::uintptr_t;
 
     use num_traits::ToPrimitive;
 
@@ -253,36 +256,32 @@ mod tests {
 
     #[test]
     fn test_stock_str() {
-        let ctx = dc_context_new(None, std::ptr::null_mut(), None);
-        assert_eq!(ctx.stock_str(StockMessage::NoMessages), "No messages.");
+        let t = dummy_context();
+        assert_eq!(t.ctx.stock_str(StockMessage::NoMessages), "No messages.");
     }
 
-    unsafe extern "C" fn test_stock_str_no_fallback_cb(
-        _ctx: &Context,
-        evt: Event,
-        d1: uintptr_t,
-        _d2: uintptr_t,
-    ) -> uintptr_t {
-        if evt == Event::GET_STRING && d1 == StockMessage::NoMessages.to_usize().unwrap() {
-            let tmp = CString::new("Hello there").unwrap();
-            dc_strdup(tmp.as_ptr()) as usize
-        } else {
-            0
+    fn test_stock_str_no_fallback_cb(_ctx: &Context, evt: Event) -> uintptr_t {
+        match evt {
+            Event::GetString {
+                id: StockMessage::NoMessages,
+                ..
+            } => unsafe { "Hello there".strdup() as usize },
+            _ => 0,
         }
     }
 
     #[test]
     fn test_stock_str_no_fallback() {
-        let t = test_context(Some(test_stock_str_no_fallback_cb));
+        let t = test_context(Some(Box::new(test_stock_str_no_fallback_cb)));
         assert_eq!(t.ctx.stock_str(StockMessage::NoMessages), "Hello there");
     }
 
     #[test]
     fn test_stock_string_repl_str() {
-        let ctx = dc_context_new(None, std::ptr::null_mut(), None);
+        let t = dummy_context();
         // uses %1$s substitution
         assert_eq!(
-            ctx.stock_string_repl_str(StockMessage::Member, "42"),
+            t.ctx.stock_string_repl_str(StockMessage::Member, "42"),
             "42 member(s)"
         );
         // We have no string using %1$d to test...
@@ -290,36 +289,38 @@ mod tests {
 
     #[test]
     fn test_stock_string_repl_int() {
-        let ctx = dc_context_new(None, std::ptr::null_mut(), None);
+        let t = dummy_context();
         assert_eq!(
-            ctx.stock_string_repl_int(StockMessage::Member, 42),
+            t.ctx.stock_string_repl_int(StockMessage::Member, 42),
             "42 member(s)"
         );
     }
 
     #[test]
     fn test_stock_string_repl_str2() {
-        let ctx = dc_context_new(None, std::ptr::null_mut(), None);
+        let t = dummy_context();
         assert_eq!(
-            ctx.stock_string_repl_str2(StockMessage::ServerResponse, "foo", "bar"),
+            t.ctx
+                .stock_string_repl_str2(StockMessage::ServerResponse, "foo", "bar"),
             "Response from foo: bar"
         );
     }
 
     #[test]
     fn test_stock_system_msg_simple() {
-        let ctx = dc_context_new(None, std::ptr::null_mut(), None);
+        let t = dummy_context();
         assert_eq!(
-            ctx.stock_system_msg(StockMessage::MsgLocationEnabled, "", "", 0),
+            t.ctx
+                .stock_system_msg(StockMessage::MsgLocationEnabled, "", "", 0),
             "Location streaming enabled."
         )
     }
 
     #[test]
     fn test_stock_system_msg_add_member_by_me() {
-        let ctx = dc_context_new(None, std::ptr::null_mut(), None);
+        let t = dummy_context();
         assert_eq!(
-            ctx.stock_system_msg(
+            t.ctx.stock_system_msg(
                 StockMessage::MsgAddMember,
                 "alice@example.com",
                 "",
@@ -350,9 +351,7 @@ mod tests {
         let contact_id = {
             Contact::create(&t.ctx, "Alice", "alice@example.com")
                 .expect("Failed to create contact Alice");
-            let id =
-                Contact::create(&t.ctx, "Bob", "bob@example.com").expect("failed to create bob");
-            id
+            Contact::create(&t.ctx, "Bob", "bob@example.com").expect("failed to create bob")
         };
         assert_eq!(
             t.ctx.stock_system_msg(

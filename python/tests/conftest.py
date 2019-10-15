@@ -24,17 +24,6 @@ def pytest_configure(config):
             config.option.liveconfig = cfg
 
 
-@pytest.hookimpl(trylast=True)
-def pytest_runtest_call(item):
-    # perform early finalization because we otherwise get cloberred
-    # output from concurrent threads printing between execution
-    # of the test function and the teardown phase of that test function
-    if "acfactory" in item.funcargs:
-        print("*"*30, "finalizing", "*"*30)
-        acfactory = item.funcargs["acfactory"]
-        acfactory.finalize()
-
-
 def pytest_report_header(config, startdir):
     summary = []
 
@@ -136,13 +125,17 @@ def acfactory(pytestconfig, tmpdir, request, session_liveconfig):
                 fin = self._finalizers.pop()
                 fin()
 
+        def make_account(self, path, logid):
+            ac = Account(path, logid=logid)
+            self._finalizers.append(ac.shutdown)
+            return ac
+
         def get_unconfigured_account(self):
             self.offline_count += 1
             tmpdb = tmpdir.join("offlinedb%d" % self.offline_count)
-            ac = Account(tmpdb.strpath, logid="ac{}".format(self.offline_count))
+            ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.offline_count))
             ac._evlogger.init_time = self.init_time
             ac._evlogger.set_timeout(2)
-            self._finalizers.append(ac.shutdown)
             return ac
 
         def get_configured_offline_account(self):
@@ -157,34 +150,52 @@ def acfactory(pytestconfig, tmpdir, request, session_liveconfig):
             lib.dc_set_config(ac._dc_context, b"configured", b"1")
             return ac
 
-        def get_online_configuring_account(self):
+        def get_online_config(self):
             if not session_liveconfig:
                 pytest.skip("specify DCC_PY_LIVECONFIG or --liveconfig")
             configdict = session_liveconfig.get(self.live_count)
             self.live_count += 1
             if "e2ee_enabled" not in configdict:
                 configdict["e2ee_enabled"] = "1"
+
+            # Enable strict certificate checks for online accounts
+            configdict["imap_certificate_checks"] = "1"
+            configdict["smtp_certificate_checks"] = "1"
+
             tmpdb = tmpdir.join("livedb%d" % self.live_count)
-            ac = Account(tmpdb.strpath, logid="ac{}".format(self.live_count))
+            ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.live_count))
             ac._evlogger.init_time = self.init_time
             ac._evlogger.set_timeout(30)
+            return ac, dict(configdict)
+
+        def get_online_configuring_account(self, mvbox=False, sentbox=False):
+            ac, configdict = self.get_online_config()
             ac.configure(**configdict)
-            ac.start_threads()
-            self._finalizers.append(ac.shutdown)
+            ac.start_threads(mvbox=mvbox, sentbox=sentbox)
             return ac
+
+        def get_two_online_accounts(self):
+            ac1 = self.get_online_configuring_account()
+            ac2 = self.get_online_configuring_account()
+            wait_successful_IMAP_SMTP_connection(ac1)
+            wait_configuration_progress(ac1, 1000)
+            wait_successful_IMAP_SMTP_connection(ac2)
+            wait_configuration_progress(ac2, 1000)
+            return ac1, ac2
 
         def clone_online_account(self, account):
             self.live_count += 1
             tmpdb = tmpdir.join("livedb%d" % self.live_count)
-            ac = Account(tmpdb.strpath, logid="ac{}".format(self.live_count))
+            ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.live_count))
             ac._evlogger.init_time = self.init_time
             ac._evlogger.set_timeout(30)
             ac.configure(addr=account.get_config("addr"), mail_pw=account.get_config("mail_pw"))
             ac.start_threads()
-            self._finalizers.append(ac.shutdown)
             return ac
 
-    return AccountMaker()
+    am = AccountMaker()
+    request.addfinalizer(am.finalize)
+    return am
 
 
 @pytest.fixture
@@ -204,12 +215,22 @@ def lp():
     return Printer()
 
 
-def wait_configuration_progress(account, target):
+def wait_configuration_progress(account, min_target, max_target=1001):
+    min_target = min(min_target, max_target)
     while 1:
         evt_name, data1, data2 = \
             account._evlogger.get_matching("DC_EVENT_CONFIGURE_PROGRESS")
-        if data1 >= target:
-            print("** CONFIG PROGRESS {}".format(target), account)
+        if data1 >= min_target and data1 <= max_target:
+            print("** CONFIG PROGRESS {}".format(min_target), account)
+            break
+
+
+def wait_securejoin_inviter_progress(account, target):
+    while 1:
+        evt_name, data1, data2 = \
+            account._evlogger.get_matching("DC_EVENT_SECUREJOIN_INVITER_PROGRESS")
+        if data2 >= target:
+            print("** SECUREJOINT-INVITER PROGRESS {}".format(target), account)
             break
 
 

@@ -50,7 +50,7 @@ pub fn dc_get_oauth2_url(
     if let Some(oauth2) = Oauth2::from_address(addr) {
         if context
             .sql
-            .set_config(
+            .set_raw_config(
                 context,
                 "oauth2_pending_redirect_uri",
                 Some(redirect_uri.as_ref()),
@@ -74,37 +74,34 @@ pub fn dc_get_oauth2_access_token(
     context: &Context,
     addr: impl AsRef<str>,
     code: impl AsRef<str>,
-    flags: usize,
+    regenerate: bool,
 ) -> Option<String> {
     if let Some(oauth2) = Oauth2::from_address(addr) {
         let lock = context.oauth2_critical.clone();
         let _l = lock.lock().unwrap();
 
         // read generated token
-        if 0 == flags & 0x1 && !is_expired(context) {
-            let access_token = context.sql.get_config(context, "oauth2_access_token");
+        if !regenerate && !is_expired(context) {
+            let access_token = context.sql.get_raw_config(context, "oauth2_access_token");
             if access_token.is_some() {
                 // success
                 return access_token;
             }
         }
 
-        let refresh_token = context.sql.get_config(context, "oauth2_refresh_token");
+        let refresh_token = context.sql.get_raw_config(context, "oauth2_refresh_token");
         let refresh_token_for = context
             .sql
-            .get_config(context, "oauth2_refresh_token_for")
+            .get_raw_config(context, "oauth2_refresh_token_for")
             .unwrap_or_else(|| "unset".into());
 
         let (redirect_uri, token_url, update_redirect_uri_on_success) =
             if refresh_token.is_none() || refresh_token_for != code.as_ref() {
-                info!(
-                    context,
-                    0, "Generate OAuth2 refresh_token and access_token...",
-                );
+                info!(context, "Generate OAuth2 refresh_token and access_token...",);
                 (
                     context
                         .sql
-                        .get_config(context, "oauth2_pending_redirect_uri")
+                        .get_raw_config(context, "oauth2_pending_redirect_uri")
                         .unwrap_or_else(|| "unset".into()),
                     oauth2.init_token,
                     true,
@@ -112,12 +109,12 @@ pub fn dc_get_oauth2_access_token(
             } else {
                 info!(
                     context,
-                    0, "Regenerate OAuth2 access_token by refresh_token...",
+                    "Regenerate OAuth2 access_token by refresh_token...",
                 );
                 (
                     context
                         .sql
-                        .get_config(context, "oauth2_redirect_uri")
+                        .get_raw_config(context, "oauth2_redirect_uri")
                         .unwrap_or_else(|| "unset".into()),
                     oauth2.refresh_token,
                     false,
@@ -134,7 +131,7 @@ pub fn dc_get_oauth2_access_token(
         if response.is_err() {
             warn!(
                 context,
-                0, "Error calling OAuth2 at {}: {:?}", token_url, response
+                "Error calling OAuth2 at {}: {:?}", token_url, response
             );
             return None;
         }
@@ -142,7 +139,6 @@ pub fn dc_get_oauth2_access_token(
         if !response.status().is_success() {
             warn!(
                 context,
-                0,
                 "Error calling OAuth2 at {}: {:?}",
                 token_url,
                 response.status()
@@ -154,7 +150,7 @@ pub fn dc_get_oauth2_access_token(
         if parsed.is_err() {
             warn!(
                 context,
-                0, "Failed to parse OAuth2 JSON response from {}: error: {:?}", token_url, parsed
+                "Failed to parse OAuth2 JSON response from {}: error: {:?}", token_url, parsed
             );
             return None;
         }
@@ -163,11 +159,11 @@ pub fn dc_get_oauth2_access_token(
         if let Some(ref token) = response.refresh_token {
             context
                 .sql
-                .set_config(context, "oauth2_refresh_token", Some(token))
+                .set_raw_config(context, "oauth2_refresh_token", Some(token))
                 .ok();
             context
                 .sql
-                .set_config(context, "oauth2_refresh_token_for", Some(code.as_ref()))
+                .set_raw_config(context, "oauth2_refresh_token_for", Some(code.as_ref()))
                 .ok();
         }
 
@@ -176,7 +172,7 @@ pub fn dc_get_oauth2_access_token(
         if let Some(ref token) = response.access_token {
             context
                 .sql
-                .set_config(context, "oauth2_access_token", Some(token))
+                .set_raw_config(context, "oauth2_access_token", Some(token))
                 .ok();
             let expires_in = response
                 .expires_in
@@ -185,22 +181,22 @@ pub fn dc_get_oauth2_access_token(
                 .unwrap_or_else(|| 0);
             context
                 .sql
-                .set_config_int64(context, "oauth2_timestamp_expires", expires_in)
+                .set_raw_config_int64(context, "oauth2_timestamp_expires", expires_in)
                 .ok();
 
             if update_redirect_uri_on_success {
                 context
                     .sql
-                    .set_config(context, "oauth2_redirect_uri", Some(redirect_uri.as_ref()))
+                    .set_raw_config(context, "oauth2_redirect_uri", Some(redirect_uri.as_ref()))
                     .ok();
             }
         } else {
-            warn!(context, 0, "Failed to find OAuth2 access token");
+            warn!(context, "Failed to find OAuth2 access token");
         }
 
         response.access_token
     } else {
-        warn!(context, 0, "Internal OAuth2 error: 2");
+        warn!(context, "Internal OAuth2 error: 2");
 
         None
     }
@@ -211,21 +207,16 @@ pub fn dc_get_oauth2_addr(
     addr: impl AsRef<str>,
     code: impl AsRef<str>,
 ) -> Option<String> {
-    let oauth2 = Oauth2::from_address(addr.as_ref());
-    if oauth2.is_none() {
-        return None;
-    }
-    let oauth2 = oauth2.unwrap();
-    if oauth2.get_userinfo.is_none() {
-        return None;
-    }
+    let oauth2 = Oauth2::from_address(addr.as_ref())?;
+    oauth2.get_userinfo?;
 
-    if let Some(access_token) = dc_get_oauth2_access_token(context, addr.as_ref(), code.as_ref(), 0)
+    if let Some(access_token) =
+        dc_get_oauth2_access_token(context, addr.as_ref(), code.as_ref(), false)
     {
         let addr_out = oauth2.get_addr(context, access_token);
         if addr_out.is_none() {
             // regenerate
-            if let Some(access_token) = dc_get_oauth2_access_token(context, addr, code, 0x1) {
+            if let Some(access_token) = dc_get_oauth2_access_token(context, addr, code, true) {
                 oauth2.get_addr(context, access_token)
             } else {
                 None
@@ -268,17 +259,12 @@ impl Oauth2 {
         // }
         let response = reqwest::Client::new().get(&userinfo_url).send();
         if response.is_err() {
-            warn!(context, 0, "Error getting userinfo: {:?}", response);
+            warn!(context, "Error getting userinfo: {:?}", response);
             return None;
         }
         let mut response = response.unwrap();
         if !response.status().is_success() {
-            warn!(
-                context,
-                0,
-                "Error getting userinfo: {:?}",
-                response.status()
-            );
+            warn!(context, "Error getting userinfo: {:?}", response.status());
             return None;
         }
 
@@ -286,19 +272,19 @@ impl Oauth2 {
         if parsed.is_err() {
             warn!(
                 context,
-                0, "Failed to parse userinfo JSON response: {:?}", parsed
+                "Failed to parse userinfo JSON response: {:?}", parsed
             );
             return None;
         }
         if let Ok(response) = parsed {
             let addr = response.get("email");
             if addr.is_none() {
-                warn!(context, 0, "E-mail missing in userinfo.");
+                warn!(context, "E-mail missing in userinfo.");
             }
 
             addr.map(|addr| addr.to_string())
         } else {
-            warn!(context, 0, "Failed to parse userinfo.");
+            warn!(context, "Failed to parse userinfo.");
             None
         }
     }
@@ -307,7 +293,7 @@ impl Oauth2 {
 fn is_expired(context: &Context) -> bool {
     let expire_timestamp = context
         .sql
-        .get_config_int64(context, "oauth2_timestamp_expires")
+        .get_raw_config_int64(context, "oauth2_timestamp_expires")
         .unwrap_or_default();
 
     if expire_timestamp <= 0 {

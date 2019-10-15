@@ -4,7 +4,7 @@ use crate::contact::*;
 use crate::context::*;
 use crate::error::Result;
 use crate::lot::Lot;
-use crate::message::*;
+use crate::message::Message;
 use crate::stock::StockMessage;
 
 /// An object representing a single chatlist in memory.
@@ -31,17 +31,13 @@ use crate::stock::StockMessage;
 /// first entry and only present on new messages, there is the rough idea that it can be optionally always
 /// present and sorted into the list by date. Rendering the deaddrop in the described way
 /// would not add extra work in the UI then.
-pub struct Chatlist<'a> {
-    context: &'a Context,
+#[derive(Debug)]
+pub struct Chatlist {
     /// Stores pairs of `chat_id, message_id`
     ids: Vec<(u32, u32)>,
 }
 
-impl<'a> Chatlist<'a> {
-    pub fn get_context(&self) -> &Context {
-        self.context
-    }
-
+impl Chatlist {
     /// Get a list of chats.
     /// The list can be filtered by query parameters.
     ///
@@ -85,7 +81,7 @@ impl<'a> Chatlist<'a> {
     /// `query_contact_id`: An optional contact ID for filtering the list. Only chats including this contact ID
     ///     are returned.
     pub fn try_load(
-        context: &'a Context,
+        context: &Context,
         listflags: usize,
         query: Option<&str>,
         query_contact_id: Option<u32>,
@@ -186,7 +182,7 @@ impl<'a> Chatlist<'a> {
             if 0 == listflags & DC_GCL_NO_SPECIALS {
                 let last_deaddrop_fresh_msg_id = get_last_deaddrop_fresh_msg(context);
                 if last_deaddrop_fresh_msg_id > 0 {
-                    ids.push((1, last_deaddrop_fresh_msg_id));
+                    ids.insert(0, (DC_CHAT_ID_DEADDROP, last_deaddrop_fresh_msg_id));
                 }
                 add_archived_link_item = 1;
             }
@@ -200,7 +196,7 @@ impl<'a> Chatlist<'a> {
             ids.push((DC_CHAT_ID_ARCHIVED_LINK, 0));
         }
 
-        Ok(Chatlist { context, ids })
+        Ok(Chatlist { ids })
     }
 
     /// Find out the number of chats.
@@ -247,7 +243,7 @@ impl<'a> Chatlist<'a> {
     /// - dc_lot_t::timestamp: the timestamp of the message.  0 if not applicable.
     /// - dc_lot_t::state: The state of the message as one of the DC_STATE_* constants (see #dc_msg_get_state()).
     //    0 if not applicable.
-    pub fn get_summary(&self, index: usize, chat: Option<&Chat<'a>>) -> Lot {
+    pub fn get_summary(&self, context: &Context, index: usize, chat: Option<&Chat>) -> Lot {
         // The summary is created by the chat, not by the last message.
         // This is because we may want to display drafts here or stuff as
         // "is typing".
@@ -262,24 +258,22 @@ impl<'a> Chatlist<'a> {
         let chat_loaded: Chat;
         let chat = if let Some(chat) = chat {
             chat
+        } else if let Ok(chat) = Chat::load_from_db(context, self.ids[index].0) {
+            chat_loaded = chat;
+            &chat_loaded
         } else {
-            if let Ok(chat) = Chat::load_from_db(self.context, self.ids[index].0) {
-                chat_loaded = chat;
-                &chat_loaded
-            } else {
-                return ret;
-            }
+            return ret;
         };
 
         let lastmsg_id = self.ids[index].1;
         let mut lastcontact = None;
 
         let lastmsg = if 0 != lastmsg_id {
-            if let Ok(lastmsg) = dc_msg_load_from_db(self.context, lastmsg_id) {
+            if let Ok(lastmsg) = Message::load_from_db(context, lastmsg_id) {
                 if lastmsg.from_id != 1 as libc::c_uint
                     && (chat.typ == Chattype::Group || chat.typ == Chattype::VerifiedGroup)
                 {
-                    lastcontact = Contact::load_from_db(self.context, lastmsg.from_id).ok();
+                    lastcontact = Contact::load_from_db(context, lastmsg.from_id).ok();
                 }
 
                 Some(lastmsg)
@@ -294,14 +288,9 @@ impl<'a> Chatlist<'a> {
             ret.text2 = None;
         } else if lastmsg.is_none() || lastmsg.as_ref().unwrap().from_id == DC_CONTACT_ID_UNDEFINED
         {
-            ret.text2 = Some(self.context.stock_str(StockMessage::NoMessages).to_string());
+            ret.text2 = Some(context.stock_str(StockMessage::NoMessages).to_string());
         } else {
-            ret.fill(
-                &mut lastmsg.unwrap(),
-                chat,
-                lastcontact.as_ref(),
-                self.context,
-            );
+            ret.fill(&mut lastmsg.unwrap(), chat, lastcontact.as_ref(), context);
         }
 
         ret
@@ -311,11 +300,10 @@ impl<'a> Chatlist<'a> {
 pub fn dc_get_archived_cnt(context: &Context) -> u32 {
     context
         .sql
-        .query_row_col(
+        .query_get_value(
             context,
             "SELECT COUNT(*) FROM chats WHERE blocked=0 AND archived=1;",
             params![],
-            0,
         )
         .unwrap_or_default()
 }
@@ -325,7 +313,7 @@ fn get_last_deaddrop_fresh_msg(context: &Context) -> u32 {
     // only few fresh messages.
     context
         .sql
-        .query_row_col(
+        .query_get_value(
             context,
             "SELECT m.id  FROM msgs m  LEFT JOIN chats c ON c.id=m.chat_id  \
              WHERE m.state=10   \
@@ -333,7 +321,6 @@ fn get_last_deaddrop_fresh_msg(context: &Context) -> u32 {
              AND c.blocked=2 \
              ORDER BY m.timestamp DESC, m.id DESC;",
             params![],
-            0,
         )
         .unwrap_or_default()
 }

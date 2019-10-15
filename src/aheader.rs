@@ -3,11 +3,10 @@ use std::ffi::CStr;
 use std::str::FromStr;
 use std::{fmt, str};
 
-use mmime::mailimf_types::*;
+use mmime::mailimf::types::*;
 
 use crate::constants::*;
 use crate::contact::*;
-use crate::dc_tools::as_str;
 use crate::key::*;
 
 /// Possible values for encryption preference
@@ -64,11 +63,8 @@ impl Aheader {
         }
     }
 
-    pub fn from_imffields(
-        wanted_from: *const libc::c_char,
-        header: *const mailimf_fields,
-    ) -> Option<Self> {
-        if wanted_from.is_null() || header.is_null() {
+    pub fn from_imffields(wanted_from: &str, header: *const mailimf_fields) -> Option<Self> {
+        if header.is_null() {
             return None;
         }
 
@@ -83,27 +79,21 @@ impl Aheader {
                 let optional_field = unsafe { (*field).fld_data.fld_optional_field };
                 if !optional_field.is_null()
                     && unsafe { !(*optional_field).fld_name.is_null() }
-                    && unsafe { CStr::from_ptr((*optional_field).fld_name).to_str().unwrap() }
+                    && unsafe { CStr::from_ptr((*optional_field).fld_name).to_string_lossy() }
                         == "Autocrypt"
                 {
-                    let value = unsafe {
-                        CStr::from_ptr((*optional_field).fld_value)
-                            .to_str()
-                            .unwrap()
-                    };
+                    let value =
+                        unsafe { CStr::from_ptr((*optional_field).fld_value).to_string_lossy() };
 
-                    match Self::from_str(value) {
-                        Ok(test) => {
-                            if addr_cmp(&test.addr, as_str(wanted_from)) {
-                                if fine_header.is_none() {
-                                    fine_header = Some(test);
-                                } else {
-                                    // TODO: figure out what kind of error case this is
-                                    return None;
-                                }
+                    if let Ok(test) = Self::from_str(&value) {
+                        if addr_cmp(&test.addr, wanted_from) {
+                            if fine_header.is_none() {
+                                fine_header = Some(test);
+                            } else {
+                                // TODO: figure out what kind of error case this is
+                                return None;
                             }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -135,9 +125,9 @@ impl str::FromStr for Aheader {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut attributes: BTreeMap<String, String> = s
-            .split(";")
+            .split(';')
             .filter_map(|a| {
-                let attribute: Vec<&str> = a.trim().splitn(2, "=").collect();
+                let attribute: Vec<&str> = a.trim().splitn(2, '=').collect();
                 if attribute.len() < 2 {
                     return None;
                 }
@@ -182,7 +172,7 @@ impl str::FromStr for Aheader {
 
         // Autocrypt-Level0: unknown attributes starting with an underscore can be safely ignored
         // Autocrypt-Level0: unknown attribute, treat the header as invalid
-        if attributes.keys().find(|k| !k.starts_with("_")).is_some() {
+        if attributes.keys().any(|k| !k.starts_with('_')) {
             return Err(());
         }
 

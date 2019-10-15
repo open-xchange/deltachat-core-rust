@@ -3,13 +3,14 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 use charset::Charset;
+use deltachat_derive::{FromSql, ToSql};
+use libc::{strcmp, strlen, strncmp};
+use mmime::mailimf::types::*;
 use mmime::mailimf::*;
-use mmime::mailimf_types::*;
+use mmime::mailmime::content::*;
+use mmime::mailmime::disposition::*;
+use mmime::mailmime::types::*;
 use mmime::mailmime::*;
-use mmime::mailmime_content::*;
-use mmime::mailmime_disposition::*;
-use mmime::mailmime_types::*;
-use mmime::mmapstring::*;
 use mmime::other::*;
 
 use crate::constants::Viewtype;
@@ -18,1470 +19,823 @@ use crate::context::Context;
 use crate::dc_simplify::*;
 use crate::dc_strencode::*;
 use crate::dc_tools::*;
-use crate::e2ee::*;
+use crate::e2ee;
+use crate::error::Error;
 use crate::location;
 use crate::param::*;
 use crate::stock::StockMessage;
-use crate::types::*;
-use crate::x::*;
+use crate::wrapmime;
 
-/* Parse MIME body; this is the text part of an IMF, see https://tools.ietf.org/html/rfc5322
-dc_mimeparser_t has no deep dependencies to Context or to the database
-(Context is used for logging only). */
-#[derive(Clone)]
-#[repr(C)]
-pub struct dc_mimepart_t {
-    pub type_0: Viewtype,
-    pub is_meta: libc::c_int,
-    pub int_mimetype: libc::c_int,
-    pub msg: Option<String>,
-    pub msg_raw: *mut libc::c_char,
-    pub bytes: libc::c_int,
-    pub param: Params,
-}
-
-/* *
- * @class dc_mimeparser_t
- */
-#[allow(non_camel_case_types)]
-pub struct dc_mimeparser_t<'a> {
-    pub parts: Vec<dc_mimepart_t>,
-    pub mimeroot: *mut mailmime,
+#[derive(Debug)]
+pub struct MimeParser<'a> {
+    pub context: &'a Context,
+    pub parts: Vec<Part>,
+    pub mimeroot: *mut Mailmime,
     pub header: HashMap<String, *mut mailimf_field>,
     pub header_root: *mut mailimf_fields,
     pub header_protected: *mut mailimf_fields,
-    pub subject: *mut libc::c_char,
+    pub subject: Option<String>,
     pub is_send_by_messenger: bool,
-    pub decrypting_failed: libc::c_int,
-    pub e2ee_helper: E2eeHelper,
-    pub is_forwarded: libc::c_int,
-    pub context: &'a Context,
-    pub reports: Vec<*mut mailmime>,
-    pub is_system_message: libc::c_int,
+    pub decrypting_failed: bool,
+    pub encrypted: bool,
+    pub signatures: HashSet<String>,
+    pub gossipped_addr: HashSet<String>,
+    pub is_forwarded: bool,
+    pub reports: Vec<*mut Mailmime>,
+    pub is_system_message: SystemMessage,
     pub location_kml: Option<location::Kml>,
     pub message_kml: Option<location::Kml>,
 }
 
-pub fn dc_mimeparser_new(context: &Context) -> dc_mimeparser_t {
-    dc_mimeparser_t {
-        parts: Vec::new(),
-        mimeroot: std::ptr::null_mut(),
-        header: Default::default(),
-        header_root: std::ptr::null_mut(),
-        header_protected: std::ptr::null_mut(),
-        subject: std::ptr::null_mut(),
-        is_send_by_messenger: false,
-        decrypting_failed: 0,
-        e2ee_helper: Default::default(),
-        is_forwarded: 0,
-        context,
-        reports: Vec::new(),
-        is_system_message: 0,
-        location_kml: None,
-        message_kml: None,
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, ToSql, FromSql)]
+#[repr(i32)]
+pub enum SystemMessage {
+    Unknown = 0,
+    GroupNameChanged = 2,
+    GroupImageChanged = 3,
+    MemberAddedToGroup = 4,
+    MemberRemovedFromGroup = 5,
+    AutocryptSetupMessage = 6,
+    SecurejoinMessage = 7,
+    LocationStreamingEnabled = 8,
+    LocationOnly = 9,
+}
+
+impl Default for SystemMessage {
+    fn default() -> Self {
+        SystemMessage::Unknown
     }
 }
 
-pub unsafe fn dc_mimeparser_unref(mimeparser: &mut dc_mimeparser_t) {
-    dc_mimeparser_empty(mimeparser);
-}
-
-unsafe fn dc_mimeparser_empty(mimeparser: &mut dc_mimeparser_t) {
-    for part in mimeparser.parts.drain(..) {
-        dc_mimepart_unref(part);
-    }
-    assert!(mimeparser.parts.is_empty());
-    mimeparser.header_root = ptr::null_mut();
-    mimeparser.header.clear();
-    if !mimeparser.header_protected.is_null() {
-        mailimf_fields_free(mimeparser.header_protected);
-        mimeparser.header_protected = ptr::null_mut()
-    }
-    mimeparser.is_send_by_messenger = false;
-    mimeparser.is_system_message = 0i32;
-    free(mimeparser.subject as *mut libc::c_void);
-    mimeparser.subject = ptr::null_mut();
-    if !mimeparser.mimeroot.is_null() {
-        mailmime_free(mimeparser.mimeroot);
-        mimeparser.mimeroot = ptr::null_mut()
-    }
-    mimeparser.is_forwarded = 0i32;
-    mimeparser.reports.clear();
-    mimeparser.decrypting_failed = 0i32;
-    mimeparser.e2ee_helper.thanks();
-
-    mimeparser.location_kml = None;
-    mimeparser.message_kml = None;
-}
-
-unsafe fn dc_mimepart_unref(mut mimepart: dc_mimepart_t) {
-    mimepart.msg = None;
-    free(mimepart.msg_raw as *mut libc::c_void);
-    mimepart.msg_raw = ptr::null_mut();
-}
+const DC_MIMETYPE_MP_ALTERNATIVE: i32 = 10;
+const DC_MIMETYPE_MP_RELATED: i32 = 20;
+const DC_MIMETYPE_MP_MIXED: i32 = 30;
+const DC_MIMETYPE_MP_NOT_DECRYPTABLE: i32 = 40;
+const DC_MIMETYPE_MP_REPORT: i32 = 45;
+const DC_MIMETYPE_MP_SIGNED: i32 = 46;
+const DC_MIMETYPE_MP_OTHER: i32 = 50;
+const DC_MIMETYPE_TEXT_PLAIN: i32 = 60;
+const DC_MIMETYPE_TEXT_HTML: i32 = 70;
+const DC_MIMETYPE_IMAGE: i32 = 80;
+const DC_MIMETYPE_AUDIO: i32 = 90;
+const DC_MIMETYPE_VIDEO: i32 = 100;
+const DC_MIMETYPE_FILE: i32 = 110;
 const DC_MIMETYPE_AC_SETUP_FILE: i32 = 111;
 
-pub unsafe fn dc_mimeparser_parse<'a>(context: &'a Context, body: &[u8]) -> dc_mimeparser_t<'a> {
-    let r: libc::c_int;
-    let mut index: size_t = 0i32 as size_t;
-    let optional_field: *mut mailimf_optional_field;
-    let mut mimeparser = dc_mimeparser_new(context);
-
-    r = mailmime_parse(
-        body.as_ptr() as *const libc::c_char,
-        body.len(),
-        &mut index,
-        &mut mimeparser.mimeroot,
-    );
-    if r == MAILIMF_NO_ERROR as libc::c_int && !mimeparser.mimeroot.is_null() {
-        mimeparser
-            .e2ee_helper
-            .decrypt(mimeparser.context, mimeparser.mimeroot);
-        let mimeparser_ref = &mut mimeparser;
-        dc_mimeparser_parse_mime_recursive(mimeparser_ref, mimeparser_ref.mimeroot);
-        let field: *mut mailimf_field = dc_mimeparser_lookup_field(&mimeparser, "Subject");
-        if !field.is_null() && (*field).fld_type == MAILIMF_FIELD_SUBJECT as libc::c_int {
-            mimeparser.subject = dc_decode_header_words((*(*field).fld_data.fld_subject).sbj_value)
+impl<'a> MimeParser<'a> {
+    pub fn new(context: &'a Context) -> Self {
+        MimeParser {
+            parts: Vec::new(),
+            mimeroot: std::ptr::null_mut(),
+            header: Default::default(),
+            header_root: std::ptr::null_mut(),
+            header_protected: std::ptr::null_mut(),
+            subject: None,
+            is_send_by_messenger: false,
+            decrypting_failed: false,
+            encrypted: false,
+            signatures: Default::default(),
+            gossipped_addr: Default::default(),
+            is_forwarded: false,
+            context,
+            reports: Vec::new(),
+            is_system_message: SystemMessage::Unknown,
+            location_kml: None,
+            message_kml: None,
         }
-        if !dc_mimeparser_lookup_optional_field(&mut mimeparser, "Chat-Version").is_null() {
-            mimeparser.is_send_by_messenger = true
-        }
-        if !dc_mimeparser_lookup_field(&mut mimeparser, "Autocrypt-Setup-Message").is_null() {
-            let has_setup_file = mimeparser
-                .parts
-                .iter()
-                .any(|p| p.int_mimetype == DC_MIMETYPE_AC_SETUP_FILE);
+    }
 
-            if has_setup_file {
-                mimeparser.is_system_message = 6i32;
+    pub unsafe fn parse(&mut self, body: &[u8]) -> Result<(), Error> {
+        let mut index = 0;
 
-                // TODO: replace the following code with this
-                // once drain_filter stabilizes.
-                //
-                // See https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain_filter
-                // and https://github.com/rust-lang/rust/issues/43244
-                //
-                // mimeparser
-                //    .parts
-                //    .drain_filter(|part| part.int_mimetype != 111)
-                //    .for_each(|part| dc_mimepart_unref(part));
+        let r = mailmime_parse(
+            body.as_ptr() as *const libc::c_char,
+            body.len(),
+            &mut index,
+            &mut self.mimeroot,
+        );
 
-                let mut i = 0;
-                while i != mimeparser.parts.len() {
-                    if mimeparser.parts[i].int_mimetype != 111 {
-                        let part = mimeparser.parts.remove(i);
-                        dc_mimepart_unref(part);
-                    } else {
-                        i += 1;
-                    }
+        if r == MAILIMF_NO_ERROR as libc::c_int && !self.mimeroot.is_null() {
+            let (encrypted, signatures, gossipped_addr) =
+                e2ee::try_decrypt(self.context, self.mimeroot)?;
+            self.encrypted = encrypted;
+            self.signatures = signatures;
+            self.gossipped_addr = gossipped_addr;
+            self.parse_mime_recursive(self.mimeroot);
+
+            if let Some(field) = self.lookup_field("Subject") {
+                if (*field).fld_type == MAILIMF_FIELD_SUBJECT as libc::c_int {
+                    let subj = (*(*field).fld_data.fld_subject).sbj_value;
+
+                    self.subject = as_opt_str(subj).map(dc_decode_header_words);
                 }
             }
-        } else {
-            optional_field = dc_mimeparser_lookup_optional_field(&mut mimeparser, "Chat-Content");
-            if !optional_field.is_null() && !(*optional_field).fld_value.is_null() {
-                if strcmp(
-                    (*optional_field).fld_value,
-                    b"location-streaming-enabled\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    mimeparser.is_system_message = 8i32
-                }
+
+            if self.lookup_optional_field("Chat-Version").is_some() {
+                self.is_send_by_messenger = true
             }
-        }
-        if !dc_mimeparser_lookup_field(&mut mimeparser, "Chat-Group-Image").is_null()
-            && !mimeparser.parts.is_empty()
-        {
-            let textpart = &mimeparser.parts[0];
-            if textpart.type_0 == Viewtype::Text {
-                if mimeparser.parts.len() >= 2 {
-                    let imgpart = &mut mimeparser.parts[1];
-                    if imgpart.type_0 == Viewtype::Image {
-                        imgpart.is_meta = 1i32
-                    }
-                }
-            }
-        }
-        if mimeparser.is_send_by_messenger && mimeparser.parts.len() == 2 {
-            let need_drop = {
-                let textpart = &mimeparser.parts[0];
-                let filepart = &mimeparser.parts[1];
-                textpart.type_0 == Viewtype::Text
-                    && (filepart.type_0 == Viewtype::Image
-                        || filepart.type_0 == Viewtype::Gif
-                        || filepart.type_0 == Viewtype::Audio
-                        || filepart.type_0 == Viewtype::Voice
-                        || filepart.type_0 == Viewtype::Video
-                        || filepart.type_0 == Viewtype::File)
-                    && 0 == filepart.is_meta
-            };
 
-            if need_drop {
-                let mut filepart = mimeparser.parts.swap_remove(1);
+            if self.lookup_field("Autocrypt-Setup-Message").is_some() {
+                let has_setup_file = self
+                    .parts
+                    .iter()
+                    .any(|p| p.mimetype == DC_MIMETYPE_AC_SETUP_FILE);
 
-                // insert new one
-                filepart.msg = mimeparser.parts[0].msg.as_ref().map(|s| s.to_string());
+                if has_setup_file {
+                    self.is_system_message = SystemMessage::AutocryptSetupMessage;
 
-                // forget the one we use now
-                mimeparser.parts[0].msg = None;
+                    // TODO: replace the following code with this
+                    // once drain_filter stabilizes.
+                    //
+                    // See https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain_filter
+                    // and https://github.com/rust-lang/rust/issues/43244
+                    //
+                    // mimeparser
+                    //    .parts
+                    //    .drain_filter(|part| part.int_mimetype != 111)
+                    //    .for_each(|part| dc_mimepart_unref(part));
 
-                // swap new with old
-                let old = std::mem::replace(&mut mimeparser.parts[0], filepart);
-
-                // unref old one
-                dc_mimepart_unref(old);
-            }
-        }
-        if !mimeparser.subject.is_null() {
-            let mut prepend_subject: libc::c_int = 1i32;
-            if 0 == mimeparser.decrypting_failed {
-                let p: *mut libc::c_char = strchr(mimeparser.subject, ':' as i32);
-                if p.wrapping_offset_from(mimeparser.subject) == 2
-                    || p.wrapping_offset_from(mimeparser.subject) == 3
-                    || mimeparser.is_send_by_messenger
-                    || !strstr(
-                        mimeparser.subject,
-                        b"Chat:\x00" as *const u8 as *const libc::c_char,
-                    )
-                    .is_null()
-                {
-                    prepend_subject = 0i32
-                }
-            }
-            if 0 != prepend_subject {
-                let subj: *mut libc::c_char = dc_strdup(mimeparser.subject);
-                let p_0: *mut libc::c_char = strchr(subj, '[' as i32);
-                if !p_0.is_null() {
-                    *p_0 = 0i32 as libc::c_char
-                }
-                dc_trim(subj);
-                if 0 != *subj.offset(0isize) {
-                    for part in mimeparser.parts.iter_mut() {
-                        if part.type_0 == Viewtype::Text {
-                            let msg_c = part.msg.as_ref().unwrap().strdup();
-                            let new_txt: *mut libc::c_char = dc_mprintf(
-                                b"%s \xe2\x80\x93 %s\x00" as *const u8 as *const libc::c_char,
-                                subj,
-                                msg_c,
-                            );
-                            free(msg_c.cast());
-                            part.msg = Some(to_string(new_txt));
-                            free(new_txt.cast());
-                            break;
+                    let mut i = 0;
+                    while i != self.parts.len() {
+                        if self.parts[i].mimetype != 111 {
+                            self.parts.remove(i);
+                        } else {
+                            i += 1;
                         }
                     }
                 }
-                free(subj as *mut libc::c_void);
-            }
-        }
-        if 0 != mimeparser.is_forwarded {
-            for part in mimeparser.parts.iter_mut() {
-                part.param.set_int(Param::Forwarded, 1);
-            }
-        }
-        if mimeparser.parts.len() == 1 {
-            if mimeparser.parts[0].type_0 == Viewtype::Audio {
-                if !dc_mimeparser_lookup_optional_field(&mimeparser, "Chat-Voice-Message").is_null()
-                {
-                    let part_mut = &mut mimeparser.parts[0];
-                    part_mut.type_0 = Viewtype::Voice;
+            } else if let Some(optional_field) = self.lookup_optional_field("Chat-Content") {
+                if optional_field == "location-streaming-enabled" {
+                    self.is_system_message = SystemMessage::LocationStreamingEnabled;
                 }
             }
-            let part = &mimeparser.parts[0];
-            if part.type_0 == Viewtype::Audio
-                || part.type_0 == Viewtype::Voice
-                || part.type_0 == Viewtype::Video
-            {
-                let field_0 = dc_mimeparser_lookup_optional_field(&mimeparser, "Chat-Duration");
-                if !field_0.is_null() {
-                    let duration_ms: libc::c_int = dc_atoi_null_is_0((*field_0).fld_value);
-                    if duration_ms > 0i32 && duration_ms < 24i32 * 60i32 * 60i32 * 1000i32 {
-                        let part_mut = &mut mimeparser.parts[0];
-                        part_mut.param.set_int(Param::Duration, duration_ms);
+            if self.lookup_field("Chat-Group-Image").is_some() && !self.parts.is_empty() {
+                let textpart = &self.parts[0];
+                if textpart.typ == Viewtype::Text && self.parts.len() >= 2 {
+                    let imgpart = &mut self.parts[1];
+                    if imgpart.typ == Viewtype::Image {
+                        imgpart.is_meta = true;
                     }
                 }
             }
-        }
-        if 0 == mimeparser.decrypting_failed {
-            let dn_field: *const mailimf_optional_field = dc_mimeparser_lookup_optional_field(
-                &mimeparser,
-                "Chat-Disposition-Notification-To",
-            );
-            if !dn_field.is_null() && dc_mimeparser_get_last_nonmeta(&mut mimeparser).is_some() {
-                let mut mb_list: *mut mailimf_mailbox_list = ptr::null_mut();
-                let mut index_0: size_t = 0i32 as size_t;
-                if mailimf_mailbox_list_parse(
-                    (*dn_field).fld_value,
-                    strlen((*dn_field).fld_value),
-                    &mut index_0,
-                    &mut mb_list,
-                ) == MAILIMF_NO_ERROR as libc::c_int
-                    && !mb_list.is_null()
+            if self.is_send_by_messenger && self.parts.len() == 2 {
+                let need_drop = {
+                    let textpart = &self.parts[0];
+                    let filepart = &self.parts[1];
+                    textpart.typ == Viewtype::Text
+                        && (filepart.typ == Viewtype::Image
+                            || filepart.typ == Viewtype::Gif
+                            || filepart.typ == Viewtype::Sticker
+                            || filepart.typ == Viewtype::Audio
+                            || filepart.typ == Viewtype::Voice
+                            || filepart.typ == Viewtype::Video
+                            || filepart.typ == Viewtype::File)
+                        && !filepart.is_meta
+                };
+
+                if need_drop {
+                    let mut filepart = self.parts.swap_remove(1);
+
+                    // insert new one
+                    filepart.msg = self.parts[0].msg.as_ref().map(|s| s.to_string());
+
+                    // forget the one we use now
+                    self.parts[0].msg = None;
+
+                    // swap new with old
+                    std::mem::replace(&mut self.parts[0], filepart);
+                }
+            }
+            if let Some(ref subject) = self.subject {
+                let mut prepend_subject: libc::c_int = 1i32;
+                if !self.decrypting_failed {
+                    let colon = subject.find(':');
+                    if colon == Some(2)
+                        || colon == Some(3)
+                        || self.is_send_by_messenger
+                        || subject.contains("Chat:")
+                    {
+                        prepend_subject = 0i32
+                    }
+                }
+                if 0 != prepend_subject {
+                    let subj = if let Some(n) = subject.find('[') {
+                        &subject[0..n]
+                    } else {
+                        subject
+                    }
+                    .trim();
+
+                    if !subj.is_empty() {
+                        for part in self.parts.iter_mut() {
+                            if part.typ == Viewtype::Text {
+                                let new_txt = format!(
+                                    "{} – {}",
+                                    subj,
+                                    part.msg.as_ref().expect("missing msg part")
+                                );
+                                part.msg = Some(new_txt);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if self.is_forwarded {
+                for part in self.parts.iter_mut() {
+                    part.param.set_int(Param::Forwarded, 1);
+                }
+            }
+            if self.parts.len() == 1 {
+                if self.parts[0].typ == Viewtype::Audio {
+                    if self.lookup_optional_field("Chat-Voice-Message").is_some() {
+                        let part_mut = &mut self.parts[0];
+                        part_mut.typ = Viewtype::Voice;
+                    }
+                }
+                if self.parts[0].typ == Viewtype::Image {
+                    if let Some(content_type) = self.lookup_optional_field("Chat-Content") {
+                        if content_type == "sticker" {
+                            let part_mut = &mut self.parts[0];
+                            part_mut.typ = Viewtype::Sticker;
+                        }
+                    }
+                }
+                let part = &self.parts[0];
+                if part.typ == Viewtype::Audio
+                    || part.typ == Viewtype::Voice
+                    || part.typ == Viewtype::Video
                 {
-                    let dn_to_addr: *mut libc::c_char = mailimf_find_first_addr(mb_list);
-                    if !dn_to_addr.is_null() {
-                        let from_field: *mut mailimf_field =
-                            dc_mimeparser_lookup_field(&mimeparser, "From");
-                        if !from_field.is_null()
-                            && (*from_field).fld_type == MAILIMF_FIELD_FROM as libc::c_int
-                            && !(*from_field).fld_data.fld_from.is_null()
+                    if let Some(field_0) = self.lookup_optional_field("Chat-Duration") {
+                        let duration_ms = field_0.parse().unwrap_or_default();
+                        if duration_ms > 0 && duration_ms < 24 * 60 * 60 * 1000 {
+                            let part_mut = &mut self.parts[0];
+                            part_mut.param.set_int(Param::Duration, duration_ms);
+                        }
+                    }
+                }
+            }
+            if !self.decrypting_failed {
+                if let Some(dn_field) =
+                    self.lookup_optional_field("Chat-Disposition-Notification-To")
+                {
+                    if self.get_last_nonmeta().is_some() {
+                        let mut mb_list: *mut mailimf_mailbox_list = ptr::null_mut();
+                        let mut index_0 = 0;
+                        let dn_field_c = CString::new(dn_field).unwrap_or_default();
+
+                        if mailimf_mailbox_list_parse(
+                            dn_field_c.as_ptr(),
+                            strlen(dn_field_c.as_ptr()),
+                            &mut index_0,
+                            &mut mb_list,
+                        ) == MAILIMF_NO_ERROR as libc::c_int
+                            && !mb_list.is_null()
                         {
-                            let from_addr: *mut libc::c_char = mailimf_find_first_addr(
-                                (*(*from_field).fld_data.fld_from).frm_mb_list,
-                            );
-                            if !from_addr.is_null() {
-                                if strcmp(from_addr, dn_to_addr) == 0i32 {
-                                    if let Some(part_4) =
-                                        dc_mimeparser_get_last_nonmeta(&mut mimeparser)
+                            if let Some(dn_to_addr) = wrapmime::mailimf_find_first_addr(mb_list) {
+                                if let Some(from_field) = self.lookup_field("From") {
+                                    if (*from_field).fld_type == MAILIMF_FIELD_FROM as libc::c_int
+                                        && !(*from_field).fld_data.fld_from.is_null()
                                     {
-                                        part_4.param.set_int(Param::WantsMdn, 1);
+                                        let from_addr = wrapmime::mailimf_find_first_addr(
+                                            (*(*from_field).fld_data.fld_from).frm_mb_list,
+                                        );
+                                        if let Some(from_addr) = from_addr {
+                                            if from_addr == dn_to_addr {
+                                                if let Some(part_4) = self.get_last_nonmeta() {
+                                                    part_4.param.set_int(Param::WantsMdn, 1);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                free(from_addr as *mut libc::c_void);
                             }
+                            mailimf_mailbox_list_free(mb_list);
                         }
-                        free(dn_to_addr as *mut libc::c_void);
                     }
-                    mailimf_mailbox_list_free(mb_list);
                 }
             }
         }
-    }
-    /* Cleanup - and try to create at least an empty part if there are no parts yet */
-    if dc_mimeparser_get_last_nonmeta(&mut mimeparser).is_none() && mimeparser.reports.is_empty() {
-        let mut part_5 = dc_mimepart_new();
-        part_5.type_0 = Viewtype::Text;
-        if !mimeparser.subject.is_null() && !mimeparser.is_send_by_messenger {
-            part_5.msg = Some(to_string(mimeparser.subject));
-        } else {
+        /* Cleanup - and try to create at least an empty part if there are no parts yet */
+        if self.get_last_nonmeta().is_none() && self.reports.is_empty() {
+            let mut part_5 = Part::default();
+            part_5.typ = Viewtype::Text;
             part_5.msg = Some("".into());
+
+            if let Some(ref subject) = self.subject {
+                if !self.is_send_by_messenger {
+                    part_5.msg = Some(subject.to_string())
+                }
+            }
+            self.parts.push(part_5);
         }
-        mimeparser.parts.push(part_5);
-    };
-    mimeparser
-}
-
-/*******************************************************************************
- * a MIME part
- ******************************************************************************/
-unsafe fn dc_mimepart_new() -> dc_mimepart_t {
-    dc_mimepart_t {
-        type_0: Viewtype::Unknown,
-        is_meta: 0,
-        int_mimetype: 0,
-        msg: None,
-        msg_raw: std::ptr::null_mut(),
-        bytes: 0,
-        param: Params::new(),
+        Ok(())
     }
-}
 
-pub fn dc_mimeparser_get_last_nonmeta<'a>(
-    mimeparser: &'a mut dc_mimeparser_t,
-) -> Option<&'a mut dc_mimepart_t> {
-    mimeparser
-        .parts
-        .iter_mut()
-        .rev()
-        .find(|part| part.is_meta == 0)
-}
-
-/*the result must be freed*/
-pub unsafe fn mailimf_find_first_addr(mb_list: *const mailimf_mailbox_list) -> *mut libc::c_char {
-    if mb_list.is_null() {
-        return ptr::null_mut();
+    pub fn get_last_nonmeta(&mut self) -> Option<&mut Part> {
+        self.parts.iter_mut().rev().find(|part| !part.is_meta)
     }
-    let mut cur: *mut clistiter = (*(*mb_list).mb_list).first;
-    while !cur.is_null() {
-        let mb: *mut mailimf_mailbox = (if !cur.is_null() {
-            (*cur).data
-        } else {
-            ptr::null_mut()
-        }) as *mut mailimf_mailbox;
-        if !mb.is_null() && !(*mb).mb_addr_spec.is_null() {
-            return addr_normalize(as_str((*mb).mb_addr_spec)).strdup();
-        }
-        cur = if !cur.is_null() {
-            (*cur).next
-        } else {
-            ptr::null_mut()
+
+    /* the following functions can be used only after a call to parse() */
+
+    pub fn lookup_field(&self, field_name: &str) -> Option<*mut mailimf_field> {
+        match self.header.get(field_name) {
+            Some(v) => {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(*v)
+                }
+            }
+            None => None,
         }
     }
 
-    ptr::null_mut()
-}
-
-/* the following functions can be used only after a call to dc_mimeparser_parse() */
-
-pub fn dc_mimeparser_lookup_field(
-    mimeparser: &dc_mimeparser_t,
-    field_name: &str,
-) -> *mut mailimf_field {
-    mimeparser
-        .header
-        .get(field_name)
-        .map(|v| *v)
-        .unwrap_or_else(|| std::ptr::null_mut())
-}
-
-pub unsafe fn dc_mimeparser_lookup_optional_field(
-    mimeparser: &dc_mimeparser_t,
-    field_name: &str,
-) -> *mut mailimf_optional_field {
-    let field = mimeparser
-        .header
-        .get(field_name)
-        .map(|v| *v)
-        .unwrap_or_else(|| std::ptr::null_mut());
-    if !field.is_null() && (*field).fld_type == MAILIMF_FIELD_OPTIONAL_FIELD as libc::c_int {
-        return (*field).fld_data.fld_optional_field;
-    }
-
-    ptr::null_mut()
-}
-
-unsafe fn dc_mimeparser_parse_mime_recursive(
-    mimeparser: &mut dc_mimeparser_t,
-    mime: *mut mailmime,
-) -> libc::c_int {
-    let mut any_part_added: libc::c_int = 0i32;
-    let mut cur: *mut clistiter;
-    if mime.is_null() {
-        return 0i32;
-    }
-    if !mailmime_find_ct_parameter(
-        mime,
-        b"protected-headers\x00" as *const u8 as *const libc::c_char,
-    )
-    .is_null()
-    {
-        if (*mime).mm_type == MAILMIME_SINGLE as libc::c_int
-            && (*(*(*mime).mm_content_type).ct_type).tp_type
-                == MAILMIME_TYPE_DISCRETE_TYPE as libc::c_int
-            && (*(*(*(*mime).mm_content_type).ct_type)
-                .tp_data
-                .tp_discrete_type)
-                .dt_type
-                == MAILMIME_DISCRETE_TYPE_TEXT as libc::c_int
-            && !(*(*mime).mm_content_type).ct_subtype.is_null()
-            && strcmp(
-                (*(*mime).mm_content_type).ct_subtype,
-                b"rfc822-headers\x00" as *const u8 as *const libc::c_char,
-            ) == 0i32
-        {
-            info!(
-                mimeparser.context,
-                0, "Protected headers found in text/rfc822-headers attachment: Will be ignored.",
-            );
-            return 0i32;
-        }
-        if mimeparser.header_protected.is_null() {
-            let mut dummy: size_t = 0i32 as size_t;
-            if mailimf_envelope_and_optional_fields_parse(
-                (*mime).mm_mime_start,
-                (*mime).mm_length,
-                &mut dummy,
-                &mut mimeparser.header_protected,
-            ) != MAILIMF_NO_ERROR as libc::c_int
-                || mimeparser.header_protected.is_null()
-            {
-                warn!(mimeparser.context, 0, "Protected headers parsing error.",);
+    pub fn lookup_optional_field(&self, field_name: &str) -> Option<String> {
+        if let Some(field) = self.lookup_field_typ(field_name, MAILIMF_FIELD_OPTIONAL_FIELD) {
+            let val = unsafe { (*field).fld_data.fld_optional_field };
+            if val.is_null() {
+                return None;
             } else {
-                hash_header(
-                    &mut mimeparser.header,
-                    mimeparser.header_protected,
-                    mimeparser.context,
-                );
+                return Some(unsafe { to_string_lossy((*val).fld_value) });
+            }
+        }
+
+        None
+    }
+
+    pub fn lookup_field_typ(&self, name: &str, typ: u32) -> Option<*const mailimf_field> {
+        if let Some(field) = self.lookup_field(name) {
+            if unsafe { (*field).fld_type } == typ as libc::c_int {
+                Some(field)
+            } else {
+                None
             }
         } else {
-            info!(
-                mimeparser.context,
-                0,
-                "Protected headers found in MIME header: Will be ignored as we already found an outer one."
-            );
+            None
         }
     }
-    match (*mime).mm_type {
-        // TODO match on enums /rtn
-        1 => any_part_added = dc_mimeparser_add_single_part_if_known(mimeparser, mime),
-        2 => {
-            match mailmime_get_mime_type(mime, ptr::null_mut(), ptr::null_mut()) {
-                10 => {
-                    cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                    while !cur.is_null() {
-                        let childmime: *mut mailmime = (if !cur.is_null() {
-                            (*cur).data
-                        } else {
-                            ptr::null_mut()
-                        }) as *mut mailmime;
-                        if mailmime_get_mime_type(childmime, ptr::null_mut(), ptr::null_mut())
-                            == 30i32
-                        {
-                            any_part_added =
-                                dc_mimeparser_parse_mime_recursive(mimeparser, childmime);
+
+    unsafe fn parse_mime_recursive(&mut self, mime: *mut Mailmime) -> bool {
+        if mime.is_null() {
+            return false;
+        }
+
+        if !mailmime_find_ct_parameter(mime, "protected-headers").is_null() {
+            let mime = *mime;
+
+            if mime.mm_type == MAILMIME_SINGLE as libc::c_int
+                && (*(*mime.mm_content_type).ct_type).tp_type
+                    == MAILMIME_TYPE_DISCRETE_TYPE as libc::c_int
+                && (*(*(*mime.mm_content_type).ct_type).tp_data.tp_discrete_type).dt_type
+                    == MAILMIME_DISCRETE_TYPE_TEXT as libc::c_int
+                && !(*mime.mm_content_type).ct_subtype.is_null()
+                && &to_string_lossy((*mime.mm_content_type).ct_subtype) == "rfc822-headers"
+            {
+                info!(
+                    self.context,
+                    "Protected headers found in text/rfc822-headers attachment: Will be ignored.",
+                );
+                return false;
+            }
+
+            if self.header_protected.is_null() {
+                /* use the most outer protected header - this is typically
+                created in sync with the normal, unprotected header */
+                let mut dummy = 0;
+                if mailimf_envelope_and_optional_fields_parse(
+                    mime.mm_mime_start,
+                    mime.mm_length,
+                    &mut dummy,
+                    &mut self.header_protected,
+                ) != MAILIMF_NO_ERROR as libc::c_int
+                    || self.header_protected.is_null()
+                {
+                    warn!(self.context, "Protected headers parsing error.",);
+                } else {
+                    hash_header(&mut self.header, self.header_protected);
+                }
+            } else {
+                info!(
+                    self.context,
+                    "Protected headers found in MIME header: Will be ignored as we already found an outer one."
+                );
+            }
+        }
+
+        match (*mime).mm_type as u32 {
+            MAILMIME_SINGLE => self.add_single_part_if_known(mime),
+            MAILMIME_MULTIPLE => self.handle_multiple(mime),
+            MAILMIME_MESSAGE => {
+                if self.header_root.is_null() {
+                    self.header_root = (*mime).mm_data.mm_message.mm_fields;
+                    hash_header(&mut self.header, self.header_root);
+                }
+                if (*mime).mm_data.mm_message.mm_msg_mime.is_null() {
+                    return false;
+                }
+
+                self.parse_mime_recursive((*mime).mm_data.mm_message.mm_msg_mime)
+            }
+            _ => false,
+        }
+    }
+
+    unsafe fn handle_multiple(&mut self, mime: *mut Mailmime) -> bool {
+        let mut any_part_added = false;
+        match mailmime_get_mime_type(mime) {
+            /* Most times, mutlipart/alternative contains true alternatives
+            as text/plain and text/html.  If we find a multipart/mixed
+            inside mutlipart/alternative, we use this (happens eg in
+            apple mail: "plaintext" as an alternative to "html+PDF attachment") */
+            (DC_MIMETYPE_MP_ALTERNATIVE, _, _) => {
+                for cur_data in (*(*mime).mm_data.mm_multipart.mm_mp_list).into_iter() {
+                    if mailmime_get_mime_type(cur_data as *mut _).0 == DC_MIMETYPE_MP_MIXED {
+                        any_part_added = self.parse_mime_recursive(cur_data as *mut _);
+                        break;
+                    }
+                }
+                if !any_part_added {
+                    /* search for text/plain and add this */
+                    for cur_data in (*(*mime).mm_data.mm_multipart.mm_mp_list).into_iter() {
+                        if mailmime_get_mime_type(cur_data as *mut _).0 == DC_MIMETYPE_TEXT_PLAIN {
+                            any_part_added = self.parse_mime_recursive(cur_data as *mut _);
                             break;
-                        } else {
-                            cur = if !cur.is_null() {
-                                (*cur).next
-                            } else {
-                                ptr::null_mut()
-                            }
-                        }
-                    }
-                    if 0 == any_part_added {
-                        cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                        while !cur.is_null() {
-                            let childmime_0: *mut mailmime = (if !cur.is_null() {
-                                (*cur).data
-                            } else {
-                                ptr::null_mut()
-                            })
-                                as *mut mailmime;
-                            if mailmime_get_mime_type(childmime_0, ptr::null_mut(), ptr::null_mut())
-                                == 60i32
-                            {
-                                any_part_added =
-                                    dc_mimeparser_parse_mime_recursive(mimeparser, childmime_0);
-                                break;
-                            } else {
-                                cur = if !cur.is_null() {
-                                    (*cur).next
-                                } else {
-                                    ptr::null_mut()
-                                }
-                            }
-                        }
-                    }
-                    if 0 == any_part_added {
-                        cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                        while !cur.is_null() {
-                            if 0 != dc_mimeparser_parse_mime_recursive(
-                                mimeparser,
-                                (if !cur.is_null() {
-                                    (*cur).data
-                                } else {
-                                    ptr::null_mut()
-                                }) as *mut mailmime,
-                            ) {
-                                any_part_added = 1i32;
-                                /* out of for() */
-                                break;
-                            } else {
-                                cur = if !cur.is_null() {
-                                    (*cur).next
-                                } else {
-                                    ptr::null_mut()
-                                }
-                            }
                         }
                     }
                 }
-                20 => {
-                    cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                    if !cur.is_null() {
-                        any_part_added = dc_mimeparser_parse_mime_recursive(
-                            mimeparser,
-                            (if !cur.is_null() {
-                                (*cur).data
-                            } else {
-                                ptr::null_mut()
-                            }) as *mut mailmime,
-                        )
+                if !any_part_added {
+                    /* `text/plain` not found - use the first part */
+                    for cur_data in (*(*mime).mm_data.mm_multipart.mm_mp_list).into_iter() {
+                        if self.parse_mime_recursive(cur_data as *mut _) {
+                            any_part_added = true;
+                            break;
+                        }
                     }
                 }
-                40 => {
-                    let mut part = dc_mimepart_new();
-                    part.type_0 = Viewtype::Text;
-                    let msg_body = mimeparser
-                        .context
-                        .stock_str(StockMessage::CantDecryptMsgBody);
+            }
+            (DC_MIMETYPE_MP_RELATED, _, _) => {
+                /* add the "root part" - the other parts may be referenced which is
+                not interesting for us (eg. embedded images) we assume he "root part"
+                being the first one, which may not be always true ...
+                however, most times it seems okay. */
+                let cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
+                if !cur.is_null() {
+                    any_part_added = self.parse_mime_recursive((*cur).data as *mut Mailmime);
+                }
+            }
+            (DC_MIMETYPE_MP_NOT_DECRYPTABLE, _, _) => {
+                let mut part = Part::default();
+                part.typ = Viewtype::Text;
+                let msg_body = self.context.stock_str(StockMessage::CantDecryptMsgBody);
 
-                    let txt = format!("[{}]", msg_body);
-                    part.msg_raw = txt.strdup();
-                    part.msg = Some(txt);
+                let txt = format!("[{}]", msg_body);
+                part.msg_raw = Some(txt.clone());
+                part.msg = Some(txt);
 
-                    mimeparser.parts.push(part);
-                    any_part_added = 1i32;
-                    mimeparser.decrypting_failed = 1i32
+                self.parts.push(part);
+                any_part_added = true;
+                self.decrypting_failed = true;
+            }
+            (DC_MIMETYPE_MP_SIGNED, _, _) => {
+                /* RFC 1847: "The multipart/signed content type
+                contains exactly two body parts.  The first body
+                part is the body part over which the digital signature was created [...]
+                The second body part contains the control information necessary to
+                verify the digital signature." We simpliy take the first body part and
+                skip the rest.  (see
+                https://k9mail.github.io/2016/11/24/OpenPGP-Considerations-Part-I.html
+                for background information why we use encrypted+signed) */
+                let cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
+                if !cur.is_null() {
+                    any_part_added = self.parse_mime_recursive((*cur).data as *mut _);
                 }
-                46 => {
-                    cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                    if !cur.is_null() {
-                        any_part_added = dc_mimeparser_parse_mime_recursive(
-                            mimeparser,
-                            (if !cur.is_null() {
-                                (*cur).data
-                            } else {
-                                ptr::null_mut()
-                            }) as *mut mailmime,
-                        )
-                    }
-                }
-                45 => {
-                    if (*(*mime).mm_data.mm_multipart.mm_mp_list).count >= 2i32 {
-                        let report_type: *mut mailmime_parameter = mailmime_find_ct_parameter(
-                            mime,
-                            b"report-type\x00" as *const u8 as *const libc::c_char,
-                        );
-                        if !report_type.is_null()
-                            && !(*report_type).pa_value.is_null()
-                            && strcmp(
-                                (*report_type).pa_value,
-                                b"disposition-notification\x00" as *const u8 as *const libc::c_char,
-                            ) == 0i32
-                        {
-                            mimeparser.reports.push(mime);
-                        } else {
-                            any_part_added = dc_mimeparser_parse_mime_recursive(
-                                mimeparser,
-                                (if !(*(*mime).mm_data.mm_multipart.mm_mp_list).first.is_null() {
-                                    (*(*(*mime).mm_data.mm_multipart.mm_mp_list).first).data
-                                } else {
-                                    ptr::null_mut()
-                                }) as *mut mailmime,
-                            )
+            }
+            (DC_MIMETYPE_MP_REPORT, _, _) => {
+                /* RFC 6522: the first part is for humans, the second for machines */
+                if (*(*mime).mm_data.mm_multipart.mm_mp_list).count >= 2 {
+                    let report_type = mailmime_find_ct_parameter(mime, "report-type");
+                    if !report_type.is_null()
+                        && !(*report_type).pa_value.is_null()
+                        && &to_string_lossy((*report_type).pa_value) == "disposition-notification"
+                    {
+                        self.reports.push(mime);
+                    } else {
+                        /* eg. `report-type=delivery-status`;
+                        maybe we should show them as a little error icon */
+                        if !(*(*mime).mm_data.mm_multipart.mm_mp_list).first.is_null() {
+                            any_part_added = self.parse_mime_recursive(
+                                (*(*(*mime).mm_data.mm_multipart.mm_mp_list).first).data as *mut _,
+                            );
                         }
                     }
                 }
-                _ => {
-                    let mut skip_part: *mut mailmime = ptr::null_mut();
-                    let mut html_part: *mut mailmime = ptr::null_mut();
-                    let mut plain_cnt: libc::c_int = 0i32;
-                    let mut html_cnt: libc::c_int = 0i32;
-                    cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                    while !cur.is_null() {
-                        let childmime_1: *mut mailmime = (if !cur.is_null() {
-                            (*cur).data
-                        } else {
-                            ptr::null_mut()
-                        })
-                            as *mut mailmime;
-                        if mailmime_get_mime_type(childmime_1, ptr::null_mut(), ptr::null_mut())
-                            == 60i32
-                        {
-                            plain_cnt += 1
-                        } else if mailmime_get_mime_type(
-                            childmime_1,
-                            ptr::null_mut(),
-                            ptr::null_mut(),
-                        ) == 70i32
-                        {
-                            html_part = childmime_1;
-                            html_cnt += 1
+            }
+            _ => {
+                /* eg. DC_MIMETYPE_MP_MIXED - add all parts (in fact,
+                AddSinglePartIfKnown() later check if the parts are really supported)
+                HACK: the following lines are a hack for clients who use
+                multipart/mixed instead of multipart/alternative for
+                combined text/html messages (eg. Stock Android "Mail" does so).
+                So, if we detect such a message below, we skip the HTML
+                part.  However, not sure, if there are useful situations to use
+                plain+html in multipart/mixed - if so, we should disable the hack. */
+                let mut skip_part = ptr::null_mut();
+                let mut html_part = ptr::null_mut();
+                let mut plain_cnt = 0;
+                let mut html_cnt = 0;
+
+                for cur_data in (*(*mime).mm_data.mm_multipart.mm_mp_list).into_iter() {
+                    match mailmime_get_mime_type(cur_data as *mut _) {
+                        (DC_MIMETYPE_TEXT_PLAIN, _, _) => {
+                            plain_cnt += 1;
                         }
-                        cur = if !cur.is_null() {
-                            (*cur).next
-                        } else {
-                            ptr::null_mut()
+                        (DC_MIMETYPE_TEXT_HTML, _, _) => {
+                            html_part = cur_data as *mut Mailmime;
+                            html_cnt += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if plain_cnt == 1 && html_cnt == 1 {
+                    warn!(
+                        self.context,
+                        "HACK: multipart/mixed message found with PLAIN and HTML, we\'ll skip the HTML part as this seems to be unwanted."
+                    );
+                    skip_part = html_part;
+                }
+
+                for cur_data in (*(*mime).mm_data.mm_multipart.mm_mp_list).into_iter() {
+                    if cur_data as *mut _ != skip_part {
+                        if self.parse_mime_recursive(cur_data as *mut _) {
+                            any_part_added = true;
                         }
                     }
-                    if plain_cnt == 1i32 && html_cnt == 1i32 {
+                }
+            }
+        }
+
+        any_part_added
+    }
+
+    unsafe fn add_single_part_if_known(&mut self, mime: *mut Mailmime) -> bool {
+        // return true if a part was added
+        if mime.is_null() || (*mime).mm_data.mm_single.is_null() {
+            return false;
+        }
+
+        let (mime_type, msg_type, raw_mime) = mailmime_get_mime_type(mime);
+
+        let mime_data = (*mime).mm_data.mm_single;
+        if (*mime_data).dt_type != MAILMIME_DATA_TEXT as libc::c_int
+            /* MAILMIME_DATA_FILE indicates, the data is in a file; AFAIK this is not used on parsing */
+            || (*mime_data).dt_data.dt_text.dt_data.is_null()
+            || (*mime_data).dt_data.dt_text.dt_length <= 0
+        {
+            return false;
+        }
+
+        let mut decoded_data = match wrapmime::mailmime_transfer_decode(mime) {
+            Ok(decoded_data) => decoded_data,
+            Err(_) => {
+                // Note that it's now always an error - might be no data
+                return false;
+            }
+        };
+
+        let old_part_count = self.parts.len();
+
+        /* regard `Content-Transfer-Encoding:` */
+        let mut desired_filename = String::default();
+        let mut simplifier: Option<Simplify> = None;
+        match mime_type {
+            DC_MIMETYPE_TEXT_PLAIN | DC_MIMETYPE_TEXT_HTML => {
+                if simplifier.is_none() {
+                    simplifier = Some(Simplify::new());
+                }
+                /* get from `Content-Type: text/...; charset=utf-8`; must not be free()'d */
+                let charset = mailmime_content_charset_get((*mime).mm_content_type);
+                if !charset.is_null()
+                    && strcmp(charset, b"utf-8\x00" as *const u8 as *const libc::c_char) != 0i32
+                    && strcmp(charset, b"UTF-8\x00" as *const u8 as *const libc::c_char) != 0i32
+                {
+                    if let Some(encoding) =
+                        Charset::for_label(CStr::from_ptr(charset).to_string_lossy().as_bytes())
+                    {
+                        let (res, _, _) = encoding.decode(&decoded_data);
+                        if res.is_empty() {
+                            /* no error - but nothing to add */
+                            return false;
+                        }
+                        decoded_data = res.as_bytes().to_vec()
+                    } else {
                         warn!(
-                            mimeparser.context,
-                            0i32,
-                            "HACK: multipart/mixed message found with PLAIN and HTML, we\'ll skip the HTML part as this seems to be unwanted."
+                            self.context,
+                            "Cannot convert {} bytes from \"{}\" to \"utf-8\".",
+                            decoded_data.len(),
+                            as_str(charset),
                         );
-                        skip_part = html_part
-                    }
-                    cur = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-                    while !cur.is_null() {
-                        let childmime_2: *mut mailmime = (if !cur.is_null() {
-                            (*cur).data
-                        } else {
-                            ptr::null_mut()
-                        })
-                            as *mut mailmime;
-                        if childmime_2 != skip_part {
-                            if 0 != dc_mimeparser_parse_mime_recursive(mimeparser, childmime_2) {
-                                any_part_added = 1i32
-                            }
-                        }
-                        cur = if !cur.is_null() {
-                            (*cur).next
-                        } else {
-                            ptr::null_mut()
-                        }
                     }
                 }
-            }
-        }
-        3 => {
-            if mimeparser.header_root.is_null() {
-                mimeparser.header_root = (*mime).mm_data.mm_message.mm_fields;
-                hash_header(
-                    &mut mimeparser.header,
-                    mimeparser.header_root,
-                    mimeparser.context,
-                );
-            }
-            if !(*mime).mm_data.mm_message.mm_msg_mime.is_null() {
-                any_part_added = dc_mimeparser_parse_mime_recursive(
-                    mimeparser,
-                    (*mime).mm_data.mm_message.mm_msg_mime,
-                )
-            }
-        }
-        _ => {}
-    }
+                /* check header directly as is_send_by_messenger is not yet set up */
+                let is_msgrmsg = self.lookup_optional_field("Chat-Version").is_some();
 
-    any_part_added
-}
+                let simplified_txt = if decoded_data.is_empty() {
+                    "".into()
+                } else {
+                    let input = std::string::String::from_utf8_lossy(&decoded_data);
+                    let is_html = mime_type == 70;
 
-unsafe fn hash_header(
-    out: &mut HashMap<String, *mut mailimf_field>,
-    in_0: *const mailimf_fields,
-    _context: &Context,
-) {
-    if in_0.is_null() {
-        return;
-    }
-    let mut cur1: *mut clistiter = (*(*in_0).fld_list).first;
-    while !cur1.is_null() {
-        let field: *mut mailimf_field = (if !cur1.is_null() {
-            (*cur1).data
-        } else {
-            ptr::null_mut()
-        }) as *mut mailimf_field;
-        let mut key: *const libc::c_char = ptr::null();
-        // TODO match on enums /rtn
-        match (*field).fld_type {
-            1 => key = b"Return-Path\x00" as *const u8 as *const libc::c_char,
-            9 => key = b"Date\x00" as *const u8 as *const libc::c_char,
-            10 => key = b"From\x00" as *const u8 as *const libc::c_char,
-            11 => key = b"Sender\x00" as *const u8 as *const libc::c_char,
-            12 => key = b"Reply-To\x00" as *const u8 as *const libc::c_char,
-            13 => key = b"To\x00" as *const u8 as *const libc::c_char,
-            14 => key = b"Cc\x00" as *const u8 as *const libc::c_char,
-            15 => key = b"Bcc\x00" as *const u8 as *const libc::c_char,
-            16 => key = b"Message-ID\x00" as *const u8 as *const libc::c_char,
-            17 => key = b"In-Reply-To\x00" as *const u8 as *const libc::c_char,
-            18 => key = b"References\x00" as *const u8 as *const libc::c_char,
-            19 => key = b"Subject\x00" as *const u8 as *const libc::c_char,
-            22 => {
-                // MAILIMF_FIELD_OPTIONAL_FIELD
-                let optional_field: *const mailimf_optional_field =
-                    (*field).fld_data.fld_optional_field;
-                if !optional_field.is_null() {
-                    key = (*optional_field).fld_name
+                    simplifier.unwrap().simplify(&input, is_html, is_msgrmsg)
+                };
+                if !simplified_txt.is_empty() {
+                    let mut part = Part::default();
+                    part.typ = Viewtype::Text;
+                    part.mimetype = mime_type;
+                    part.msg = Some(simplified_txt);
+                    part.msg_raw =
+                        Some(std::string::String::from_utf8_lossy(&decoded_data).to_string());
+                    self.do_add_single_part(part);
+                }
+
+                if simplifier.unwrap().is_forwarded {
+                    self.is_forwarded = true;
+                }
+            }
+            DC_MIMETYPE_IMAGE
+            | DC_MIMETYPE_AUDIO
+            | DC_MIMETYPE_VIDEO
+            | DC_MIMETYPE_FILE
+            | DC_MIMETYPE_AC_SETUP_FILE => {
+                /* try to get file name from
+                   `Content-Disposition: ... filename*=...`
+                or `Content-Disposition: ... filename*0*=... filename*1*=... filename*2*=...`
+                or `Content-Disposition: ... filename=...` */
+                let mut filename_parts = String::new();
+
+                for cur1 in (*(*(*mime).mm_mime_fields).fld_list).into_iter() {
+                    let field = cur1 as *mut mailmime_field;
+                    if !field.is_null()
+                        && (*field).fld_type == MAILMIME_FIELD_DISPOSITION as libc::c_int
+                        && !(*field).fld_data.fld_disposition.is_null()
+                    {
+                        let file_disposition: *mut mailmime_disposition =
+                            (*field).fld_data.fld_disposition;
+                        if !file_disposition.is_null() {
+                            for cur2 in (*(*file_disposition).dsp_parms).into_iter() {
+                                let dsp_param = cur2 as *mut mailmime_disposition_parm;
+                                if !dsp_param.is_null() {
+                                    if (*dsp_param).pa_type
+                                        == MAILMIME_DISPOSITION_PARM_PARAMETER as libc::c_int
+                                        && !(*dsp_param).pa_data.pa_parameter.is_null()
+                                        && !(*(*dsp_param).pa_data.pa_parameter).pa_name.is_null()
+                                        && strncmp(
+                                            (*(*dsp_param).pa_data.pa_parameter).pa_name,
+                                            b"filename*\x00" as *const u8 as *const libc::c_char,
+                                            9,
+                                        ) == 0i32
+                                    {
+                                        // we assume the filename*?* parts are in order, not seen anything else yet
+                                        filename_parts += &to_string_lossy(
+                                            (*(*dsp_param).pa_data.pa_parameter).pa_value,
+                                        );
+                                    } else if (*dsp_param).pa_type
+                                        == MAILMIME_DISPOSITION_PARM_FILENAME as libc::c_int
+                                    {
+                                        // might be a wrongly encoded filename
+                                        let s = to_string_lossy((*dsp_param).pa_data.pa_filename);
+                                        // this is used only if the parts buffer stays empty
+                                        desired_filename = dc_decode_header_words(&s)
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                if !filename_parts.is_empty() {
+                    desired_filename = dc_decode_ext_header(filename_parts.as_bytes()).into_owned();
+                }
+                if desired_filename.is_empty() {
+                    let param = mailmime_find_ct_parameter(mime, "name");
+                    if !param.is_null()
+                        && !(*param).pa_value.is_null()
+                        && 0 != *(*param).pa_value.offset(0isize) as libc::c_int
+                    {
+                        // might be a wrongly encoded filename
+                        desired_filename = to_string_lossy((*param).pa_value);
+                    }
+                }
+                /* if there is still no filename, guess one */
+                if desired_filename.is_empty() {
+                    if !(*mime).mm_content_type.is_null()
+                        && !(*(*mime).mm_content_type).ct_subtype.is_null()
+                    {
+                        desired_filename =
+                            format!("file.{}", as_str((*(*mime).mm_content_type).ct_subtype));
+                    } else {
+                        return false;
+                    }
+                }
+                if desired_filename.starts_with("location") && desired_filename.ends_with(".kml") {
+                    if !decoded_data.is_empty() {
+                        let d = std::string::String::from_utf8_lossy(&decoded_data);
+                        self.location_kml = location::Kml::parse(self.context, &d).ok();
+                    }
+                } else if desired_filename.starts_with("message")
+                    && desired_filename.ends_with(".kml")
+                {
+                    if !decoded_data.is_empty() {
+                        let d = std::string::String::from_utf8_lossy(&decoded_data);
+                        self.message_kml = location::Kml::parse(self.context, &d).ok();
+                    }
+                } else if !decoded_data.is_empty() {
+                    self.do_add_single_file_part(
+                        msg_type,
+                        mime_type,
+                        raw_mime.as_ref(),
+                        &decoded_data,
+                        &desired_filename,
+                    );
                 }
             }
             _ => {}
         }
-        if !key.is_null() {
-            // XXX the optional field sometimes contains invalid UTF8
-            // which should not happen (according to the mime standard).
-            // This might point to a bug in our mime parsing/processing
-            // logic. As mmime/dc_mimeparser is scheduled fore replacement
-            // anyway we just use a lossy conversion.
-            let key_r = &to_string_lossy(key);
-            if !out.contains_key(key_r) || // key already exists, only overwrite known types (protected headers)
-                (*field).fld_type != MAILIMF_FIELD_OPTIONAL_FIELD as i32 || key_r.starts_with("Chat-")
-            {
-                out.insert(key_r.to_string(), field);
-            }
-        }
-        cur1 = if !cur1.is_null() {
-            (*cur1).next
-        } else {
-            ptr::null_mut()
-        }
-    }
-}
-
-unsafe fn mailmime_get_mime_type(
-    mime: *mut mailmime,
-    mut msg_type: *mut Viewtype,
-    raw_mime: *mut *mut libc::c_char,
-) -> libc::c_int {
-    let c: *mut mailmime_content = (*mime).mm_content_type;
-    let mut dummy = Viewtype::Unknown;
-    if msg_type.is_null() {
-        msg_type = &mut dummy
-    }
-    *msg_type = Viewtype::Unknown;
-    if c.is_null() || (*c).ct_type.is_null() {
-        return 0i32;
-    }
-    // TODO match on enums /rtn
-    match (*(*c).ct_type).tp_type {
-        1 => match (*(*(*c).ct_type).tp_data.tp_discrete_type).dt_type {
-            1 => {
-                if !(0 != mailmime_is_attachment_disposition(mime)) {
-                    if strcmp(
-                        (*c).ct_subtype,
-                        b"plain\x00" as *const u8 as *const libc::c_char,
-                    ) == 0i32
-                    {
-                        *msg_type = Viewtype::Text;
-                        return 60i32;
-                    } else {
-                        if strcmp(
-                            (*c).ct_subtype,
-                            b"html\x00" as *const u8 as *const libc::c_char,
-                        ) == 0i32
-                        {
-                            *msg_type = Viewtype::Text;
-                            return 70i32;
-                        }
-                    }
-                }
-                *msg_type = Viewtype::File;
-                if !raw_mime.is_null() {
-                    *raw_mime = reconcat_mime(Some("text"), as_opt_str((*c).ct_subtype)).strdup();
-                }
-                return 110i32;
-            }
-            2 => {
-                if strcmp(
-                    (*c).ct_subtype,
-                    b"gif\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    *msg_type = Viewtype::Gif;
-                } else if strcmp(
-                    (*c).ct_subtype,
-                    b"svg+xml\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    *msg_type = Viewtype::File;
-                    if !raw_mime.is_null() {
-                        *raw_mime =
-                            reconcat_mime(Some("image"), as_opt_str((*c).ct_subtype)).strdup();
-                    }
-                    return 110i32;
-                } else {
-                    *msg_type = Viewtype::Image;
-                }
-                if !raw_mime.is_null() {
-                    *raw_mime = reconcat_mime(Some("image"), as_opt_str((*c).ct_subtype)).strdup();
-                }
-                return 80i32;
-            }
-            3 => {
-                *msg_type = Viewtype::Audio;
-                if !raw_mime.is_null() {
-                    *raw_mime = reconcat_mime(Some("audio"), as_opt_str((*c).ct_subtype)).strdup();
-                }
-                return 90i32;
-            }
-            4 => {
-                *msg_type = Viewtype::Video;
-                if !raw_mime.is_null() {
-                    *raw_mime = reconcat_mime(Some("video"), as_opt_str((*c).ct_subtype)).strdup();
-                }
-                return 100i32;
-            }
-            _ => {
-                *msg_type = Viewtype::File;
-                if (*(*(*c).ct_type).tp_data.tp_discrete_type).dt_type
-                    == MAILMIME_DISCRETE_TYPE_APPLICATION as libc::c_int
-                    && strcmp(
-                        (*c).ct_subtype,
-                        b"autocrypt-setup\x00" as *const u8 as *const libc::c_char,
-                    ) == 0i32
-                {
-                    if !raw_mime.is_null() {
-                        *raw_mime = reconcat_mime(None, as_opt_str((*c).ct_subtype)).strdup();
-                    }
-                    return 111i32;
-                }
-                if !raw_mime.is_null() {
-                    *raw_mime = reconcat_mime(
-                        as_opt_str((*(*(*c).ct_type).tp_data.tp_discrete_type).dt_extension),
-                        as_opt_str((*c).ct_subtype),
-                    )
-                    .strdup();
-                }
-                return 110i32;
-            }
-        },
-        2 => {
-            if (*(*(*c).ct_type).tp_data.tp_composite_type).ct_type
-                == MAILMIME_COMPOSITE_TYPE_MULTIPART as libc::c_int
-            {
-                if strcmp(
-                    (*c).ct_subtype,
-                    b"alternative\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    return 10i32;
-                } else if strcmp(
-                    (*c).ct_subtype,
-                    b"related\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    return 20i32;
-                } else if strcmp(
-                    (*c).ct_subtype,
-                    b"encrypted\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    return 40i32;
-                } else if strcmp(
-                    (*c).ct_subtype,
-                    b"signed\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    return 46i32;
-                } else if strcmp(
-                    (*c).ct_subtype,
-                    b"mixed\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    return 30i32;
-                } else if strcmp(
-                    (*c).ct_subtype,
-                    b"report\x00" as *const u8 as *const libc::c_char,
-                ) == 0i32
-                {
-                    return 45i32;
-                } else {
-                    return 50i32;
-                }
-            } else {
-                if (*(*(*c).ct_type).tp_data.tp_composite_type).ct_type
-                    == MAILMIME_COMPOSITE_TYPE_MESSAGE as libc::c_int
-                {
-                    return 0i32;
-                }
-            }
-        }
-        _ => {}
+        /* add object? (we do not add all objects, eg. signatures etc. are ignored) */
+        self.parts.len() > old_part_count
     }
 
-    0
-}
-
-fn reconcat_mime(type_0: Option<&str>, subtype: Option<&str>) -> String {
-    let type_0 = type_0.unwrap_or("application");
-    let subtype = subtype.unwrap_or("octet-stream");
-
-    format!("{}/{}", type_0, subtype)
-}
-
-unsafe fn mailmime_is_attachment_disposition(mime: *mut mailmime) -> libc::c_int {
-    if !(*mime).mm_mime_fields.is_null() {
-        let mut cur: *mut clistiter = (*(*(*mime).mm_mime_fields).fld_list).first;
-        while !cur.is_null() {
-            let field: *mut mailmime_field = (if !cur.is_null() {
-                (*cur).data
-            } else {
-                ptr::null_mut()
-            }) as *mut mailmime_field;
-            if !field.is_null()
-                && (*field).fld_type == MAILMIME_FIELD_DISPOSITION as libc::c_int
-                && !(*field).fld_data.fld_disposition.is_null()
-            {
-                if !(*(*field).fld_data.fld_disposition).dsp_type.is_null()
-                    && (*(*(*field).fld_data.fld_disposition).dsp_type).dsp_type
-                        == MAILMIME_DISPOSITION_TYPE_ATTACHMENT as libc::c_int
-                {
-                    return 1i32;
-                }
-            }
-            cur = if !cur.is_null() {
-                (*cur).next
-            } else {
-                ptr::null_mut()
-            }
-        }
-    }
-
-    0
-}
-
-/* low-level-tools for working with mailmime structures directly */
-pub unsafe fn mailmime_find_ct_parameter(
-    mime: *mut mailmime,
-    name: *const libc::c_char,
-) -> *mut mailmime_parameter {
-    if mime.is_null()
-        || name.is_null()
-        || (*mime).mm_content_type.is_null()
-        || (*(*mime).mm_content_type).ct_parameters.is_null()
-    {
-        return ptr::null_mut();
-    }
-    let mut cur: *mut clistiter;
-    cur = (*(*(*mime).mm_content_type).ct_parameters).first;
-    while !cur.is_null() {
-        let param: *mut mailmime_parameter = (if !cur.is_null() {
-            (*cur).data
-        } else {
-            ptr::null_mut()
-        }) as *mut mailmime_parameter;
-        if !param.is_null() && !(*param).pa_name.is_null() {
-            if strcmp((*param).pa_name, name) == 0i32 {
-                return param;
-            }
-        }
-        cur = if !cur.is_null() {
-            (*cur).next
-        } else {
-            ptr::null_mut()
-        }
-    }
-
-    ptr::null_mut()
-}
-
-unsafe fn dc_mimeparser_add_single_part_if_known(
-    mimeparser: &mut dc_mimeparser_t,
-    mime: *mut mailmime,
-) -> libc::c_int {
-    let mut ok_to_continue = true;
-    let old_part_count = mimeparser.parts.len();
-    let mime_type: libc::c_int;
-    let mime_data: *mut mailmime_data;
-    let file_suffix: *mut libc::c_char = ptr::null_mut();
-    let mut desired_filename: *mut libc::c_char = ptr::null_mut();
-    let mut msg_type = Viewtype::Unknown;
-    let mut raw_mime: *mut libc::c_char = ptr::null_mut();
-    /* mmap_string_unref()'d if set */
-    let mut transfer_decoding_buffer: *mut libc::c_char = ptr::null_mut();
-    /* must not be free()'d */
-    let mut decoded_data: *const libc::c_char = ptr::null();
-    let mut decoded_data_bytes = 0;
-    let mut simplifier: Option<Simplify> = None;
-    if !(mime.is_null() || (*mime).mm_data.mm_single.is_null()) {
-        mime_type = mailmime_get_mime_type(mime, &mut msg_type, &mut raw_mime);
-        mime_data = (*mime).mm_data.mm_single;
-        /* MAILMIME_DATA_FILE indicates, the data is in a file; AFAIK this is not used on parsing */
-        if !((*mime_data).dt_type != MAILMIME_DATA_TEXT as libc::c_int
-            || (*mime_data).dt_data.dt_text.dt_data.is_null()
-            || (*mime_data).dt_data.dt_text.dt_length <= 0)
-        {
-            /* regard `Content-Transfer-Encoding:` */
-            if !(0
-                == mailmime_transfer_decode(
-                    mime,
-                    &mut decoded_data,
-                    &mut decoded_data_bytes,
-                    &mut transfer_decoding_buffer,
-                ))
-            {
-                /* no always error - but no data */
-                match mime_type {
-                    60 | 70 => {
-                        if simplifier.is_none() {
-                            simplifier = Some(Simplify::new());
-                        }
-                        /* get from `Content-Type: text/...; charset=utf-8`; must not be free()'d */
-                        let charset = mailmime_content_charset_get((*mime).mm_content_type);
-                        if !charset.is_null()
-                            && strcmp(charset, b"utf-8\x00" as *const u8 as *const libc::c_char)
-                                != 0i32
-                            && strcmp(charset, b"UTF-8\x00" as *const u8 as *const libc::c_char)
-                                != 0i32
-                        {
-                            if let Some(encoding) = Charset::for_label(
-                                CStr::from_ptr(charset).to_str().unwrap().as_bytes(),
-                            ) {
-                                let data = std::slice::from_raw_parts(
-                                    decoded_data as *const u8,
-                                    decoded_data_bytes,
-                                );
-
-                                let (res, _, _) = encoding.decode(data);
-                                info!(mimeparser.context, 0, "decoded message: '{}'", res);
-                                if res.is_empty() {
-                                    /* no error - but nothing to add */
-                                    ok_to_continue = false;
-                                } else {
-                                    let b = res.as_bytes();
-                                    decoded_data = b.as_ptr() as *const libc::c_char;
-                                    decoded_data_bytes = b.len();
-                                    std::mem::forget(res);
-                                }
-                            } else {
-                                warn!(
-                                    mimeparser.context,
-                                    0,
-                                    "Cannot convert {} bytes from \"{}\" to \"utf-8\".",
-                                    decoded_data_bytes as libc::c_int,
-                                    as_str(charset),
-                                );
-                            }
-                        }
-                        if ok_to_continue {
-                            /* check header directly as is_send_by_messenger is not yet set up */
-                            let is_msgrmsg =
-                                !dc_mimeparser_lookup_optional_field(&mimeparser, "Chat-Version")
-                                    .is_null();
-
-                            let simplified_txt =
-                                if decoded_data_bytes <= 0 || decoded_data.is_null() {
-                                    "".into()
-                                } else {
-                                    let input_c = strndup(decoded_data, decoded_data_bytes as _);
-                                    let input = to_string_lossy(input_c);
-                                    let is_html = mime_type == 70;
-                                    free(input_c as *mut _);
-
-                                    simplifier.unwrap().simplify(&input, is_html, is_msgrmsg)
-                                };
-                            if !simplified_txt.is_empty() {
-                                let mut part = dc_mimepart_new();
-                                part.type_0 = Viewtype::Text;
-                                part.int_mimetype = mime_type;
-                                part.msg = Some(simplified_txt);
-                                part.msg_raw =
-                                    strndup(decoded_data, decoded_data_bytes as libc::c_ulong);
-                                do_add_single_part(mimeparser, part);
-                            }
-
-                            if simplifier.unwrap().is_forwarded {
-                                mimeparser.is_forwarded = 1i32
-                            }
-                        }
-                    }
-                    80 | 90 | 100 | 110 | 111 => {
-                        /* try to get file name from
-                           `Content-Disposition: ... filename*=...`
-                        or `Content-Disposition: ... filename*0*=... filename*1*=... filename*2*=...`
-                        or `Content-Disposition: ... filename=...` */
-                        let mut filename_parts = String::new();
-                        let mut cur1: *mut clistiter = (*(*(*mime).mm_mime_fields).fld_list).first;
-                        while !cur1.is_null() {
-                            let field: *mut mailmime_field = (if !cur1.is_null() {
-                                (*cur1).data
-                            } else {
-                                ptr::null_mut()
-                            })
-                                as *mut mailmime_field;
-                            if !field.is_null()
-                                && (*field).fld_type == MAILMIME_FIELD_DISPOSITION as libc::c_int
-                                && !(*field).fld_data.fld_disposition.is_null()
-                            {
-                                let file_disposition: *mut mailmime_disposition =
-                                    (*field).fld_data.fld_disposition;
-                                if !file_disposition.is_null() {
-                                    let mut cur2: *mut clistiter =
-                                        (*(*file_disposition).dsp_parms).first;
-                                    while !cur2.is_null() {
-                                        let dsp_param: *mut mailmime_disposition_parm =
-                                            (if !cur2.is_null() {
-                                                (*cur2).data
-                                            } else {
-                                                ptr::null_mut()
-                                            })
-                                                as *mut mailmime_disposition_parm;
-                                        if !dsp_param.is_null() {
-                                            if (*dsp_param).pa_type
-                                                == MAILMIME_DISPOSITION_PARM_PARAMETER
-                                                    as libc::c_int
-                                                && !(*dsp_param).pa_data.pa_parameter.is_null()
-                                                && !(*(*dsp_param).pa_data.pa_parameter)
-                                                    .pa_name
-                                                    .is_null()
-                                                && strncmp(
-                                                    (*(*dsp_param).pa_data.pa_parameter).pa_name,
-                                                    b"filename*\x00" as *const u8
-                                                        as *const libc::c_char,
-                                                    9,
-                                                ) == 0i32
-                                            {
-                                                filename_parts += &to_string(
-                                                    (*(*dsp_param).pa_data.pa_parameter).pa_value,
-                                                );
-                                            } else if (*dsp_param).pa_type
-                                                == MAILMIME_DISPOSITION_PARM_FILENAME as libc::c_int
-                                            {
-                                                desired_filename = dc_decode_header_words(
-                                                    (*dsp_param).pa_data.pa_filename,
-                                                )
-                                            }
-                                        }
-                                        cur2 = if !cur2.is_null() {
-                                            (*cur2).next
-                                        } else {
-                                            ptr::null_mut()
-                                        }
-                                    }
-                                }
-                                break;
-                            } else {
-                                cur1 = if !cur1.is_null() {
-                                    (*cur1).next
-                                } else {
-                                    ptr::null_mut()
-                                }
-                            }
-                        }
-                        if !filename_parts.is_empty() {
-                            free(desired_filename as *mut libc::c_void);
-                            let parts_c = CString::yolo(filename_parts);
-                            desired_filename = dc_decode_ext_header(parts_c.as_ptr());
-                        }
-                        if desired_filename.is_null() {
-                            let param = mailmime_find_ct_parameter(
-                                mime,
-                                b"name\x00" as *const u8 as *const libc::c_char,
-                            );
-                            if !param.is_null()
-                                && !(*param).pa_value.is_null()
-                                && 0 != *(*param).pa_value.offset(0isize) as libc::c_int
-                            {
-                                desired_filename = dc_strdup((*param).pa_value)
-                            }
-                        }
-                        /* if there is still no filename, guess one */
-                        if desired_filename.is_null() {
-                            if !(*mime).mm_content_type.is_null()
-                                && !(*(*mime).mm_content_type).ct_subtype.is_null()
-                            {
-                                desired_filename = dc_mprintf(
-                                    b"file.%s\x00" as *const u8 as *const libc::c_char,
-                                    (*(*mime).mm_content_type).ct_subtype,
-                                );
-                            } else {
-                                ok_to_continue = false;
-                            }
-                        }
-                        if ok_to_continue {
-                            if strncmp(
-                                desired_filename,
-                                b"location\x00" as *const u8 as *const libc::c_char,
-                                8,
-                            ) == 0i32
-                                && strncmp(
-                                    desired_filename
-                                        .offset(strlen(desired_filename) as isize)
-                                        .offset(-4isize),
-                                    b".kml\x00" as *const u8 as *const libc::c_char,
-                                    4,
-                                ) == 0i32
-                            {
-                                if !decoded_data.is_null() && decoded_data_bytes > 0 {
-                                    let d =
-                                        dc_null_terminate(decoded_data, decoded_data_bytes as i32);
-                                    mimeparser.location_kml =
-                                        location::Kml::parse(mimeparser.context, as_str(d)).ok();
-                                    free(d.cast());
-                                }
-                            } else if strncmp(
-                                desired_filename,
-                                b"message\x00" as *const u8 as *const libc::c_char,
-                                7,
-                            ) == 0i32
-                                && strncmp(
-                                    desired_filename
-                                        .offset(strlen(desired_filename) as isize)
-                                        .offset(-4isize),
-                                    b".kml\x00" as *const u8 as *const libc::c_char,
-                                    4,
-                                ) == 0i32
-                            {
-                                if !decoded_data.is_null() && decoded_data_bytes > 0 {
-                                    let d =
-                                        dc_null_terminate(decoded_data, decoded_data_bytes as i32);
-                                    mimeparser.message_kml =
-                                        location::Kml::parse(mimeparser.context, as_str(d)).ok();
-                                    free(d.cast());
-                                }
-                            } else {
-                                dc_replace_bad_utf8_chars(desired_filename);
-                                do_add_single_file_part(
-                                    mimeparser,
-                                    msg_type,
-                                    mime_type,
-                                    raw_mime,
-                                    decoded_data,
-                                    decoded_data_bytes,
-                                    desired_filename,
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    /* add object? (we do not add all objects, eg. signatures etc. are ignored) */
-    if !transfer_decoding_buffer.is_null() {
-        mmap_string_unref(transfer_decoding_buffer);
-    }
-    free(file_suffix as *mut libc::c_void);
-    free(desired_filename as *mut libc::c_void);
-    free(raw_mime as *mut libc::c_void);
-    (mimeparser.parts.len() > old_part_count) as libc::c_int
-}
-
-#[allow(non_snake_case)]
-unsafe fn do_add_single_file_part(
-    parser: &mut dc_mimeparser_t,
-    msg_type: Viewtype,
-    mime_type: libc::c_int,
-    raw_mime: *const libc::c_char,
-    decoded_data: *const libc::c_char,
-    decoded_data_bytes: size_t,
-    desired_filename: *const libc::c_char,
-) {
-    let pathNfilename: *mut libc::c_char;
-    /* create a free file name to use */
-    pathNfilename = dc_get_fine_pathNfilename(
-        (*parser).context,
-        b"$BLOBDIR\x00" as *const u8 as *const libc::c_char,
-        desired_filename,
-    );
-    if !pathNfilename.is_null() {
-        /* copy data to file */
-        if !(dc_write_file(
-            (*parser).context,
-            pathNfilename,
-            decoded_data as *const libc::c_void,
-            decoded_data_bytes,
-        ) == 0i32)
-        {
-            let mut part = dc_mimepart_new();
-            part.type_0 = msg_type;
-            part.int_mimetype = mime_type;
-            part.bytes = decoded_data_bytes as libc::c_int;
-            part.param.set(Param::File, as_str(pathNfilename));
-            part.param.set(Param::MimeType, as_str(raw_mime));
-            if mime_type == 80 {
-                assert!(!decoded_data.is_null(), "invalid image data");
-                let data = std::slice::from_raw_parts(
-                    decoded_data as *const u8,
-                    decoded_data_bytes as usize,
+    unsafe fn do_add_single_file_part(
+        &mut self,
+        msg_type: Viewtype,
+        mime_type: libc::c_int,
+        raw_mime: Option<&String>,
+        decoded_data: &[u8],
+        desired_filename: &str,
+    ) {
+        /* write decoded data to new blob file */
+        let bpath = match self.context.new_blob_file(desired_filename, decoded_data) {
+            Ok(path) => path,
+            Err(err) => {
+                error!(
+                    self.context,
+                    "Could not add blob for mime part {}, error {}", desired_filename, err
                 );
-
-                if let Ok((width, height)) = dc_get_filemeta(data) {
-                    part.param.set_int(Param::Width, width as i32);
-                    part.param.set_int(Param::Height, height as i32);
-                }
+                return;
             }
-            do_add_single_part(parser, part);
+        };
+
+        let mut part = Part::default();
+        part.typ = msg_type;
+        part.mimetype = mime_type;
+        part.bytes = decoded_data.len() as libc::c_int;
+        part.param.set(Param::File, bpath);
+        if let Some(raw_mime) = raw_mime {
+            part.param.set(Param::MimeType, raw_mime);
         }
-    }
-    free(pathNfilename as *mut libc::c_void);
-}
 
-unsafe fn do_add_single_part(parser: &mut dc_mimeparser_t, mut part: dc_mimepart_t) {
-    if (*parser).e2ee_helper.encrypted && (*parser).e2ee_helper.signatures.len() > 0 {
-        part.param.set_int(Param::GuranteeE2ee, 1);
-    } else if (*parser).e2ee_helper.encrypted {
-        part.param.set_int(Param::ErroneousE2ee, 0x2);
-    }
-    parser.parts.push(part);
-}
-
-// TODO should return bool /rtn
-pub unsafe fn mailmime_transfer_decode(
-    mime: *mut mailmime,
-    ret_decoded_data: *mut *const libc::c_char,
-    ret_decoded_data_bytes: *mut size_t,
-    ret_to_mmap_string_unref: *mut *mut libc::c_char,
-) -> libc::c_int {
-    let mut mime_transfer_encoding: libc::c_int = MAILMIME_MECHANISM_BINARY as libc::c_int;
-    let mime_data: *mut mailmime_data;
-    /* must not be free()'d */
-    let decoded_data: *const libc::c_char;
-    let mut decoded_data_bytes: size_t = 0i32 as size_t;
-    /* mmap_string_unref()'d if set */
-    let mut transfer_decoding_buffer: *mut libc::c_char = ptr::null_mut();
-    if mime.is_null()
-        || ret_decoded_data.is_null()
-        || ret_decoded_data_bytes.is_null()
-        || ret_to_mmap_string_unref.is_null()
-        || !(*ret_decoded_data).is_null()
-        || *ret_decoded_data_bytes != 0
-        || !(*ret_to_mmap_string_unref).is_null()
-    {
-        return 0i32;
-    }
-    mime_data = (*mime).mm_data.mm_single;
-    if !(*mime).mm_mime_fields.is_null() {
-        let mut cur: *mut clistiter;
-        cur = (*(*(*mime).mm_mime_fields).fld_list).first;
-        while !cur.is_null() {
-            let field: *mut mailmime_field = (if !cur.is_null() {
-                (*cur).data
-            } else {
-                ptr::null_mut()
-            }) as *mut mailmime_field;
-            if !field.is_null()
-                && (*field).fld_type == MAILMIME_FIELD_TRANSFER_ENCODING as libc::c_int
-                && !(*field).fld_data.fld_encoding.is_null()
-            {
-                mime_transfer_encoding = (*(*field).fld_data.fld_encoding).enc_type;
-                break;
-            } else {
-                cur = if !cur.is_null() {
-                    (*cur).next
-                } else {
-                    ptr::null_mut()
-                }
+        if mime_type == DC_MIMETYPE_IMAGE {
+            if let Ok((width, height)) = dc_get_filemeta(decoded_data) {
+                part.param.set_int(Param::Width, width as i32);
+                part.param.set_int(Param::Height, height as i32);
             }
         }
+        self.do_add_single_part(part);
     }
-    if mime_transfer_encoding == MAILMIME_MECHANISM_7BIT as libc::c_int
-        || mime_transfer_encoding == MAILMIME_MECHANISM_8BIT as libc::c_int
-        || mime_transfer_encoding == MAILMIME_MECHANISM_BINARY as libc::c_int
-    {
-        decoded_data = (*mime_data).dt_data.dt_text.dt_data;
-        decoded_data_bytes = (*mime_data).dt_data.dt_text.dt_length;
-        if decoded_data.is_null() || decoded_data_bytes <= 0 {
-            return 0i32;
-        }
-    } else {
-        let r: libc::c_int;
-        let mut current_index: size_t = 0i32 as size_t;
-        r = mailmime_part_parse(
-            (*mime_data).dt_data.dt_text.dt_data,
-            (*mime_data).dt_data.dt_text.dt_length,
-            &mut current_index,
-            mime_transfer_encoding,
-            &mut transfer_decoding_buffer,
-            &mut decoded_data_bytes,
-        );
-        if r != MAILIMF_NO_ERROR as libc::c_int
-            || transfer_decoding_buffer.is_null()
-            || decoded_data_bytes <= 0
-        {
-            return 0i32;
-        }
-        decoded_data = transfer_decoding_buffer
-    }
-    *ret_decoded_data = decoded_data;
-    *ret_decoded_data_bytes = decoded_data_bytes;
-    *ret_to_mmap_string_unref = transfer_decoding_buffer;
 
-    1
-}
-
-pub unsafe fn dc_mimeparser_is_mailinglist_message(mimeparser: &dc_mimeparser_t) -> bool {
-    if !dc_mimeparser_lookup_field(&mimeparser, "List-Id").is_null() {
-        return true;
+    fn do_add_single_part(&mut self, mut part: Part) {
+        if self.encrypted && self.signatures.len() > 0 {
+            part.param.set_int(Param::GuranteeE2ee, 1);
+        } else if self.encrypted {
+            part.param.set_int(Param::ErroneousE2ee, 0x2);
+        }
+        self.parts.push(part);
     }
-    let precedence: *mut mailimf_optional_field =
-        dc_mimeparser_lookup_optional_field(mimeparser, "Precedence");
-    if !precedence.is_null() {
-        if strcasecmp(
-            (*precedence).fld_value,
-            b"list\x00" as *const u8 as *const libc::c_char,
-        ) == 0i32
-            || strcasecmp(
-                (*precedence).fld_value,
-                b"bulk\x00" as *const u8 as *const libc::c_char,
-            ) == 0i32
-        {
+
+    pub fn is_mailinglist_message(&self) -> bool {
+        if self.lookup_field("List-Id").is_some() {
             return true;
         }
+
+        if let Some(precedence) = self.lookup_optional_field("Precedence") {
+            if precedence == "list" || precedence == "bulk" {
+                return true;
+            }
+        }
+
+        false
     }
 
-    false
-}
+    pub unsafe fn sender_equals_recipient(&self) -> bool {
+        if self.header_root.is_null() {
+            return false;
+        }
 
-pub unsafe fn dc_mimeparser_sender_equals_recipient(mimeparser: &dc_mimeparser_t) -> libc::c_int {
-    let mut sender_equals_recipient: libc::c_int = 0i32;
-    let fld: *const mailimf_field;
-    let mut fld_from: *const mailimf_from = ptr::null();
-    let mb: *mut mailimf_mailbox;
+        let mut sender_equals_recipient = false;
+        let mut fld_from: *const mailimf_from = ptr::null();
 
-    if !mimeparser.header_root.is_null() {
         /* get From: and check there is exactly one sender */
-        fld = mailimf_find_field(mimeparser.header_root, MAILIMF_FIELD_FROM as libc::c_int);
+        let fld = wrapmime::mailimf_find_field(self.header_root, MAILIMF_FIELD_FROM as libc::c_int);
         if !(fld.is_null()
             || {
                 fld_from = (*fld).fld_data.fld_from;
@@ -1491,238 +845,286 @@ pub unsafe fn dc_mimeparser_sender_equals_recipient(mimeparser: &dc_mimeparser_t
             || (*(*fld_from).frm_mb_list).mb_list.is_null()
             || (*(*(*fld_from).frm_mb_list).mb_list).count != 1i32)
         {
-            mb = (if !(*(*(*fld_from).frm_mb_list).mb_list).first.is_null() {
+            let mb = (if !(*(*(*fld_from).frm_mb_list).mb_list).first.is_null() {
                 (*(*(*(*fld_from).frm_mb_list).mb_list).first).data
             } else {
                 ptr::null_mut()
             }) as *mut mailimf_mailbox;
+
             if !mb.is_null() {
                 let from_addr_norm = addr_normalize(as_str((*mb).mb_addr_spec));
-                let recipients = mailimf_get_recipients(mimeparser.header_root);
-                if recipients.len() == 1 {
-                    if recipients.contains(from_addr_norm) {
-                        sender_equals_recipient = 1i32;
-                    }
+                let recipients = wrapmime::mailimf_get_recipients(self.header_root);
+                if recipients.len() == 1 && recipients.contains(from_addr_norm) {
+                    sender_equals_recipient = true;
                 }
             }
         }
+
+        sender_equals_recipient
     }
 
-    sender_equals_recipient
-}
+    pub fn repl_msg_by_error(&mut self, error_msg: impl AsRef<str>) {
+        if self.parts.is_empty() {
+            return;
+        }
 
-pub unsafe fn mailimf_get_recipients(imffields: *mut mailimf_fields) -> HashSet<String> {
-    /* returned addresses are normalized. */
-    let mut recipients: HashSet<String> = Default::default();
-    let mut cur1: *mut clistiter;
-    cur1 = (*(*imffields).fld_list).first;
-    while !cur1.is_null() {
-        let fld: *mut mailimf_field = (if !cur1.is_null() {
-            (*cur1).data
-        } else {
-            ptr::null_mut()
-        }) as *mut mailimf_field;
-        let fld_to: *mut mailimf_to;
-        let fld_cc: *mut mailimf_cc;
-        let mut addr_list: *mut mailimf_address_list = ptr::null_mut();
-        // TODO match on enums /rtn
-        match (*fld).fld_type {
-            13 => {
-                fld_to = (*fld).fld_data.fld_to;
-                if !fld_to.is_null() {
-                    addr_list = (*fld_to).to_addr_list
-                }
-            }
-            14 => {
-                fld_cc = (*fld).fld_data.fld_cc;
-                if !fld_cc.is_null() {
-                    addr_list = (*fld_cc).cc_addr_list
-                }
-            }
-            _ => {}
-        }
-        if !addr_list.is_null() {
-            let mut cur2: *mut clistiter;
-            cur2 = (*(*addr_list).ad_list).first;
-            while !cur2.is_null() {
-                let adr: *mut mailimf_address = (if !cur2.is_null() {
-                    (*cur2).data
-                } else {
-                    ptr::null_mut()
-                }) as *mut mailimf_address;
-                if !adr.is_null() {
-                    if (*adr).ad_type == MAILIMF_ADDRESS_MAILBOX as libc::c_int {
-                        mailimf_get_recipients__add_addr(
-                            &mut recipients,
-                            (*adr).ad_data.ad_mailbox,
-                        );
-                    } else if (*adr).ad_type == MAILIMF_ADDRESS_GROUP as libc::c_int {
-                        let group: *mut mailimf_group = (*adr).ad_data.ad_group;
-                        if !group.is_null() && !(*group).grp_mb_list.is_null() {
-                            let mut cur3: *mut clistiter;
-                            cur3 = (*(*(*group).grp_mb_list).mb_list).first;
-                            while !cur3.is_null() {
-                                mailimf_get_recipients__add_addr(
-                                    &mut recipients,
-                                    (if !cur3.is_null() {
-                                        (*cur3).data
-                                    } else {
-                                        ptr::null_mut()
-                                    }) as *mut mailimf_mailbox,
-                                );
-                                cur3 = if !cur3.is_null() {
-                                    (*cur3).next
-                                } else {
-                                    ptr::null_mut()
-                                }
-                            }
-                        }
-                    }
-                }
-                cur2 = if !cur2.is_null() {
-                    (*cur2).next
-                } else {
-                    ptr::null_mut()
-                }
-            }
-        }
-        cur1 = if !cur1.is_null() {
-            (*cur1).next
-        } else {
-            ptr::null_mut()
-        }
+        let part = &mut self.parts[0];
+        part.typ = Viewtype::Text;
+        part.msg = Some(format!("[{}]", error_msg.as_ref()));
+        self.parts.truncate(1);
+
+        assert_eq!(self.parts.len(), 1);
     }
 
-    recipients
-}
-
-/* ******************************************************************************
- * debug output
- ******************************************************************************/
-/* DEBUG_MIME_OUTPUT */
-/* ******************************************************************************
- * low-level-tools for getting a list of all recipients
- ******************************************************************************/
-
-#[allow(non_snake_case)]
-unsafe fn mailimf_get_recipients__add_addr(
-    recipients: &mut HashSet<String>,
-    mb: *mut mailimf_mailbox,
-) {
-    if !mb.is_null() {
-        let addr_norm = addr_normalize(as_str((*mb).mb_addr_spec));
-        recipients.insert(addr_norm.into());
-    };
-}
-
-/*the result is a pointer to mime, must not be freed*/
-pub unsafe fn mailimf_find_field(
-    header: *mut mailimf_fields,
-    wanted_fld_type: libc::c_int,
-) -> *mut mailimf_field {
-    if header.is_null() || (*header).fld_list.is_null() {
-        return ptr::null_mut();
-    }
-    let mut cur1: *mut clistiter = (*(*header).fld_list).first;
-    while !cur1.is_null() {
-        let field: *mut mailimf_field = (if !cur1.is_null() {
-            (*cur1).data
-        } else {
-            ptr::null_mut()
-        }) as *mut mailimf_field;
-        if !field.is_null() {
-            if (*field).fld_type == wanted_fld_type {
-                return field;
+    pub fn get_rfc724_mid(&mut self) -> Option<String> {
+        // get Message-ID from header
+        if let Some(field) = self.lookup_field_typ("Message-ID", MAILIMF_FIELD_MESSAGE_ID) {
+            unsafe {
+                let fld_message_id = (*field).fld_data.fld_message_id;
+                if !fld_message_id.is_null() {
+                    return Some(to_string_lossy((*fld_message_id).mid_value));
+                }
             }
         }
-        cur1 = if !cur1.is_null() {
-            (*cur1).next
-        } else {
-            ptr::null_mut()
-        }
+        None
     }
-
-    ptr::null_mut()
 }
 
-pub unsafe fn dc_mimeparser_repl_msg_by_error(
-    mimeparser: &mut dc_mimeparser_t,
-    error_msg: *const libc::c_char,
-) {
-    if mimeparser.parts.is_empty() {
+impl<'a> Drop for MimeParser<'a> {
+    fn drop(&mut self) {
+        if !self.header_protected.is_null() {
+            unsafe { mailimf_fields_free(self.header_protected) };
+        }
+        if !self.mimeroot.is_null() {
+            unsafe { mailmime_free(self.mimeroot) };
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct Part {
+    pub typ: Viewtype,
+    pub is_meta: bool,
+    pub mimetype: i32,
+    pub msg: Option<String>,
+    pub msg_raw: Option<String>,
+    pub bytes: i32,
+    pub param: Params,
+}
+
+unsafe fn hash_header(out: &mut HashMap<String, *mut mailimf_field>, in_0: *const mailimf_fields) {
+    if in_0.is_null() {
         return;
     }
-    let part = &mut mimeparser.parts[0];
-    part.type_0 = Viewtype::Text;
-    part.msg = Some(format!("[{}]", to_string(error_msg)));
-    for part in mimeparser.parts.drain(1..) {
-        dc_mimepart_unref(part);
-    }
-    assert_eq!(mimeparser.parts.len(), 1);
-}
 
-/*the result is a pointer to mime, must not be freed*/
-pub unsafe fn mailmime_find_mailimf_fields(mime: *mut mailmime) -> *mut mailimf_fields {
-    if mime.is_null() {
-        return ptr::null_mut();
-    }
+    for cur in (*(*in_0).fld_list).into_iter() {
+        let field = cur as *mut mailimf_field;
+        // TODO match on enums /rtn
 
-    match (*mime).mm_type as _ {
-        MAILMIME_MULTIPLE => {
-            let mut cur: *mut clistiter = (*(*mime).mm_data.mm_multipart.mm_mp_list).first;
-            while !cur.is_null() {
-                let header: *mut mailimf_fields = mailmime_find_mailimf_fields(
-                    (if !cur.is_null() {
-                        (*cur).data
-                    } else {
-                        ptr::null_mut()
-                    }) as *mut mailmime,
-                );
-                if !header.is_null() {
-                    return header;
-                }
-                cur = if !cur.is_null() {
-                    (*cur).next
+        let key = match (*field).fld_type as libc::c_uint {
+            MAILIMF_FIELD_RETURN_PATH => Some("Return-Path".to_string()),
+            MAILIMF_FIELD_ORIG_DATE => Some("Date".to_string()),
+            MAILIMF_FIELD_FROM => Some("From".to_string()),
+            MAILIMF_FIELD_SENDER => Some("Sender".to_string()),
+            MAILIMF_FIELD_REPLY_TO => Some("Reply-To".to_string()),
+            MAILIMF_FIELD_TO => Some("To".to_string()),
+            MAILIMF_FIELD_CC => Some("Cc".to_string()),
+            MAILIMF_FIELD_BCC => Some("Bcc".to_string()),
+            MAILIMF_FIELD_MESSAGE_ID => Some("Message-ID".to_string()),
+            MAILIMF_FIELD_IN_REPLY_TO => Some("In-Reply-To".to_string()),
+            MAILIMF_FIELD_REFERENCES => Some("References".to_string()),
+            MAILIMF_FIELD_SUBJECT => Some("Subject".to_string()),
+            MAILIMF_FIELD_OPTIONAL_FIELD => {
+                // MAILIMF_FIELD_OPTIONAL_FIELD
+                let optional_field = (*field).fld_data.fld_optional_field;
+                // XXX the optional field sometimes contains invalid UTF8
+                // which should not happen (according to the mime standard).
+                // This might point to a bug in our mime parsing/processing
+                // logic. As mmime/dc_mimeparser is scheduled fore replacement
+                // anyway we just use a lossy conversion.
+
+                if !optional_field.is_null() {
+                    Some(to_string_lossy((*optional_field).fld_name))
                 } else {
-                    ptr::null_mut()
+                    None
                 }
             }
-        }
-        MAILMIME_MESSAGE => return (*mime).mm_data.mm_message.mm_fields,
-        _ => {}
-    }
-
-    ptr::null_mut()
-}
-
-pub unsafe fn mailimf_find_optional_field(
-    header: *mut mailimf_fields,
-    wanted_fld_name: *const libc::c_char,
-) -> *mut mailimf_optional_field {
-    if header.is_null() || (*header).fld_list.is_null() {
-        return ptr::null_mut();
-    }
-    let mut cur1: *mut clistiter = (*(*header).fld_list).first;
-    while !cur1.is_null() {
-        let field: *mut mailimf_field = (if !cur1.is_null() {
-            (*cur1).data
-        } else {
-            ptr::null_mut()
-        }) as *mut mailimf_field;
-        if !field.is_null() && (*field).fld_type == MAILIMF_FIELD_OPTIONAL_FIELD as libc::c_int {
-            let optional_field: *mut mailimf_optional_field = (*field).fld_data.fld_optional_field;
-            if !optional_field.is_null()
-                && !(*optional_field).fld_name.is_null()
-                && !(*optional_field).fld_value.is_null()
-                && strcasecmp((*optional_field).fld_name, wanted_fld_name) == 0i32
+            _ => None,
+        };
+        if let Some(key) = key {
+            if !out.contains_key(&key) || // key already exists, only overwrite known types (protected headers)
+                (*field).fld_type != MAILIMF_FIELD_OPTIONAL_FIELD as i32 || key.starts_with("Chat-")
             {
-                return optional_field;
+                out.insert(key, field);
             }
         }
-        cur1 = if !cur1.is_null() {
-            (*cur1).next
-        } else {
-            ptr::null_mut()
+    }
+}
+
+unsafe fn mailmime_get_mime_type(mime: *mut Mailmime) -> (libc::c_int, Viewtype, Option<String>) {
+    let c = (*mime).mm_content_type;
+
+    let unknown_type = (0, Viewtype::Unknown, None);
+
+    if c.is_null() || (*c).ct_type.is_null() {
+        return unknown_type;
+    }
+
+    match (*(*c).ct_type).tp_type as libc::c_uint {
+        MAILMIME_TYPE_DISCRETE_TYPE => match (*(*(*c).ct_type).tp_data.tp_discrete_type).dt_type
+            as libc::c_uint
+        {
+            MAILMIME_DISCRETE_TYPE_TEXT => {
+                if !mailmime_is_attachment_disposition(mime) {
+                    if strcmp(
+                        (*c).ct_subtype,
+                        b"plain\x00" as *const u8 as *const libc::c_char,
+                    ) == 0i32
+                    {
+                        return (DC_MIMETYPE_TEXT_PLAIN, Viewtype::Text, None);
+                    } else if strcmp(
+                        (*c).ct_subtype,
+                        b"html\x00" as *const u8 as *const libc::c_char,
+                    ) == 0i32
+                    {
+                        return (DC_MIMETYPE_TEXT_HTML, Viewtype::Text, None);
+                    }
+                }
+
+                let raw_mime = reconcat_mime(Some("text"), as_opt_str((*c).ct_subtype));
+                (DC_MIMETYPE_FILE, Viewtype::File, Some(raw_mime))
+            }
+            MAILMIME_DISCRETE_TYPE_IMAGE => {
+                let subtype = as_opt_str((*c).ct_subtype);
+                let msg_type = match subtype {
+                    Some("gif") => Viewtype::Gif,
+                    Some("svg+xml") => {
+                        let raw_mime = reconcat_mime(Some("image"), as_opt_str((*c).ct_subtype));
+                        return (DC_MIMETYPE_FILE, Viewtype::File, Some(raw_mime));
+                    }
+                    _ => Viewtype::Image,
+                };
+
+                let raw_mime = reconcat_mime(Some("image"), subtype);
+                (DC_MIMETYPE_IMAGE, msg_type, Some(raw_mime))
+            }
+            MAILMIME_DISCRETE_TYPE_AUDIO => {
+                let raw_mime = reconcat_mime(Some("audio"), as_opt_str((*c).ct_subtype));
+                (DC_MIMETYPE_AUDIO, Viewtype::Audio, Some(raw_mime))
+            }
+            MAILMIME_DISCRETE_TYPE_VIDEO => {
+                let raw_mime = reconcat_mime(Some("video"), as_opt_str((*c).ct_subtype));
+                (DC_MIMETYPE_VIDEO, Viewtype::Video, Some(raw_mime))
+            }
+            _ => {
+                if (*(*(*c).ct_type).tp_data.tp_discrete_type).dt_type
+                    == MAILMIME_DISCRETE_TYPE_APPLICATION as libc::c_int
+                    && strcmp(
+                        (*c).ct_subtype,
+                        b"autocrypt-setup\x00" as *const u8 as *const libc::c_char,
+                    ) == 0i32
+                {
+                    let raw_mime = reconcat_mime(None, as_opt_str((*c).ct_subtype));
+                    return (DC_MIMETYPE_AC_SETUP_FILE, Viewtype::File, Some(raw_mime));
+                }
+
+                let raw_mime = reconcat_mime(
+                    as_opt_str((*(*(*c).ct_type).tp_data.tp_discrete_type).dt_extension),
+                    as_opt_str((*c).ct_subtype),
+                );
+
+                (DC_MIMETYPE_FILE, Viewtype::File, Some(raw_mime))
+            }
+        },
+        MAILMIME_TYPE_COMPOSITE_TYPE => {
+            if (*(*(*c).ct_type).tp_data.tp_composite_type).ct_type
+                == MAILMIME_COMPOSITE_TYPE_MULTIPART as libc::c_int
+            {
+                let subtype = as_opt_str((*c).ct_subtype);
+
+                let mime_type = match subtype {
+                    Some("alternative") => DC_MIMETYPE_MP_ALTERNATIVE,
+                    Some("related") => DC_MIMETYPE_MP_RELATED,
+                    Some("encrypted") => {
+                        // maybe try_decrypt failed to decrypt
+                        // or it wasn't in proper Autocrypt format
+                        DC_MIMETYPE_MP_NOT_DECRYPTABLE
+                    }
+                    Some("signed") => DC_MIMETYPE_MP_SIGNED,
+                    Some("mixed") => DC_MIMETYPE_MP_MIXED,
+                    Some("report") => DC_MIMETYPE_MP_REPORT,
+                    _ => DC_MIMETYPE_MP_OTHER,
+                };
+
+                (mime_type, Viewtype::Unknown, None)
+            } else {
+                if (*(*(*c).ct_type).tp_data.tp_composite_type).ct_type
+                    == MAILMIME_COMPOSITE_TYPE_MESSAGE as libc::c_int
+                {
+                    // Enacapsulated messages, see https://www.w3.org/Protocols/rfc1341/7_3_Message.html
+                    // Also used as part "message/disposition-notification" of "multipart/report", which, however, will
+                    // be handled separatedly.
+                    // I've not seen any messages using this, so we do not attach these parts (maybe they're used to attach replies,
+                    // which are unwanted at all).
+                    // For now, we skip these parts at all; if desired, we could return DC_MIMETYPE_FILE/DC_MSG_FILE
+                    // for selected and known subparts.
+                }
+
+                unknown_type
+            }
+        }
+        _ => unknown_type,
+    }
+}
+
+fn reconcat_mime(typ: Option<&str>, subtype: Option<&str>) -> String {
+    let typ = typ.unwrap_or("application");
+    let subtype = subtype.unwrap_or("octet-stream");
+
+    format!("{}/{}", typ, subtype)
+}
+
+unsafe fn mailmime_is_attachment_disposition(mime: *mut Mailmime) -> bool {
+    if (*mime).mm_mime_fields.is_null() {
+        return false;
+    }
+
+    for cur in (*(*(*mime).mm_mime_fields).fld_list).into_iter() {
+        let field = cur as *mut mailmime_field;
+        if !field.is_null()
+            && (*field).fld_type == MAILMIME_FIELD_DISPOSITION as libc::c_int
+            && !(*field).fld_data.fld_disposition.is_null()
+        {
+            if !(*(*field).fld_data.fld_disposition).dsp_type.is_null()
+                && (*(*(*field).fld_data.fld_disposition).dsp_type).dsp_type
+                    == MAILMIME_DISPOSITION_TYPE_ATTACHMENT as libc::c_int
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/* low-level-tools for working with mailmime structures directly */
+pub unsafe fn mailmime_find_ct_parameter(
+    mime: *mut Mailmime,
+    name: &str,
+) -> *mut mailmime_parameter {
+    if mime.is_null()
+        || (*mime).mm_content_type.is_null()
+        || (*(*mime).mm_content_type).ct_parameters.is_null()
+    {
+        return ptr::null_mut();
+    }
+
+    for cur in (*(*(*mime).mm_content_type).ct_parameters).into_iter() {
+        let param = cur as *mut mailmime_parameter;
+        if !param.is_null() && !(*param).pa_name.is_null() {
+            if &to_string_lossy((*param).pa_name) == name {
+                return param;
+            }
         }
     }
 
@@ -1733,6 +1135,7 @@ pub unsafe fn mailimf_find_optional_field(
 mod tests {
     use super::*;
     use crate::test_utils::*;
+    use proptest::prelude::*;
     use std::ffi::CStr;
 
     #[test]
@@ -1740,17 +1143,16 @@ mod tests {
         unsafe {
             let txt: *const libc::c_char =
                 b"FieldA: ValueA\nFieldB: ValueB\n\x00" as *const u8 as *const libc::c_char;
-            let mut mime: *mut mailmime = ptr::null_mut();
-            let mut dummy: size_t = 0i32 as size_t;
+            let mut mime: *mut Mailmime = ptr::null_mut();
+            let mut dummy = 0;
             let res = mailmime_parse(txt, strlen(txt), &mut dummy, &mut mime);
-
             assert_eq!(res, MAIL_NO_ERROR as libc::c_int);
             assert!(!mime.is_null());
 
-            let fields: *mut mailimf_fields = mailmime_find_mailimf_fields(mime);
+            let fields: *mut mailimf_fields = wrapmime::mailmime_find_mailimf_fields(mime);
             assert!(!fields.is_null());
 
-            let mut of_a: *mut mailimf_optional_field = mailimf_find_optional_field(
+            let mut of_a: *mut mailimf_optional_field = wrapmime::mailimf_find_optional_field(
                 fields,
                 b"fielda\x00" as *const u8 as *const libc::c_char,
             );
@@ -1770,7 +1172,7 @@ mod tests {
                 "ValueA",
             );
 
-            of_a = mailimf_find_optional_field(
+            of_a = wrapmime::mailimf_find_optional_field(
                 fields,
                 b"FIELDA\x00" as *const u8 as *const libc::c_char,
             );
@@ -1790,7 +1192,7 @@ mod tests {
                 "ValueA",
             );
 
-            let of_b: *mut mailimf_optional_field = mailimf_find_optional_field(
+            let of_b: *mut mailimf_optional_field = wrapmime::mailimf_find_optional_field(
                 fields,
                 b"FieldB\x00" as *const u8 as *const libc::c_char,
             );
@@ -1807,33 +1209,72 @@ mod tests {
             mailmime_free(mime);
         }
     }
+
     #[test]
-    fn test_dc_mimeparser_with_context() {
+    fn test_dc_mimeparser_crash() {
+        let context = dummy_context();
+        let raw = include_bytes!("../test-data/message/issue_523.txt");
+        let mut mimeparser = MimeParser::new(&context.ctx);
+        unsafe {
+            mimeparser.parse(&raw[..]).unwrap();
+        };
+        assert_eq!(mimeparser.subject, None);
+        assert_eq!(mimeparser.parts.len(), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn test_dc_mailmime_parse_crash_fuzzy(data in "[!-~\t ]{2000,}") {
+            // this test doesn't exercise much of dc_mimeparser anymore
+            // because a missing From-field early aborts parsing
+            let context = dummy_context();
+            let mut mimeparser = MimeParser::new(&context.ctx);
+            unsafe {
+                assert!(mimeparser.parse(data.as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_rfc724_mid_exists() {
+        let context = dummy_context();
+        let raw = include_bytes!("../test-data/message/mail_with_message_id.txt");
+        let mut mimeparser = MimeParser::new(&context.ctx);
+        unsafe { mimeparser.parse(&raw[..]).unwrap() };
+        assert_eq!(
+            mimeparser.get_rfc724_mid(),
+            Some("2dfdbde7@example.org".into())
+        );
+    }
+
+    #[test]
+    fn test_get_rfc724_mid_not_exists() {
+        let context = dummy_context();
+        let raw = include_bytes!("../test-data/message/issue_523.txt");
+        let mut mimeparser = MimeParser::new(&context.ctx);
+        unsafe { mimeparser.parse(&raw[..]).unwrap() };
+        assert_eq!(mimeparser.get_rfc724_mid(), None);
+    }
+
+    #[test]
+    fn test_mimeparser_with_context() {
         unsafe {
             let context = dummy_context();
-            let raw = b"Content-Type: multipart/mixed; boundary=\"==break==\";\nSubject: outer-subject\nX-Special-A: special-a\nFoo: Bar\nChat-Version: 0.0\n\n--==break==\nContent-Type: text/plain; protected-headers=\"v1\";\nSubject: inner-subject\nX-Special-B: special-b\nFoo: Xy\nChat-Version: 1.0\n\ntest1\n\n--==break==--\n\n\x00";
-            let mut mimeparser = dc_mimeparser_parse(&context.ctx, &raw[..]);
+            let raw = b"From: hello\nContent-Type: multipart/mixed; boundary=\"==break==\";\nSubject: outer-subject\nX-Special-A: special-a\nFoo: Bar\nChat-Version: 0.0\n\n--==break==\nContent-Type: text/plain; protected-headers=\"v1\";\nSubject: inner-subject\nX-Special-B: special-b\nFoo: Xy\nChat-Version: 1.0\n\ntest1\n\n--==break==--\n\n\x00";
+            let mut mimeparser = MimeParser::new(&context.ctx);
+            mimeparser.parse(&raw[..]).unwrap();
 
-            assert_eq!(
-                &to_string(mimeparser.subject as *const libc::c_char),
-                "inner-subject",
-            );
+            assert_eq!(mimeparser.subject, Some("inner-subject".into()));
 
-            let mut of: *mut mailimf_optional_field =
-                dc_mimeparser_lookup_optional_field(&mimeparser, "X-Special-A");
-            assert_eq!(
-                &to_string((*of).fld_value as *const libc::c_char),
-                "special-a",
-            );
+            let of = mimeparser.lookup_optional_field("X-Special-A").unwrap();
+            assert_eq!(&of, "special-a");
 
-            of = dc_mimeparser_lookup_optional_field(&mimeparser, "Foo");
-            assert_eq!(&to_string((*of).fld_value as *const libc::c_char), "Bar",);
+            let of = mimeparser.lookup_optional_field("Foo").unwrap();
+            assert_eq!(&of, "Bar");
 
-            of = dc_mimeparser_lookup_optional_field(&mimeparser, "Chat-Version");
-            assert_eq!(&to_string((*of).fld_value as *const libc::c_char), "1.0",);
+            let of = mimeparser.lookup_optional_field("Chat-Version").unwrap();
+            assert_eq!(&of, "1.0");
             assert_eq!(mimeparser.parts.len(), 1);
-
-            dc_mimeparser_unref(&mut mimeparser);
         }
     }
 }

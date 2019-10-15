@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
 use std::io::Cursor;
-use std::slice;
+use std::path::Path;
 
-use libc;
 use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
 use pgp::ser::Serialize;
 use pgp::types::{KeyTrait, SecretKeyTrait};
@@ -12,7 +10,6 @@ use crate::constants::*;
 use crate::context::Context;
 use crate::dc_tools::*;
 use crate::sql::{self, Sql};
-use crate::x::*;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Key {
@@ -106,15 +103,6 @@ impl Key {
         }
     }
 
-    pub fn from_binary(data: *const u8, len: libc::c_int, key_type: KeyType) -> Option<Self> {
-        if data.is_null() || len == 0 {
-            return None;
-        }
-
-        let bytes = unsafe { slice::from_raw_parts(data, len as usize) };
-        Self::from_slice(bytes, key_type)
-    }
-
     pub fn from_armored_string(
         data: &str,
         key_type: KeyType,
@@ -152,11 +140,10 @@ impl Key {
     ) -> Option<Self> {
         let addr = self_addr.as_ref();
 
-        sql.query_row_col(
+        sql.query_get_value(
             context,
             "SELECT public_key FROM keypairs WHERE addr=? AND is_default=1;",
             &[addr],
-            0,
         )
         .and_then(|blob: Vec<u8>| Self::from_slice(&blob, KeyType::Public))
     }
@@ -166,19 +153,18 @@ impl Key {
         self_addr: impl AsRef<str>,
         sql: &Sql,
     ) -> Option<Self> {
-        sql.query_row_col(
+        sql.query_get_value(
             context,
             "SELECT private_key FROM keypairs WHERE addr=? AND is_default=1;",
             &[self_addr.as_ref()],
-            0,
         )
         .and_then(|blob: Vec<u8>| Self::from_slice(&blob, KeyType::Private))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Key::Public(k) => k.to_bytes().unwrap(),
-            Key::Secret(k) => k.to_bytes().unwrap(),
+            Key::Public(k) => k.to_bytes().unwrap_or_default(),
+            Key::Secret(k) => k.to_bytes().unwrap_or_default(),
         }
     }
 
@@ -228,30 +214,15 @@ impl Key {
             .expect("failed to serialize key")
     }
 
-    pub fn write_asc_to_file(&self, file: *const libc::c_char, context: &Context) -> bool {
-        if file.is_null() {
-            return false;
-        }
+    pub fn write_asc_to_file(&self, file: impl AsRef<Path>, context: &Context) -> bool {
+        let file_content = self.to_asc(None).into_bytes();
 
-        let file_content = self.to_asc(None);
-        let file_content_c = CString::new(file_content).unwrap();
-
-        let success = if 0
-            == unsafe {
-                dc_write_file(
-                    context,
-                    file,
-                    file_content_c.as_ptr() as *const libc::c_void,
-                    file_content_c.as_bytes().len(),
-                )
-            } {
-            error!(context, 0, "Cannot write key to {}", to_string(file));
-            false
-        } else {
+        if dc_write_file(context, &file, &file_content) {
             true
-        };
-
-        success
+        } else {
+            error!(context, "Cannot write key to {}", file.as_ref().display());
+            false
+        }
     }
 
     pub fn fingerprint(&self) -> String {
@@ -261,21 +232,9 @@ impl Key {
         }
     }
 
-    pub fn fingerprint_c(&self) -> *mut libc::c_char {
-        let res = CString::new(self.fingerprint()).unwrap();
-
-        unsafe { strdup(res.as_ptr()) }
-    }
-
     pub fn formatted_fingerprint(&self) -> String {
         let rawhex = self.fingerprint();
         dc_format_fingerprint(&rawhex)
-    }
-
-    pub fn formatted_fingerprint_c(&self) -> *mut libc::c_char {
-        let res = CString::new(self.formatted_fingerprint()).unwrap();
-
-        unsafe { strdup(res.as_ptr()) }
     }
 
     pub fn split_key(&self) -> Option<Key> {
@@ -294,14 +253,14 @@ pub fn dc_key_save_self_keypair(
     public_key: &Key,
     private_key: &Key,
     addr: impl AsRef<str>,
-    is_default: libc::c_int,
+    is_default: bool,
     sql: &Sql,
 ) -> bool {
     sql::execute(
         context,
         sql,
         "INSERT INTO keypairs (addr, is_default, public_key, private_key, created) VALUES (?,?,?,?,?);",
-        params![addr.as_ref(), is_default, public_key.to_bytes(), private_key.to_bytes(), time()],
+        params![addr.as_ref(), is_default as i32, public_key.to_bytes(), private_key.to_bytes(), time()],
     ).is_ok()
 }
 
@@ -323,28 +282,12 @@ pub fn dc_format_fingerprint(fingerprint: &str) -> String {
     res
 }
 
-pub fn dc_format_fingerprint_c(fp: *const libc::c_char) -> *mut libc::c_char {
-    let input = unsafe { CStr::from_ptr(fp).to_str().unwrap() };
-    let res = dc_format_fingerprint(input);
-    let res_c = CString::new(res).unwrap();
-
-    unsafe { strdup(res_c.as_ptr()) }
-}
-
 /// Bring a human-readable or otherwise formatted fingerprint back to the 40-characters-uppercase-hex format.
 pub fn dc_normalize_fingerprint(fp: &str) -> String {
     fp.to_uppercase()
         .chars()
         .filter(|&c| c >= '0' && c <= '9' || c >= 'A' && c <= 'F')
         .collect()
-}
-
-pub fn dc_normalize_fingerprint_c(fp: *const libc::c_char) -> *mut libc::c_char {
-    let input = unsafe { CStr::from_ptr(fp).to_str().unwrap() };
-    let res = dc_normalize_fingerprint(input);
-    let res_c = CString::new(res).unwrap();
-
-    unsafe { strdup(res_c.as_ptr()) }
 }
 
 #[cfg(test)]
@@ -447,6 +390,27 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
         let binary = private_key.to_bytes();
         let private_key2 = Key::from_slice(&binary, KeyType::Private).expect("invalid private key");
         assert_eq!(private_key, private_key2);
+    }
+
+    #[test]
+    fn test_from_slice_bad_data() {
+        let mut bad_data: [u8; 4096] = [0; 4096];
+
+        for i in 0..4096 {
+            bad_data[i] = (i & 0xff) as u8;
+        }
+
+        for j in 0..(4096 / 40) {
+            let bad_key = Key::from_slice(
+                &bad_data[j..j + 4096 / 2 + j],
+                if 0 != j & 1 {
+                    KeyType::Public
+                } else {
+                    KeyType::Private
+                },
+            );
+            assert!(bad_key.is_none());
+        }
     }
 
     #[test]

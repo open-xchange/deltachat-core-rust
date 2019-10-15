@@ -11,6 +11,16 @@ extern "C" {
 #endif
 
 
+typedef struct _dc_context  dc_context_t;
+typedef struct _dc_array    dc_array_t;
+typedef struct _dc_chatlist dc_chatlist_t;
+typedef struct _dc_chat     dc_chat_t;
+typedef struct _dc_msg      dc_msg_t;
+typedef struct _dc_contact  dc_contact_t;
+typedef struct _dc_lot      dc_lot_t;
+typedef struct _dc_provider dc_provider_t;
+
+
 /**
  * @mainpage Getting started
  *
@@ -189,13 +199,6 @@ extern "C" {
  * SQLite database for offline functionality and for account-related
  * settings.
  */
-typedef struct _dc_context  dc_context_t;
-typedef struct _dc_array    dc_array_t;
-typedef struct _dc_chatlist dc_chatlist_t;
-typedef struct _dc_chat     dc_chat_t;
-typedef struct _dc_msg      dc_msg_t;
-typedef struct _dc_contact  dc_contact_t;
-typedef struct _dc_lot      dc_lot_t;
 
 
 /**
@@ -393,16 +396,22 @@ int             dc_set_config                (dc_context_t* context, const char*
  * @memberof dc_context_t
  * @param context The context object as created by dc_context_new(). For querying system values, this can be NULL.
  * @param key The key to query.
- * @return Returns current value of "key", if "key" is unset, the default value is returned.
- *     The returned value must be free()'d, NULL is never returned.
+ * @return Returns current value of "key", if "key" is unset, the default
+ *     value is returned.  The returned value must be free()'d, NULL is never
+ *     returned.  If there is an error an empty string will be returned.
  */
 char*           dc_get_config                (dc_context_t* context, const char* key);
 
 
 /**
  * Get information about the context.
+ *
  * The information is returned by a multi-line string
  * and contains information about the current configuration.
+ *
+ * If the context is not open or configured only a subset of the information
+ * will be available.  There is no guarantee about which information will be
+ * included when however.
  *
  * @memberof dc_context_t
  * @param context The context as created by dc_context_new().
@@ -617,12 +626,8 @@ void            dc_interrupt_imap_idle       (dc_context_t* context);
 
 
 /**
- * Fetch new messages from the MVBOX, if any.
- * The MVBOX is a folder on the account where chat messages are moved to.
- * The moving is done to not disturb shared accounts that are used by both,
- * Delta Chat and a classical MUA.
- *
- * This function and dc_perform_mvbox_idle()
+ * Execute pending mvbox-jobs.
+ * This function and dc_perform_mvbox_fetch() and dc_perform_mvbox_idle()
  * must be called from the same thread, typically in a loop.
  *
  * Example:
@@ -630,6 +635,7 @@ void            dc_interrupt_imap_idle       (dc_context_t* context);
  *     void* mvbox_thread_func(void* context)
  *     {
  *         while (true) {
+ *             dc_perform_mvbox_jobs(context);
  *             dc_perform_mvbox_fetch(context);
  *             dc_perform_mvbox_idle(context);
  *         }
@@ -643,8 +649,21 @@ void            dc_interrupt_imap_idle       (dc_context_t* context);
  *
  *     // network becomes available again -
  *     // the interrupt causes dc_perform_mvbox_idle() in the thread above
- *     // to return so that and messages are fetched.
+ *     // to return so that jobs are executed and messages are fetched.
  *     dc_maybe_network(context);
+ *
+ * @memberof dc_context_t
+ * @param context The context as created by dc_context_new().
+ * @return None.
+ */
+void            dc_perform_mvbox_jobs         (dc_context_t* context);
+
+
+/**
+ * Fetch new messages from the MVBOX, if any.
+ * The MVBOX is a folder on the account where chat messages are moved to.
+ * The moving is done to not disturb shared accounts that are used by both,
+ * Delta Chat and a classical MUA.
  *
  * @memberof dc_context_t
  * @param context The context as created by dc_context_new().
@@ -685,6 +704,39 @@ void            dc_perform_mvbox_idle        (dc_context_t* context);
  * @return None.
  */
 void            dc_interrupt_mvbox_idle      (dc_context_t* context);
+
+/**
+ * Execute pending sentbox-jobs.
+ * This function and dc_perform_sentbox_fetch() and dc_perform_sentbox_idle()
+ * must be called from the same thread, typically in a loop.
+ *
+ * Example:
+ *
+ *     void* sentbox_thread_func(void* context)
+ *     {
+ *         while (true) {
+ *             dc_perform_sentbox_jobs(context);
+ *             dc_perform_sentbox_fetch(context);
+ *             dc_perform_sentbox_idle(context);
+ *         }
+ *     }
+ *
+ *     // start sentbox-thread that runs forever
+ *     pthread_t sentbox_thread;
+ *     pthread_create(&sentbox_thread, NULL, sentbox_thread_func, context);
+ *
+ *     ... program runs ...
+ *
+ *     // network becomes available again -
+ *     // the interrupt causes dc_perform_sentbox_idle() in the thread above
+ *     // to return so that jobs are executed and messages are fetched.
+ *     dc_maybe_network(context);
+ *
+ * @memberof dc_context_t
+ * @param context The context as created by dc_context_new().
+ * @return None.
+ */
+void            dc_perform_sentbox_jobs         (dc_context_t* context);
 
 
 /**
@@ -3429,6 +3481,110 @@ int             dc_contact_is_verified       (dc_contact_t* contact);
 
 
 /**
+ * @class dc_provider_t
+ *
+ * Opaque object containing information about one single email provider.
+ */
+
+
+/**
+ * Create a provider struct for the given domain.
+ *
+ * @memberof dc_provider_t
+ * @param domain The domain to get provider info for.
+ * @return a dc_provider_t struct which can be used with the dc_provider_get_*
+ *     accessor functions.  If no provider info is found, NULL will be
+ *     returned.
+ */
+dc_provider_t*  dc_provider_new_from_domain           (const char* domain);
+
+
+/**
+ * Create a provider struct for the given email address.
+ *
+ * The provider is extracted from the email address and it's information is returned.
+ *
+ * @memberof dc_provider_t
+ * @param email The user's email address to extract the provider info form.
+ * @return a dc_provider_t struct which can be used with the dc_provider_get_*
+ *     accessor functions.  If no provider info is found, NULL will be
+ *     returned.
+ */
+dc_provider_t*  dc_provider_new_from_email            (const char* email);
+
+
+/**
+ * URL of the overview page.
+ *
+ * This URL allows linking to the providers page on providers.delta.chat.
+ *
+ * @memberof dc_provider_t
+ * @param provider The dc_provider_t struct.
+ * @return A string which must be free()d.
+ */
+char*           dc_provider_get_overview_page         (const dc_provider_t* provider);
+
+
+/**
+ * The provider's name.
+ *
+ * The name of the provider, e.g. "POSTEO".
+ *
+ * @memberof dc_provider_t
+ * @param provider The dc_provider_t struct.
+ * @return A string which must be free()d.
+ */
+char*           dc_provider_get_name                  (const dc_provider_t* provider);
+
+
+/**
+ * The markdown content of the providers page.
+ *
+ * This contains the preparation steps or additional information if the status
+ * is @ref DC_PROVIDER_STATUS_BROKEN.
+ *
+ * @memberof dc_provider_t
+ * @param provider The dc_provider_t struct.
+ * @return A string which must be free()d.
+ */
+char*           dc_provider_get_markdown              (const dc_provider_t* provider);
+
+
+/**
+ * Date of when the state was last checked/updated.
+ *
+ * This is returned as a string.
+ *
+ * @memberof dc_provider_t
+ * @param provider The dc_provider_t struct.
+ * @return A string which must be free()d.
+ */
+char*           dc_provider_get_status_date           (const dc_provider_t* provider);
+
+
+/**
+ * Whether DC works with this provider.
+ *
+ * Can be one of @ref DC_PROVIDER_STATUS_OK, @ref
+ * DC_PROVIDER_STATUS_PREPARATION and @ref DC_PROVIDER_STATUS_BROKEN.
+ *
+ * @memberof dc_provider_t
+ * @param provider The dc_provider_t struct.
+ * @return The status as a constant number.
+ */
+int             dc_provider_get_status                (const dc_provider_t* provider);
+
+
+/**
+ * Free the provider info struct.
+ *
+ * @memberof dc_provider_t
+ * @param provider The dc_provider_t struct.
+ */
+void            dc_provider_unref                     (const dc_provider_t* provider);
+
+
+/**
  * @class dc_lot_t
  *
  * An object containing a set of values.
@@ -3593,6 +3749,14 @@ char*           dc_decrypt_message_in_memory(
  * and retrieved via dc_msg_get_file(), dc_msg_get_width(), dc_msg_get_height().
  */
 #define DC_MSG_GIF       21
+
+
+/**
+ * Message containing a sticker, similar to image.
+ * If possible, the ui should display the image without borders in a transparent way.
+ * A click on a sticker will offer to install the sticker set in some future.
+ */
+#define DC_MSG_STICKER     23
 
 
 /**
@@ -3772,6 +3936,45 @@ char*           dc_decrypt_message_in_memory(
  */
 #define DC_EVENT_SMTP_MESSAGE_SENT        103
 
+/**
+ * Emitted when a message was successfully marked as deleted on the IMAP server.
+ *
+ * @param data1 0
+ * @param data2 (const char*) Info string in english language.
+ *     Must not be free()'d or modified and is valid only until the callback returns.
+ * @return 0
+ */
+#define DC_EVENT_IMAP_MESSAGE_DELETED   104
+
+/**
+ * Emitted when a message was successfully moved on IMAP.
+ *
+ * @param data1 0
+ * @param data2 (const char*) Info string in english language.
+ *     Must not be free()'d or modified and is valid only until the callback returns.
+ * @return 0
+ */
+#define DC_EVENT_IMAP_MESSAGE_MOVED   105
+
+/**
+ * Emitted when a new blob file was successfully written 
+ *
+ * @param data1 0
+ * @param data2 (const char*) path name 
+ *     Must not be free()'d or modified and is valid only until the callback returns.
+ * @return 0
+ */
+#define DC_EVENT_NEW_BLOB_FILE 150
+
+/**
+ * Emitted when a blob file was successfully deleted 
+ *
+ * @param data1 0
+ * @param data2 (const char*) path name 
+ *     Must not be free()'d or modified and is valid only until the callback returns.
+ * @return 0
+ */
+#define DC_EVENT_DELETED_BLOB_FILE 151
 
 /**
  * The library-user should write a warning string to the log.
@@ -4075,6 +4278,41 @@ void            dc_array_add_id              (dc_array_t*, uint32_t); // depreca
 #define DC_SHOW_EMAILS_OFF               0
 #define DC_SHOW_EMAILS_ACCEPTED_CONTACTS 1
 #define DC_SHOW_EMAILS_ALL               2
+
+
+/**
+ * @defgroup DC_PROVIDER_STATUS DC_PROVIDER_STATUS
+ *
+ * These constants are used as return values for dc_provider_get_status().
+ *
+ * @addtogroup DC_PROVIDER_STATUS
+ * @{
+ */
+
+/**
+ * Provider status returned by dc_provider_get_status().
+ *
+ * Works right out of the box without any preperation steps needed
+ */
+#define         DC_PROVIDER_STATUS_OK           1
+
+/**
+ * Provider status returned by dc_provider_get_status().
+ *
+ * Works, but preparation steps are needed
+ */
+#define         DC_PROVIDER_STATUS_PREPARATION  2
+
+/**
+ * Provider status returned by dc_provider_get_status().
+ *
+ * Doesn't work (too unstable to use falls also in this category)
+ */
+#define         DC_PROVIDER_STATUS_BROKEN       3
+
+/**
+ * @}
+ */
 
 
 /*

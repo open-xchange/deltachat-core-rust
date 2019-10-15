@@ -1,8 +1,8 @@
 """ Account class implementation. """
 
 from __future__ import print_function
+import atexit
 import threading
-import os
 import re
 import time
 from array import array
@@ -15,7 +15,7 @@ except ImportError:
 import deltachat
 from . import const
 from .capi import ffi, lib
-from .cutil import as_dc_charpointer, from_dc_charpointer, iter_array
+from .cutil import as_dc_charpointer, from_dc_charpointer, iter_array, DCLot
 from .chatting import Contact, Chat, Message
 
 
@@ -24,7 +24,7 @@ class Account(object):
     by the underlying deltachat c-library.  All public Account methods are
     meant to be memory-safe and return memory-safe objects.
     """
-    def __init__(self, db_path, logid=None, eventlogging=True):
+    def __init__(self, db_path, logid=None, eventlogging=True, debug=True):
         """ initialize account object.
 
         :param db_path: a path to the account database. The database
@@ -32,13 +32,14 @@ class Account(object):
         :param logid: an optional logging prefix that should be used with
                       the default internal logging.
         :param eventlogging: if False no eventlogging and no context callback will be configured
+        :param debug: turn on debug logging for events.
         """
         self._dc_context = ffi.gc(
             lib.dc_context_new(lib.py_dc_callback, ffi.NULL, ffi.NULL),
             _destroy_dc_context,
         )
         if eventlogging:
-            self._evlogger = EventLogger(self._dc_context, logid)
+            self._evlogger = EventLogger(self._dc_context, logid, debug)
             deltachat.set_context_callback(self._dc_context, self._process_event)
             self._threads = IOThreads(self._dc_context, self._evlogger._log_event)
         else:
@@ -49,9 +50,9 @@ class Account(object):
         if not lib.dc_open(self._dc_context, db_path, ffi.NULL):
             raise ValueError("Could not dc_open: {}".format(db_path))
         self._configkeys = self.get_config("sys.config_keys").split()
-        self._imex_completed = threading.Event()
+        self._imex_events = Queue()
+        atexit.register(self.shutdown)
 
-    # XXX this can cause "illegal instructions" at test ends so we omit it for now
     # def __del__(self):
     #    self.shutdown()
 
@@ -308,7 +309,7 @@ class Account(object):
         :returns: a :class:`deltachat.chatting.Chat` object.
         """
         bytes_name = name.encode("utf8")
-        chat_id = lib.dc_create_group_chat(self._dc_context, verified, bytes_name)
+        chat_id = lib.dc_create_group_chat(self._dc_context, int(verified), bytes_name)
         return Chat(self, chat_id)
 
     def get_chats(self):
@@ -366,31 +367,64 @@ class Account(object):
         msg_ids = [msg.id for msg in messages]
         lib.dc_delete_msgs(self._dc_context, msg_ids, len(msg_ids))
 
-    def export_to_dir(self, backupdir):
-        """return after all delta chat state is exported to a new file in
-        the specified directory.
+    def export_self_keys(self, path):
+        """ export public and private keys to the specified directory. """
+        return self._export(path, imex_cmd=1)
+
+    def export_all(self, path):
+        """return new file containing a backup of all database state
+        (chats, contacts, keys, media, ...). The file is created in the
+        the `path` directory.
         """
-        snap_files = os.listdir(backupdir)
-        self._imex_completed.clear()
-        lib.dc_imex(self._dc_context, 11, as_dc_charpointer(backupdir), ffi.NULL)
+        export_files = self._export(path, 11)
+        if len(export_files) != 1:
+            raise RuntimeError("found more than one new file")
+        return export_files[0]
+
+    def _imex_events_clear(self):
+        try:
+            while True:
+                self._imex_events.get_nowait()
+        except Empty:
+            pass
+
+    def _export(self, path, imex_cmd):
+        self._imex_events_clear()
+        lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
         if not self._threads.is_started():
             lib.dc_perform_imap_jobs(self._dc_context)
-        self._imex_completed.wait()
-        for x in os.listdir(backupdir):
-            if x not in snap_files:
-                return os.path.join(backupdir, x)
+        files_written = []
+        while True:
+            ev = self._imex_events.get()
+            if isinstance(ev, str):
+                files_written.append(ev)
+            elif isinstance(ev, bool):
+                if not ev:
+                    raise ValueError("export failed, exp-files: {}".format(files_written))
+                return files_written
 
-    def import_from_file(self, path):
-        """import delta chat state from the specified backup file.
+    def import_self_keys(self, path):
+        """ Import private keys found in the `path` directory.
+        The last imported key is made the default keys unless its name
+        contains the string legacy. Public keys are not imported.
+        """
+        self._import(path, imex_cmd=2)
+
+    def import_all(self, path):
+        """import delta chat state from the specified backup `path` (a file).
 
         The account must be in unconfigured state for import to attempted.
         """
         assert not self.is_configured(), "cannot import into configured account"
-        self._imex_completed.clear()
-        lib.dc_imex(self._dc_context, 12, as_dc_charpointer(path), ffi.NULL)
+        self._import(path, imex_cmd=12)
+
+    def _import(self, path, imex_cmd):
+        self._imex_events_clear()
+        lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
         if not self._threads.is_started():
             lib.dc_perform_imap_jobs(self._dc_context)
-        self._imex_completed.wait()
+        if not self._imex_events.get():
+            raise ValueError("import from path '{}' failed".format(path))
 
     def initiate_key_transfer(self):
         """return setup code after a Autocrypt setup message
@@ -405,7 +439,69 @@ class Account(object):
             raise RuntimeError("could not send out autocrypt setup message")
         return from_dc_charpointer(res)
 
-    def start_threads(self):
+    def get_setup_contact_qr(self):
+        """ get/create Setup-Contact QR Code as ascii-string.
+
+        this string needs to be transferred to another DC account
+        in a second channel (typically used by mobiles with QRcode-show + scan UX)
+        where qr_setup_contact(qr) is called.
+        """
+        res = lib.dc_get_securejoin_qr(self._dc_context, 0)
+        return from_dc_charpointer(res)
+
+    def check_qr(self, qr):
+        """ check qr code and return :class:`ScannedQRCode` instance representing the result"""
+        res = ffi.gc(
+            lib.dc_check_qr(self._dc_context, as_dc_charpointer(qr)),
+            lib.dc_lot_unref
+        )
+        lot = DCLot(res)
+        if lot.state() == const.DC_QR_ERROR:
+            raise ValueError("invalid or unknown QR code: {}".format(lot.text1()))
+        return ScannedQRCode(lot)
+
+    def qr_setup_contact(self, qr):
+        """ setup contact and return a Chat after contact is established.
+
+        Note that this function may block for a long time as messages are exchanged
+        with the emitter of the QR code.  On success a :class:`deltachat.chatting.Chat` instance
+        is returned.
+        :param qr: valid "setup contact" QR code (all other QR codes will result in an exception)
+        """
+        assert self.check_qr(qr).is_ask_verifycontact()
+        chat_id = lib.dc_join_securejoin(self._dc_context, as_dc_charpointer(qr))
+        if chat_id == 0:
+            raise ValueError("could not setup secure contact")
+        return Chat(self, chat_id)
+
+    def qr_join_chat(self, qr):
+        """ join a chat group through a QR code.
+
+        Note that this function may block for a long time as messages are exchanged
+        with the emitter of the QR code.  On success a :class:`deltachat.chatting.Chat` instance
+        is returned which is the chat that we just joined.
+
+        :param qr: valid "join-group" QR code (all other QR codes will result in an exception)
+        """
+        assert self.check_qr(qr).is_ask_verifygroup()
+        chat_id = lib.dc_join_securejoin(self._dc_context, as_dc_charpointer(qr))
+        if chat_id == 0:
+            raise ValueError("could not join group")
+        return Chat(self, chat_id)
+
+    def stop_ongoing(self):
+        lib.dc_stop_ongoing_process(self._dc_context)
+
+    #
+    # meta API for start/stop and event based processing
+    #
+
+    def wait_next_incoming_message(self):
+        """ wait for and return next incoming message. """
+        ev = self._evlogger.get_matching("DC_EVENT_INCOMING_MSG")
+        return self.get_message_by_id(ev[2])
+
+    def start_threads(self, mvbox=False, sentbox=False):
         """ start IMAP/SMTP threads (and configure account if it hasn't happened).
 
         :raises: ValueError if 'addr' or 'mail_pw' are not configured.
@@ -413,21 +509,23 @@ class Account(object):
         """
         if not self.is_configured():
             self.configure()
-        self._threads.start()
+        self._threads.start(mvbox=mvbox, sentbox=sentbox)
 
     def stop_threads(self, wait=True):
         """ stop IMAP/SMTP threads. """
-        lib.dc_stop_ongoing_process(self._dc_context)
+        self.stop_ongoing()
         self._threads.stop(wait=wait)
 
     def shutdown(self, wait=True):
         """ stop threads and close and remove underlying dc_context and callbacks. """
         if hasattr(self, "_dc_context") and hasattr(self, "_threads"):
-            self.stop_threads(wait=False)  # to interrupt idle and tell python threads to stop
+            # print("SHUTDOWN", self)
+            self.stop_threads(wait=False)
             lib.dc_close(self._dc_context)
             self.stop_threads(wait=wait)  # to wait for threads
             deltachat.clear_context_callback(self._dc_context)
             del self._dc_context
+            atexit.unregister(self.shutdown)
 
     def _process_event(self, ctx, evt_name, data1, data2):
         assert ctx == self._dc_context
@@ -440,7 +538,12 @@ class Account(object):
 
     def on_dc_event_imex_progress(self, data1, data2):
         if data1 == 1000:
-            self._imex_completed.set()
+            self._imex_events.put(True)
+        elif data1 == 0:
+            self._imex_events.put(False)
+
+    def on_dc_event_imex_file_written(self, data1, data2):
+        self._imex_events.put(data1)
 
 
 class IOThreads:
@@ -453,10 +556,14 @@ class IOThreads:
     def is_started(self):
         return len(self._name2thread) > 0
 
-    def start(self, imap=True, smtp=True):
+    def start(self, imap=True, smtp=True, mvbox=False, sentbox=False):
         assert not self.is_started()
         if imap:
-            self._start_one_thread("imap", self.imap_thread_run)
+            self._start_one_thread("inbox", self.imap_thread_run)
+        if mvbox:
+            self._start_one_thread("mvbox", self.mvbox_thread_run)
+        if sentbox:
+            self._start_one_thread("sentbox", self.sentbox_thread_run)
         if smtp:
             self._start_one_thread("smtp", self.smtp_thread_run)
 
@@ -469,17 +576,35 @@ class IOThreads:
         self._thread_quitflag = True
         lib.dc_interrupt_imap_idle(self._dc_context)
         lib.dc_interrupt_smtp_idle(self._dc_context)
+        lib.dc_interrupt_mvbox_idle(self._dc_context)
+        lib.dc_interrupt_sentbox_idle(self._dc_context)
         if wait:
             for name, thread in self._name2thread.items():
                 thread.join()
 
     def imap_thread_run(self):
-        self._log_event("py-bindings-info", 0, "IMAP THREAD START")
+        self._log_event("py-bindings-info", 0, "INBOX THREAD START")
         while not self._thread_quitflag:
             lib.dc_perform_imap_jobs(self._dc_context)
             lib.dc_perform_imap_fetch(self._dc_context)
             lib.dc_perform_imap_idle(self._dc_context)
-        self._log_event("py-bindings-info", 0, "IMAP THREAD FINISHED")
+        self._log_event("py-bindings-info", 0, "INBOX THREAD FINISHED")
+
+    def mvbox_thread_run(self):
+        self._log_event("py-bindings-info", 0, "MVBOX THREAD START")
+        while not self._thread_quitflag:
+            lib.dc_perform_mvbox_jobs(self._dc_context)
+            lib.dc_perform_mvbox_fetch(self._dc_context)
+            lib.dc_perform_mvbox_idle(self._dc_context)
+        self._log_event("py-bindings-info", 0, "MVBOX THREAD FINISHED")
+
+    def sentbox_thread_run(self):
+        self._log_event("py-bindings-info", 0, "SENTBOX THREAD START")
+        while not self._thread_quitflag:
+            lib.dc_perform_sentbox_jobs(self._dc_context)
+            lib.dc_perform_sentbox_fetch(self._dc_context)
+            lib.dc_perform_sentbox_idle(self._dc_context)
+        self._log_event("py-bindings-info", 0, "SENTBOX THREAD FINISHED")
 
     def smtp_thread_run(self):
         self._log_event("py-bindings-info", 0, "SMTP THREAD START")
@@ -509,6 +634,10 @@ class EventLogger:
     def set_timeout(self, timeout):
         self._timeout = timeout
 
+    def consume_events(self, check_error=True):
+        while not self._event_queue.empty():
+            self.get()
+
     def get(self, timeout=None, check_error=True):
         timeout = timeout or self._timeout
         ev = self._event_queue.get(timeout=timeout)
@@ -527,11 +656,11 @@ class EventLogger:
             else:
                 assert not rex.match(ev[0]), "event found {}".format(ev)
 
-    def get_matching(self, event_name_regex, check_error=True):
+    def get_matching(self, event_name_regex, check_error=True, timeout=None):
         self._log("-- waiting for event with regex: {} --".format(event_name_regex))
         rex = re.compile("(?:{}).*".format(event_name_regex))
         while 1:
-            ev = self.get()
+            ev = self.get(timeout=timeout, check_error=check_error)
             if rex.match(ev[0]):
                 return ev
 
@@ -568,3 +697,18 @@ def _destroy_dc_context(dc_context, dc_context_unref=lib.dc_context_unref):
         # we are deep into Python Interpreter shutdown,
         # so no need to clear the callback context mapping.
         pass
+
+
+class ScannedQRCode:
+    def __init__(self, dc_lot):
+        self._dc_lot = dc_lot
+
+    def is_ask_verifycontact(self):
+        return self._dc_lot.state() == const.DC_QR_ASK_VERIFYCONTACT
+
+    def is_ask_verifygroup(self):
+        return self._dc_lot.state() == const.DC_QR_ASK_VERIFYGROUP
+
+    @property
+    def contact_id(self):
+        return self._dc_lot.id()

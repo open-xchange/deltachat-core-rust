@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::ffi::CStr;
 use std::io::Cursor;
 use std::ptr;
 
+use libc::{strchr, strlen, strncmp, strspn, strstr};
 use pgp::composed::{
     Deserializable, KeyType as PgpKeyType, Message, SecretKeyParamsBuilder, SignedPublicKey,
     SignedSecretKey, SubkeyParamsBuilder,
@@ -13,28 +13,24 @@ use pgp::types::{CompressionAlgorithm, KeyTrait, SecretKeyTrait, StringToKey};
 use rand::thread_rng;
 
 use crate::dc_tools::*;
+use crate::error::Error;
 use crate::key::*;
 use crate::keyring::*;
-use crate::types::*;
-use crate::x::*;
 
 pub unsafe fn dc_split_armored_data(
     buf: *mut libc::c_char,
-    ret_headerline: *mut *const libc::c_char,
+    ret_headerline: *mut String,
     ret_setupcodebegin: *mut *const libc::c_char,
     ret_preferencrypt: *mut *const libc::c_char,
     ret_base64: *mut *const libc::c_char,
 ) -> bool {
     let mut success = false;
-    let mut line_chars: size_t = 0i32 as size_t;
+    let mut line_chars: libc::size_t = 0;
     let mut line: *mut libc::c_char = buf;
     let mut p1: *mut libc::c_char = buf;
     let mut p2: *mut libc::c_char;
     let mut headerline: *mut libc::c_char = ptr::null_mut();
     let mut base64: *mut libc::c_char = ptr::null_mut();
-    if !ret_headerline.is_null() {
-        *ret_headerline = ptr::null()
-    }
     if !ret_setupcodebegin.is_null() {
         *ret_setupcodebegin = ptr::null_mut();
     }
@@ -44,10 +40,10 @@ pub unsafe fn dc_split_armored_data(
     if !ret_base64.is_null() {
         *ret_base64 = ptr::null();
     }
-    if !(buf.is_null() || ret_headerline.is_null()) {
+    if !buf.is_null() {
         dc_remove_cr_chars(buf);
         while 0 != *p1 {
-            if *p1 as libc::c_int == '\n' as i32 {
+            if i32::from(*p1) == '\n' as i32 {
                 *line.offset(line_chars as isize) = 0i32 as libc::c_char;
                 if headerline.is_null() {
                     dc_trim(line);
@@ -63,9 +59,7 @@ pub unsafe fn dc_split_armored_data(
                         ) == 0i32
                     {
                         headerline = line;
-                        if !ret_headerline.is_null() {
-                            *ret_headerline = headerline
-                        }
+                        *ret_headerline = as_str(headerline).to_string();
                     }
                 } else if strspn(line, b"\t\r\n \x00" as *const u8 as *const libc::c_char)
                     == strlen(line)
@@ -75,7 +69,7 @@ pub unsafe fn dc_split_armored_data(
                 } else {
                     p2 = strchr(line, ':' as i32);
                     if p2.is_null() {
-                        *line.offset(line_chars as isize) = '\n' as i32 as libc::c_char;
+                        *line.add(line_chars) = '\n' as i32 as libc::c_char;
                         base64 = line;
                         break;
                     } else {
@@ -106,7 +100,7 @@ pub unsafe fn dc_split_armored_data(
                 }
                 p1 = p1.offset(1isize);
                 line = p1;
-                line_chars = 0i32 as size_t
+                line_chars = 0;
             } else {
                 p1 = p1.offset(1isize);
                 line_chars = line_chars.wrapping_add(1)
@@ -188,18 +182,14 @@ pub fn dc_pgp_create_keypair(addr: impl AsRef<str>) -> Option<(Key, Key)> {
 }
 
 pub fn dc_pgp_pk_encrypt(
-    plain_text: *const libc::c_void,
-    plain_bytes: size_t,
+    plain: &[u8],
     public_keys_for_encryption: &Keyring,
     private_key_for_signing: Option<&Key>,
-) -> Option<String> {
-    assert!(!plain_text.is_null() && !plain_bytes > 0, "invalid input");
-
-    let bytes = unsafe { std::slice::from_raw_parts(plain_text as *const u8, plain_bytes) };
-    let lit_msg = Message::new_literal_bytes("", bytes);
+) -> Result<String, Error> {
+    let lit_msg = Message::new_literal_bytes("", plain);
     let pkeys: Vec<&SignedPublicKey> = public_keys_for_encryption
         .keys()
-        .into_iter()
+        .iter()
         .filter_map(|key| {
             let k: &Key = &key;
             k.try_into().ok()
@@ -209,9 +199,10 @@ pub fn dc_pgp_pk_encrypt(
     let mut rng = thread_rng();
 
     // TODO: measure time
-    // TODO: better error handling
     let encrypted_msg = if let Some(private_key) = private_key_for_signing {
-        let skey: &SignedSecretKey = private_key.try_into().unwrap();
+        let skey: &SignedSecretKey = private_key
+            .try_into()
+            .map_err(|_| format_err!("Invalid private key"))?;
 
         lit_msg
             .sign(skey, || "".into(), Default::default())
@@ -221,110 +212,84 @@ pub fn dc_pgp_pk_encrypt(
         lit_msg.encrypt_to_keys(&mut rng, Default::default(), &pkeys)
     };
 
-    encrypted_msg
-        .and_then(|msg| msg.to_armored_string(None))
-        .ok()
+    let msg = encrypted_msg?;
+    let encoded_msg = msg.to_armored_string(None)?;
+
+    Ok(encoded_msg)
 }
 
 pub fn dc_pgp_pk_decrypt(
-    ctext: *const libc::c_void,
-    ctext_bytes: size_t,
+    ctext: &[u8],
     private_keys_for_decryption: &Keyring,
     public_keys_for_validation: &Keyring,
     ret_signature_fingerprints: Option<&mut HashSet<String>>,
-) -> Option<Vec<u8>> {
-    assert!(!ctext.is_null() && ctext_bytes > 0, "invalid input");
+) -> Result<Vec<u8>, Error> {
+    let (msg, _) = Message::from_armor_single(Cursor::new(ctext))?;
+    let skeys: Vec<&SignedSecretKey> = private_keys_for_decryption
+        .keys()
+        .iter()
+        .filter_map(|key| {
+            let k: &Key = &key;
+            k.try_into().ok()
+        })
+        .collect();
 
-    let ctext = unsafe { std::slice::from_raw_parts(ctext as *const u8, ctext_bytes) };
+    let (decryptor, _) = msg.decrypt(|| "".into(), || "".into(), &skeys[..])?;
+    let msgs = decryptor.collect::<Result<Vec<_>, _>>()?;
+    ensure!(!msgs.is_empty(), "No valid messages found");
 
-    // TODO: proper error handling
-    if let Ok((msg, _)) = Message::from_armor_single(Cursor::new(ctext)) {
-        let skeys: Vec<&SignedSecretKey> = private_keys_for_decryption
-            .keys()
-            .iter()
-            .filter_map(|key| {
-                let k: &Key = &key;
-                k.try_into().ok()
-            })
-            .collect();
+    let dec_msg = &msgs[0];
 
-        msg.decrypt(|| "".into(), || "".into(), &skeys[..])
-            .and_then(|(mut decryptor, _)| {
-                // TODO: how to handle the case when we detect multiple messages?
-                decryptor.next().expect("no message")
-            })
-            .and_then(|dec_msg| {
-                if let Some(ret_signature_fingerprints) = ret_signature_fingerprints {
-                    if !public_keys_for_validation.keys().is_empty() {
-                        let pkeys: Vec<&SignedPublicKey> = public_keys_for_validation
-                            .keys()
-                            .iter()
-                            .filter_map(|key| {
-                                let k: &Key = &key;
-                                k.try_into().ok()
-                            })
-                            .collect();
+    if let Some(ret_signature_fingerprints) = ret_signature_fingerprints {
+        if !public_keys_for_validation.keys().is_empty() {
+            let pkeys: Vec<&SignedPublicKey> = public_keys_for_validation
+                .keys()
+                .iter()
+                .filter_map(|key| {
+                    let k: &Key = &key;
+                    k.try_into().ok()
+                })
+                .collect();
 
-                        for pkey in &pkeys {
-                            if dec_msg.verify(&pkey.primary_key).is_ok() {
-                                let fp = hex::encode_upper(pkey.fingerprint());
-                                ret_signature_fingerprints.insert(fp);
-                            }
-                        }
-                    }
+            for pkey in &pkeys {
+                if dec_msg.verify(&pkey.primary_key).is_ok() {
+                    let fp = hex::encode_upper(pkey.fingerprint());
+                    ret_signature_fingerprints.insert(fp);
                 }
-                dec_msg.get_content()
-            })
-            .ok()
-            .and_then(|content| content)
-    } else {
-        None
+            }
+        }
+    }
+
+    match dec_msg.get_content()? {
+        Some(content) => Ok(content),
+        None => bail!("Decrypted message is empty"),
     }
 }
 
 /// Symmetric encryption.
-pub fn dc_pgp_symm_encrypt(
-    passphrase: *const libc::c_char,
-    plain: *const libc::c_void,
-    plain_bytes: size_t,
-) -> Option<String> {
-    assert!(!passphrase.is_null(), "invalid passphrase");
-    assert!(!plain.is_null() && !plain_bytes > 0, "invalid input");
-
-    let pw = unsafe { CStr::from_ptr(passphrase).to_str().unwrap() };
-    let bytes = unsafe { std::slice::from_raw_parts(plain as *const u8, plain_bytes) };
-
+pub fn dc_pgp_symm_encrypt(passphrase: &str, plain: &[u8]) -> Result<String, Error> {
     let mut rng = thread_rng();
-    let lit_msg = Message::new_literal_bytes("", bytes);
+    let lit_msg = Message::new_literal_bytes("", plain);
 
     let s2k = StringToKey::new_default(&mut rng);
-    let msg = lit_msg.encrypt_with_password(&mut rng, s2k, Default::default(), || pw.into());
+    let msg =
+        lit_msg.encrypt_with_password(&mut rng, s2k, Default::default(), || passphrase.into())?;
 
-    msg.and_then(|msg| msg.to_armored_string(None)).ok()
+    let encoded_msg = msg.to_armored_string(None)?;
+
+    Ok(encoded_msg)
 }
 
 /// Symmetric decryption.
-pub fn dc_pgp_symm_decrypt(
-    passphrase: *const libc::c_char,
-    ctext: *const libc::c_void,
-    ctext_bytes: size_t,
-) -> Option<Vec<u8>> {
-    assert!(!passphrase.is_null(), "invalid passphrase");
-    assert!(!ctext.is_null() && !ctext_bytes > 0, "invalid input");
+pub fn dc_pgp_symm_decrypt(passphrase: &str, ctext: &[u8]) -> Result<Vec<u8>, Error> {
+    let enc_msg = Message::from_bytes(Cursor::new(ctext))?;
+    let decryptor = enc_msg.decrypt_with_password(|| passphrase.into())?;
 
-    let pw = unsafe { CStr::from_ptr(passphrase).to_str().unwrap() };
-    let bytes = unsafe { std::slice::from_raw_parts(ctext as *const u8, ctext_bytes) };
+    let msgs = decryptor.collect::<Result<Vec<_>, _>>()?;
+    ensure!(!msgs.is_empty(), "No valid messages found");
 
-    let enc_msg = Message::from_bytes(Cursor::new(bytes));
-
-    enc_msg
-        .and_then(|msg| {
-            let mut decryptor = msg
-                .decrypt_with_password(|| pw.into())
-                .expect("failed decryption");
-            decryptor.next().expect("no message")
-        })
-        .and_then(|msg| msg.get_content())
-        .ok()
-        .and_then(|content| content)
+    match msgs[0].get_content()? {
+        Some(content) => Ok(content),
+        None => bail!("Decrypted message is empty"),
+    }
 }
