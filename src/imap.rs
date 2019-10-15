@@ -1131,6 +1131,7 @@ impl Imap {
                 idle.wait_interruptible()
             })();
             match res {
+                Err(imap::error::Error::Io(_)) |
                 Err(imap::error::Error::ConnectionLost) => {
                     info!(context, "IMAP-IDLE wait cancelled, we will reconnect soon.");
                     self.should_reconnect.store(true, Ordering::Relaxed);
