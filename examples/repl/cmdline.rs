@@ -18,8 +18,6 @@ use deltachat::message::{self, Message, MessageState};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::sql;
-use deltachat::x::*;
-use num_traits::FromPrimitive;
 use deltachat::coi::CoiMessageFilter;
 use deltachat::Event;
 use libc::free;
