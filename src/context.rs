@@ -492,9 +492,6 @@ impl Context {
     }
 }
 
-// unsafe impl Send for Context {}
-// unsafe impl Sync for Context {}
-
 impl Drop for Context {
     fn drop(&mut self) {
         info!(self, "disconnecting INBOX-watch",);

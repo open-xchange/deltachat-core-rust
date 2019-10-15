@@ -38,7 +38,7 @@ pub enum ImapResult {
 const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 
-pub type StopCallback = dyn FnOnce() -> imap::error::Result<()>;
+pub type StopCallback = dyn FnOnce() -> imap::error::Result<()> + Send + Sync;
 
 #[derive(DebugStub)]
 pub struct Imap {
