@@ -411,6 +411,12 @@ class TestOnlineAccount:
         ac2 = acfactory.get_online_configuring_account(mvbox=True)
         wait_configuration_progress(ac2, 1000)
         wait_configuration_progress(ac1, 1000)
+
+        ac2.set_coi_message_filter(const.DC_COI_FILTER_NONE, 1);
+        ev1 = ac2._evlogger.get_matching("DC_EVENT_SET_METADATA_DONE")
+        assert ev1[1] == 1
+        assert ev1[2] == 0
+
         chat = self.get_chat(ac1, ac2)
         chat.send_text("message1")
         ev = ac2._evlogger.get_matching("DC_EVENT_INCOMING_MSG|DC_EVENT_MSGS_CHANGED")
@@ -526,15 +532,8 @@ class TestOnlineAccount:
         lp.sec("create group chat with two members, one of which has no encrypt state")
         chat = ac1.create_group_chat("encryption test")
         chat.add_contact(ac1.create_contact(ac2.get_config("addr")))
-        chat.add_contact(ac1.create_contact("notexisting@testrun.org"))
-        msg = chat.send_text("test not encrypt")
-        ev = ac1._evlogger.get_matching("DC_EVENT_SMTP_MESSAGE_SENT")
-        assert not msg.is_encrypted()
-
-        lp.sec("create group chat with two members, one of which has no encrypt state")
-        chat = ac1.create_group_chat("encryption test")
-        chat.add_contact(ac1.create_contact(ac2.get_config("addr")))
-        chat.add_contact(ac1.create_contact("notexisting@testrun.org"))
+        ac3_config = acfactory.peek_online_config()
+        chat.add_contact(ac1.create_contact(ac3_config["addr"]))
         msg = chat.send_text("test not encrypt")
         ev = ac1._evlogger.get_matching("DC_EVENT_SMTP_MESSAGE_SENT")
         assert not msg.is_encrypted()
@@ -749,7 +748,7 @@ class TestOnlineConfigureFails:
         ac1.configure(addr="x" + configdict["addr"], mail_pw=configdict["mail_pw"])
         ac1.start_threads()
         wait_configuration_progress(ac1, 500)
-        ev1 = ac1._evlogger.get_matching("DC_EVENT_ERROR_NETWORK")
+        ev1 = ac1._evlogger.get_matching("DC_EVENT_(ERROR_NETWORK|IMAP_CONNECTED)")
         assert "authentication failed" in ev1[2].lower()
         wait_configuration_progress(ac1, 0, 0)
 
