@@ -75,35 +75,6 @@ pub type dc_callback_t =
 pub type dc_context_t = ContextWrapper;
 
 impl ContextWrapper {
-
-    fn get_coi_config(&self)->Option<CoiConfig> {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().get_coi_config()
-    }
-
-    fn get_webpush_config(&self)->Option<WebPushConfig> {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().get_webpush_config()
-    }
-
-    fn set_coi_enabled(&self, enable: bool, id: i32) {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().set_coi_enabled(enable, id)
-    }
-
-    fn set_coi_message_filter(&self, message_filter: CoiMessageFilter, id: i32) {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().set_coi_message_filter(message_filter, id)
-    }
-
-    fn subscribe_webpush(&self, uid: &str, json: Option<&str>, id: i32) {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().subscribe_webpush(uid, json, id)
-    }
-
-    fn get_webpush_subscription(&self, uid: &str, id: i32) {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().get_webpush_subscription(uid, id)
-    }
-
-    fn validate_webpush(&self, uid: &str, msg: &str, id: i32) {
-        self.inner.write().expect("Missing Context").as_ref().unwrap().validate_webpush(uid, msg, id)
-    }
-
     /// Log an error on the FFI context.
     ///
     /// As soon as a [ContextWrapper] exist it can be used to log an
@@ -428,7 +399,6 @@ pub unsafe extern "C" fn dc_get_oauth2_url(
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_coi_supported(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    println!("%%%% dc_is_coi_supported");
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
@@ -440,7 +410,6 @@ pub unsafe extern "C" fn dc_is_coi_supported(context: *mut dc_context_t) -> libc
 #[no_mangle]
 pub unsafe extern "C" fn dc_is_coi_enabled(context: *mut dc_context_t) -> libc::c_int {
     assert!(!context.is_null());
-    println!("%%%% dc_is_coi_enabled");
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
@@ -458,7 +427,6 @@ pub unsafe extern "C" fn dc_get_coi_message_filter(
     context: *mut dc_context_t,
 ) -> libc::c_int {
     assert!(!context.is_null());
-    println!("%%%% dc_get_coi_message_filter");
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
