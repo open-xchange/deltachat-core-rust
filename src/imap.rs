@@ -36,6 +36,7 @@ pub enum ImapResult {
 }
 
 const PREFETCH_FLAGS: &str = "(UID ENVELOPE)";
+const PREFETCH_BODY_FLAGS: &str = "(UID ENVELOPE BODYSTRUCTURE)";
 const BODY_FLAGS: &str = "(FLAGS BODY.PEEK[])";
 
 pub type StopCallback = dyn FnOnce() -> imap::error::Result<()> + Send + Sync;
@@ -404,6 +405,28 @@ impl Default for ImapConfig {
         }
     }
 }
+
+    fn body_structure_is_autocrypt_setup(bs: &imap_proto::types::BodyStructure)->bool
+    {
+        match bs
+        {
+            imap_proto::BodyStructure::Text{..} => return false,
+            // imap_proto::BodyStructure::Text{common, other, lines, extension} => return false,
+            imap_proto::BodyStructure::Message{..} => return false,
+            // imap_proto::BodyStructure::Message{common, other, envelope, body, lines, extension} => return false,
+            imap_proto::BodyStructure::Basic{common, ..} =>
+            {
+                return common.ty.ty == "application" && common.ty.subtype == "autocrypt-setup";
+            },
+            imap_proto::BodyStructure::Multipart{bodies, ..} =>  {
+                for bs in bodies
+                {
+                    if body_structure_is_autocrypt_setup(&bs) { return true; }
+                }
+                return false;
+            }
+        }
+    }
 
 impl Imap {
     pub fn new() -> Self {
@@ -845,6 +868,18 @@ impl Imap {
         }
     }
 
+    fn message_is_autocrypt_setup(&self, msg: &imap::types::Fetch) -> bool
+    {
+
+        let res =
+        match msg.bodystructure()
+        {
+            Some(bs) => body_structure_is_autocrypt_setup(bs),
+            _ => false,
+        };
+        res
+    }
+
     fn fetch_from_single_folder<S: AsRef<str>>(&self, context: &Context, folder: S) -> usize {
         if !self.is_connected() {
             info!(
@@ -947,7 +982,7 @@ impl Imap {
             // fetch messages with larger UID than the last one seen
             // (`UID FETCH lastseenuid+1:*)`, see RFC 4549
             let set = format!("{}:*", last_seen_uid + 1);
-            match session.uid_fetch(set, PREFETCH_FLAGS) {
+            match session.uid_fetch(set, PREFETCH_BODY_FLAGS) {
                 Ok(list) => list,
                 Err(err) => {
                     warn!(context, "failed to fetch uids: {}", err);
@@ -966,7 +1001,8 @@ impl Imap {
 
                 let message_id = prefetch_get_message_id(msg).unwrap_or_default();
 
-                if !precheck_imf(context, &message_id, folder.as_ref(), cur_uid) {
+                if self.message_is_autocrypt_setup(msg) ||
+                    !precheck_imf(context, &message_id, folder.as_ref(), cur_uid) {
                     // check passed, go fetch the rest
                     if self.fetch_single_msg(context, &folder, cur_uid) == 0 {
                         info!(
