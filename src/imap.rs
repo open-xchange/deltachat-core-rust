@@ -376,7 +376,7 @@ struct ImapConfig {
     pub selected_folder_needs_expunge: bool,
     pub can_idle: bool,
     pub has_xlist: bool,
-    pub imap_delimiter: char,
+    pub imap_delimiter: String,
     pub watch_folder: Option<String>,
     pub coi: Option<CoiConfig>,
     pub webpush: Option<WebPushConfig>,
@@ -397,7 +397,7 @@ impl Default for ImapConfig {
             selected_folder_needs_expunge: false,
             can_idle: false,
             has_xlist: false,
-            imap_delimiter: '.',
+            imap_delimiter: String::from("."),
             watch_folder: None,
             coi: None,
             webpush: None,
@@ -619,6 +619,7 @@ impl Imap {
                 caps.has(&Capability::Atom("COI")),
                 caps.has(&Capability::Atom("WEBPUSH")),
             );
+            let delimiter = self.query_imap_delimiter();
 
             let caps_list = caps
                 .iter()
@@ -639,6 +640,11 @@ impl Imap {
             config.has_xlist = has_xlist;
             config.coi = coi;
             config.webpush = webpush;
+            println!("Delim was: {}", config.imap_delimiter);
+            if delimiter.is_some() {
+                config.imap_delimiter = delimiter.unwrap();
+            }
+            println!("Delim now: {}", config.imap_delimiter);
             *self.connected.lock().unwrap() = true;
             Ok(())
         })()
@@ -649,6 +655,22 @@ impl Imap {
             self.free_connect_params();
         }
         !teardown
+    }
+
+    fn query_imap_delimiter(&self// , context: &Context
+    ) -> Option<String> {
+        if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
+            let list = session.list(None, None).unwrap();
+            let delim = list[0].delimiter();
+            match delim {
+                None => None,
+                Some(d) => Some(String::from(d)),
+            }
+        } else {
+            // Use default delimiter when not able to acquire session.
+            None
+        }
+
     }
 
     fn query_metadata(
@@ -1448,7 +1470,7 @@ impl Imap {
         info!(context, "Configuring IMAP-folders.");
 
         let folders = self.list_folders(context).unwrap();
-        let delimiter = self.config.read().unwrap().imap_delimiter;
+        let delimiter = &self.config.read().unwrap().imap_delimiter;
         let fallback_folder = format!("INBOX{}DeltaChat", delimiter);
 
         let mut mvbox_folder = folders
