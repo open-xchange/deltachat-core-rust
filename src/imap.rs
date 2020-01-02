@@ -23,6 +23,7 @@ pub use imap::extensions::metadata::MetadataDepth;
 pub use imap_proto::types::{Metadata, Capability};
 use imap::extensions::idle::Waker;
 use crate::param::Params;
+use crate::param::Param;
 use crate::wrapmime;
 
 const DC_IMAP_SEEN: usize = 0x0001;
@@ -1648,11 +1649,13 @@ fn precheck_imf(context: &Context, rfc724_mid: &str, server_folder: &str, server
     {
         if old_server_folder.is_empty() && old_server_uid == 0 {
             info!(context, "[move] detected bbc-self {}", rfc724_mid,);
+            let mut param = Params::new();
+            param.set_int(Param::AlsoMove, 1);
             job_add(
                 context,
                 Action::MarkseenMsgOnImap,
                 msg_id as libc::c_int,
-                Params::new(),
+                param,
                 0,
             );
         } else if old_server_folder != server_folder {
