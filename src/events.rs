@@ -159,6 +159,13 @@ pub enum Event {
     #[strum(props(id = "2015"))]
     MsgRead { chat_id: u32, msg_id: u32 },
 
+    /// Message could not be decrypted due to a missing key
+    ///
+    /// @param address of the message sender
+    /// @return 0
+    #[strum(props(id = "2016"))]
+    MissingKey(String),
+
     /// Chat changed.  The name or the image of a chat group was changed or members were added or removed.
     /// Or the verify state of a chat has changed.
     /// See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
@@ -251,7 +258,7 @@ pub enum Event {
     /// @param data2 (const char*) JSON string returned by the server, or NULL if no subscription found.
     ///     Must not be free()'d or modified and is valid only until the callback returns.
     #[strum(props(id = "2071"))]
-    Metadata { foreign_id: u32, json: Option<String> },  
+    Metadata { foreign_id: u32, json: Option<String> },
 
     // the following events are functions that should be provided by the frontends
     /// Requeste a localized string from the frontend.

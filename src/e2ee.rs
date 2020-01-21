@@ -592,6 +592,7 @@ fn decrypt_part(
                 ensure!(!ret_valid_signatures.is_empty(), "no valid signatures");
                 plain
             }
+            Err(Error::Pgp(pgp::errors::Error::MissingKey)) => { return Err(Error::Pgp(pgp::errors::Error::MissingKey)); }
             Err(err) => bail!("could not decrypt: {}", err),
         };
         let plain_bytes = plain.len();

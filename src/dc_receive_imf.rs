@@ -29,6 +29,7 @@ use crate::securejoin::handle_securejoin_handshake;
 use crate::sql;
 use crate::stock::StockMessage;
 use crate::wrapmime;
+use crate::error::Error;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CreateEvent {
@@ -43,6 +44,7 @@ pub unsafe fn dc_receive_imf(
     server_folder: impl AsRef<str>,
     server_uid: u32,
     flags: u32,
+    from: String,
 ) {
     info!(
         context,
@@ -62,7 +64,10 @@ pub unsafe fn dc_receive_imf(
 
     let mut mime_parser = MimeParser::new(context);
     if let Err(err) = mime_parser.parse(imf_raw) {
-        error!(context, "dc_receive_imf parse error: {}", err);
+        match err {
+            Error::Pgp(pgp::errors::Error::MissingKey) => { context.call_cb(Event::MissingKey(from)); }
+            _ => { error!(context, "dc_receive_imf parse error: {}", err); }
+        }
     };
 
     if mime_parser.header.is_empty() {

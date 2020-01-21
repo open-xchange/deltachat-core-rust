@@ -20,7 +20,7 @@ use std::str::FromStr;
 
 use imap::extensions::metadata::{get_metadata, set_metadata};
 pub use imap::extensions::metadata::MetadataDepth;
-pub use imap_proto::types::{Metadata, Capability};
+pub use imap_proto::types::{Address, Capability, Metadata};
 use imap::extensions::idle::Waker;
 use crate::param::Params;
 use crate::param::Param;
@@ -969,7 +969,7 @@ impl Imap {
 
                 if !precheck_imf(context, &message_id, folder.as_ref(), cur_uid) {
                     // check passed, go fetch the rest
-                    if self.fetch_single_msg(context, &folder, cur_uid) == 0 {
+                    if self.fetch_single_msg(context, &folder, cur_uid, msg.envelope().unwrap().from.as_ref()) == 0 {
                         info!(
                             context,
                             "Read error for message {} from \"{}\", trying over later.",
@@ -1033,11 +1033,12 @@ impl Imap {
         context.sql.set_raw_config(context, &key, Some(&val)).ok();
     }
 
-    fn fetch_single_msg<S: AsRef<str>>(
+    fn fetch_single_msg<'a, S: AsRef<str>>(
         &self,
         context: &Context,
         folder: S,
         server_uid: u32,
+        from: Option<&Vec<Address<'a>>>
     ) -> usize {
         // the function returns:
         // 0  the caller should try over again later
@@ -1093,7 +1094,7 @@ impl Imap {
             if !is_deleted && msg.body().is_some() {
                 let body = msg.body().unwrap_or_default();
                 unsafe {
-                    dc_receive_imf(context, &body, folder.as_ref(), server_uid, flags as u32);
+                    dc_receive_imf(context, &body, folder.as_ref(), server_uid, flags as u32, from_as_string(from));
                 }
             }
         }
@@ -1596,6 +1597,19 @@ impl Imap {
 
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
         self.config.read().unwrap().webpush.clone()
+    }
+}
+
+fn from_as_string<'a>(from_raw: Option<&Vec<Address<'a>>>) -> String {
+    match from_raw {
+        None => String::from(""),
+        Some(v) => {
+            if v[0].mailbox.is_none() || v[0].host.is_none() {
+                return String::from("");
+            } else {
+                return format!("{}@{}", std::str::from_utf8(v[0].mailbox.unwrap()).unwrap(), std::str::from_utf8(v[0].host.unwrap()).unwrap());
+            }
+        },
     }
 }
 
