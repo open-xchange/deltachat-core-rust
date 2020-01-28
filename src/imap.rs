@@ -568,6 +568,22 @@ impl Imap {
         cfg.watch_folder = None;
     }
 
+    pub fn update_metadata(
+        &self,
+        context: &Context,
+        has_coi: Option<bool>,
+        has_webpush: Option<bool>,
+    ) {
+        let (coi, webpush) = self.query_metadata(
+            context,
+            has_coi.unwrap_or(self.config.read().unwrap().coi.is_some()),
+            has_webpush.unwrap_or(self.config.read().unwrap().webpush.is_some()),
+        );
+        let mut config = self.config.write().unwrap();
+        config.coi = coi;
+        config.webpush = webpush;
+    }
+
     pub fn connect(&self, context: &Context, lp: &LoginParam) -> bool {
         if lp.mail_server.is_empty() || lp.mail_user.is_empty() || lp.mail_pw.is_empty() {
             return false;
@@ -615,10 +631,10 @@ impl Imap {
             }
             let can_idle = caps.has(&Capability::Atom("IDLE"));
             let has_xlist = caps.has(&Capability::Atom("XLIST"));
-            let (coi, webpush) = self.query_metadata(
+            self.update_metadata(
                 context,
-                caps.has(&Capability::Atom("COI")),
-                caps.has(&Capability::Atom("WEBPUSH")),
+                Some(caps.has(&Capability::Atom("COI"))),
+                Some(caps.has(&Capability::Atom("WEBPUSH"))),
             );
 
             let caps_list = caps
@@ -638,8 +654,6 @@ impl Imap {
             let mut config = self.config.write().unwrap();
             config.can_idle = can_idle;
             config.has_xlist = has_xlist;
-            config.coi = coi;
-            config.webpush = webpush;
             *self.connected.lock().unwrap() = true;
             Ok(())
         })()
@@ -1585,7 +1599,8 @@ impl Imap {
         info!(context, "set metadata: {:?}, {:?}", mbox, keyval);
 
         if let Some(ref mut session) = &mut *self.session.lock().unwrap() {
-            Ok(session.set_metadata(mbox, keyval)?)
+            let res = session.set_metadata(mbox, keyval)?;
+            Ok(res)
         } else {
             Err(format_err!("Cannot acquire session"))
         }

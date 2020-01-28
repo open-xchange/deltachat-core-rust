@@ -274,6 +274,7 @@ impl Job {
             match inbox.set_metadata(context, "", &meta) {
                 Ok(_) => {
                     context.call_cb(Event::SetMetadataDone { foreign_id: self.foreign_id });
+                    inbox.update_metadata(context, None, None);
                 },
                 Err(e) => {
                     error!(context, "Cannot set metadata: {} ({})", e, self.foreign_id);
