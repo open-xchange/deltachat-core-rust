@@ -369,22 +369,17 @@ impl Job {
                     }
                 }
             }
+            self.maybe_move(context, msg.server_uid, folder, inbox);
         }
     }
 
-    #[allow(non_snake_case)]
-    fn do_DC_JOB_MARKSEEN_MDN_ON_IMAP(&mut self, context: &Context) {
-        let folder = self
-            .param
-            .get(Param::ServerFolder)
-            .unwrap_or_default()
-            .to_string();
-        let uid = self.param.get_int(Param::ServerUid).unwrap_or_default() as u32;
-        let inbox = context.inbox.read().unwrap();
-        if inbox.set_seen(context, &folder, uid) == ImapResult::RetryLater {
-            self.try_again_later(3i32, None);
-            return;
-        }
+    fn maybe_move(
+        &mut self,
+        context: &Context,
+        uid: u32,
+        folder: &str,
+        inbox: std::sync::RwLockReadGuard<'_, Imap>
+    ) {
         if 0 != self.param.get_int(Param::AlsoMove).unwrap_or_default() {
             if context
                 .sql
@@ -406,6 +401,22 @@ impl Job {
                 }
             }
         }
+    }
+
+    #[allow(non_snake_case)]
+    fn do_DC_JOB_MARKSEEN_MDN_ON_IMAP(&mut self, context: &Context) {
+        let folder = self
+            .param
+            .get(Param::ServerFolder)
+            .unwrap_or_default()
+            .to_string();
+        let uid = self.param.get_int(Param::ServerUid).unwrap_or_default() as u32;
+        let inbox = context.inbox.read().unwrap();
+        if inbox.set_seen(context, &folder, uid) == ImapResult::RetryLater {
+            self.try_again_later(3i32, None);
+            return;
+        }
+        self.maybe_move(context, uid, &folder, inbox);
     }
 }
 
