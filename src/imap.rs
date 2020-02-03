@@ -1702,6 +1702,6 @@ fn precheck_imf(context: &Context, rfc724_mid: &str, server_folder: &str, server
 }
 
 fn prefetch_get_message_id(prefetch_msg: &imap::types::Fetch) -> Result<String, Error> {
-    let message_id = prefetch_msg.envelope().unwrap().message_id.unwrap();
+    let message_id = prefetch_msg.envelope().unwrap().message_id.unwrap_or(b"");
     wrapmime::parse_message_id(std::str::from_utf8(message_id).unwrap())
 }
