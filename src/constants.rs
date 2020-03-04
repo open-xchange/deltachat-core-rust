@@ -1,4 +1,4 @@
-//! Constants
+//! # Constants
 #![allow(non_camel_case_types, dead_code)]
 
 use deltachat_derive::*;
@@ -6,21 +6,6 @@ use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref DC_VERSION_STR: String = env!("CARGO_PKG_VERSION").to_string();
-}
-
-#[repr(u8)]
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, ToSql, FromSql)]
-pub enum MoveState {
-    Undefined = 0,
-    Pending = 1,
-    Stay = 2,
-    Moving = 3,
-}
-
-impl Default for MoveState {
-    fn default() -> Self {
-        MoveState::Undefined
-    }
 }
 
 // some defaults
@@ -44,24 +29,39 @@ impl Default for Blocked {
     }
 }
 
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+#[repr(u8)]
+pub enum ShowEmails {
+    Off = 0,
+    AcceptedContacts = 1,
+    All = 2,
+}
+
+impl Default for ShowEmails {
+    fn default() -> Self {
+        ShowEmails::Off // also change Config.ShowEmails props(default) on changes
+    }
+}
+
 pub const DC_IMAP_SEEN: u32 = 0x1;
 
 pub const DC_HANDSHAKE_CONTINUE_NORMAL_PROCESSING: i32 = 0x01;
 pub const DC_HANDSHAKE_STOP_NORMAL_PROCESSING: i32 = 0x02;
 pub const DC_HANDSHAKE_ADD_DELETE_JOB: i32 = 0x04;
 
+pub(crate) const DC_FROM_HANDSHAKE: i32 = 0x01;
+
 pub const DC_GCL_ARCHIVED_ONLY: usize = 0x01;
 pub const DC_GCL_NO_SPECIALS: usize = 0x02;
 pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
 
-const DC_GCM_ADDDAYMARKER: usize = 0x01;
+pub const DC_GCM_ADDDAYMARKER: u32 = 0x01;
 
 pub const DC_GCL_VERIFIED_ONLY: usize = 0x01;
 pub const DC_GCL_ADD_SELF: usize = 0x02;
 
-// values for DC_PARAM_FORCE_PLAINTEXT
-pub(crate) const DC_FP_NO_AUTOCRYPT_HEADER: i32 = 2;
-pub(crate) const DC_FP_ADD_AUTOCRYPT_HEADER: i32 = 1;
+// unchanged user avatars are resent to the recipients every some days
+pub const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
 
 /// virtual chat showing all messages belonging to chats flagged with chats.blocked=2
 pub(crate) const DC_CHAT_ID_DEADDROP: u32 = 1;
@@ -106,20 +106,28 @@ impl Default for Chattype {
 }
 
 pub const DC_MSG_ID_MARKER1: u32 = 1;
-const DC_MSG_ID_DAYMARKER: u32 = 9;
+pub const DC_MSG_ID_DAYMARKER: u32 = 9;
 pub const DC_MSG_ID_LAST_SPECIAL: u32 = 9;
 
 /// approx. max. length returned by dc_msg_get_text()
 const DC_MAX_GET_TEXT_LEN: usize = 30000;
 /// approx. max. length returned by dc_get_msg_info()
-const DC_MAX_GET_INFO_LEN: usize = 100000;
+const DC_MAX_GET_INFO_LEN: usize = 100_000;
 
 pub const DC_CONTACT_ID_UNDEFINED: u32 = 0;
 pub const DC_CONTACT_ID_SELF: u32 = 1;
-pub const DC_CONTACT_ID_DEVICE: u32 = 2;
+pub const DC_CONTACT_ID_INFO: u32 = 2;
+pub const DC_CONTACT_ID_DEVICE: u32 = 5;
 pub const DC_CONTACT_ID_LAST_SPECIAL: u32 = 9;
 
-pub const DC_CREATE_MVBOX: usize = 1;
+// decorative address that is used for DC_CONTACT_ID_DEVICE
+// when an api that returns an email is called.
+pub const DC_CONTACT_ID_DEVICE_ADDR: &str = "device@localhost";
+
+// Flags for empty server job
+
+pub const DC_EMPTY_MVBOX: u32 = 0x01;
+pub const DC_EMPTY_INBOX: u32 = 0x02;
 
 // Flags for configuring IMAP and SMTP servers.
 // These flags are optional
@@ -174,10 +182,14 @@ pub const DC_VC_CONTACT_CONFIRM: i32 = 6;
 pub const DC_BOB_ERROR: i32 = 0;
 pub const DC_BOB_SUCCESS: i32 = 1;
 
+// max. width/height of an avatar
+pub const AVATAR_SIZE: u32 = 192;
+
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
 #[repr(i32)]
 pub enum Viewtype {
     Unknown = 0,
+
     /// Text message.
     /// The text of the message is set using dc_msg_set_text()
     /// and retrieved with dc_msg_get_text().
@@ -500,13 +512,8 @@ const DC_ERROR_SEE_STRING: usize = 0; // deprecated;
 const DC_ERROR_SELF_NOT_IN_GROUP: usize = 1; // deprecated;
 const DC_STR_SELFNOTINGRP: usize = 21; // deprecated;
 
-/// Values for dc_get|set_config("show_emails")
-const DC_SHOW_EMAILS_OFF: usize = 0;
-const DC_SHOW_EMAILS_ACCEPTED_CONTACTS: usize = 1;
-const DC_SHOW_EMAILS_ALL: usize = 2;
-
 // TODO: Strings need some doumentation about used placeholders.
-// These constants are used to request strings using #DC_EVENT_GET_STRING.
+// These constants are used to set stock translation strings
 
 const DC_STR_NOMESSAGES: usize = 1;
 const DC_STR_SELF: usize = 2;

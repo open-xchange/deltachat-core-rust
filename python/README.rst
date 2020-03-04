@@ -3,88 +3,53 @@ deltachat python bindings
 =========================
 
 This package provides bindings to the deltachat-core_ Rust -library
-which provides imap/smtp/crypto handling as well as chat/group/messages
-handling to Android, Desktop and IO user interfaces.
-
-Installing pre-built packages (linux-only)
-==========================================
-
-If you have a linux system you may install the ``deltachat`` binary "wheel" package
-without any "build-from-source" steps.
-
-1. `Install virtualenv <https://virtualenv.pypa.io/en/stable/installation/>`_,
-   then create a fresh python environment and activate it in your shell::
-
-        virtualenv venv  # or: python -m venv
-        source venv/bin/activate
-
-   Afterwards, invoking ``python`` or ``pip install`` will only
-   modify files in your ``venv`` directory and leave your system installation
-   alone.
-
-2. Install the wheel for linux::
-
-        pip install deltachat
-
-    Verify it worked by typing::
-
-        python -c "import deltachat"
+which implements IMAP/SMTP/MIME/PGP e-mail standards and offers
+a low-level Chat/Contact/Message API to user interfaces and bots.
 
 
-Installing a wheel from a PR/branch
----------------------------------------
+Installing bindings from source (Updated: 20-Jan-2020)
+=========================================================
 
-For Linux, we automatically build wheels for all github PR branches
-and push them to a python package index. To install the latest github ``master`` branch::
+Install Rust and Cargo first.  Deltachat needs a specific nightly
+version, the easiest is probably to first install Rust stable from
+rustup and then use this to install the correct nightly version.
 
-    pip install -i https://m.devpi.net/dc/master deltachat
+Bootstrap Rust and Cargo by using rustup::
 
-.. note::
+   curl https://sh.rustup.rs -sSf | sh
 
-    If you can help to automate the building of wheels for Mac or Windows,
-    that'd be much appreciated! please then get
-    `in contact with us <https://delta.chat/en/contribute>`_.
+Then GIT clone the deltachat-core-rust repo and get the actual
+rust- and cargo-toolchain needed by deltachat::
 
+   git clone https://github.com/deltachat/deltachat-core-rust
+   cd deltachat-core-rust
+   rustup show
 
-Installing bindings from source
-===============================
+To install the Delta Chat Python bindings make sure you have Python3 installed.
+E.g. on Debian-based systems `apt install python3 python3-pip
+python3-venv` should give you a usable python installation.
 
-If you can't use "binary" method above then you need to compile
-to core deltachat library::
+Ensure you are in the deltachat-core-rust/python directory, create the
+virtual environment and activate it in your shell::
 
-    git clone https://github.com/deltachat/deltachat-core-rust
-    cd deltachat-core-rust
-    cd python
+   cd python
+   python3 -m venv venv  # or: virtualenv venv
+   source venv/bin/activate
 
-If you don't have one active, create and activate a python "virtualenv":
+You should now be able to build the python bindings using the supplied script::
 
-    python virtualenv venv  # or python -m venv
-    source venv/bin/activate
+   ./install_python_bindings.py
 
-Afterwards ``which python`` tells you that it comes out of the "venv"
-directory that contains all python install artifacts. Let's first
-install test tools::
-
-    pip install pytest pytest-timeout pytest-rerunfailures requests
-
-then cargo-build and install the deltachat bindings::
-
-    python install_python_bindings.py
-
+The installation might take a while, depending on your machine.
 The bindings will be installed in release mode but with debug symbols.
-The release mode is necessary because some tests generate RSA keys
-which is prohibitively slow in debug mode.
+The release mode is currently necessary because some tests generate RSA keys
+which is prohibitively slow in non-release mode.
 
-After successful binding installation you can finally run the tests::
+After successful binding installation you can install a few more
+Python packages before running the tests::
 
+    python -m pip install pytest pytest-timeout pytest-rerunfailures requests
     pytest -v tests
-
-.. note::
-
-    Some tests are sometimes failing/hanging because of
-    https://github.com/deltachat/deltachat-core-rust/issues/331
-    and
-    https://github.com/deltachat/deltachat-core-rust/issues/326
 
 
 running "live" tests (experimental)
@@ -104,6 +69,38 @@ With ``DCC_PY_LIVECONFIG`` set pytest invocations will use real
 e-mail accounts and run through all functional "liveconfig" tests.
 
 
+Installing pre-built packages (Linux-only)
+========================================================
+
+If you have a Linux system you may try to install the ``deltachat`` binary "wheel" packages
+without any "build-from-source" steps.
+
+We suggest to `Install virtualenv <https://virtualenv.pypa.io/en/stable/installation/>`_,
+then create a fresh Python virtual environment and activate it in your shell::
+
+        virtualenv venv  # or: python -m venv
+        source venv/bin/activate
+
+Afterwards, invoking ``python`` or ``pip install`` only
+modifies files in your ``venv`` directory and leaves
+your system installation alone.
+
+For Linux, we automatically build wheels for all github PR branches
+and push them to a python package index. To install the latest
+github ``master`` branch::
+
+    pip install --pre -i https://m.devpi.net/dc/master deltachat
+
+To verify it worked::
+
+    python -c "import deltachat"
+
+.. note::
+
+    If you can help to automate the building of wheels for Mac or Windows,
+    that'd be much appreciated! please then get
+    `in contact with us <https://delta.chat/en/contribute>`_.
+
 
 Code examples
 =============
@@ -115,15 +112,11 @@ You may look at `examples <https://py.delta.chat/examples.html>`_.
 .. _`deltachat-core`: https://github.com/deltachat/deltachat-core-rust
 
 
-Building manylinux1 wheels
-==========================
-
-.. note::
-
-   This section may not fully work.
+Building manylinux1 based wheels
+================================
 
 Building portable manylinux1 wheels which come with libdeltachat.so
-and all it's dependencies is easy using the provided docker tooling.
+can be done with docker-tooling.
 
 using docker pull / premade images
 ------------------------------------
@@ -136,9 +129,9 @@ organization::
 
 This docker image can be used to run tests and build Python wheels for all interpreters::
 
-    $ bash ci_scripts/ci_run.sh
-
-This command runs tests and build-wheel scripts in a docker container.
+    $ docker run -e DCC_PY_LIVECONFIG \
+       --rm -it -v \$(pwd):/mnt -w /mnt \
+       deltachat/coredeps ci_scripts/run_all.sh
 
 
 Optionally build your own docker image

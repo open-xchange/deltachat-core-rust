@@ -1,12 +1,14 @@
+//! # Import/export module
+
 use core::cmp::{max, min};
-use std::ffi::CString;
-use std::path::{Path, PathBuf};
-use std::ptr;
+use std::path::Path;
 
 use num_traits::FromPrimitive;
 use rand::{thread_rng, Rng};
 
+use crate::blob::BlobObject;
 use crate::chat;
+use crate::chat::delete_and_reset_all_device_msgs;
 use crate::config::Config;
 use crate::configure::*;
 use crate::constants::*;
@@ -17,9 +19,10 @@ use crate::error::*;
 use crate::events::Event;
 use crate::job::*;
 use crate::key::*;
-use crate::message::Message;
+use crate::message::{Message, MsgId};
+use crate::mimeparser::SystemMessage;
 use crate::param::*;
-use crate::pgp::*;
+use crate::pgp;
 use crate::sql::{self, Sql};
 use crate::stock::StockMessage;
 
@@ -31,16 +34,19 @@ pub enum ImexMode {
     /// and `private-key-default.asc`, if there are more keys, they are written to files as
     /// `public-key-<id>.asc` and `private-key-<id>.asc`
     ExportSelfKeys = 1,
+
     /// Import private keys found in the directory given as `param1`.
     /// The last imported key is made the default keys unless its name contains the string `legacy`.
     /// Public keys are not imported.
     ImportSelfKeys = 2,
+
     /// Export a backup to the directory given as `param1`.
     /// The backup contains all contacts, chats, images and other data and device independent settings.
     /// The backup does not contain device dependent settings as ringtones or LED notification settings.
     /// The name of the backup is typically `delta-chat.<day>.bak`, if more than one backup is create on a day,
     /// the format is `delta-chat.<day>-<number>.bak`
     ExportBackup = 11,
+
     /// `param1` is the file (not: directory) to import. The file is normally
     /// created by DC_IMEX_EXPORT_BACKUP and detected by dc_imex_has_backup(). Importing a backup
     /// is only possible as long as the context is not configured or used in another way.
@@ -49,9 +55,9 @@ pub enum ImexMode {
 
 /// Import/export things.
 /// For this purpose, the function creates a job that is executed in the IMAP-thread then;
-/// this requires to call dc_perform_imap_jobs() regularly.
+/// this requires to call dc_perform_inbox_jobs() regularly.
 ///
-/// What to do is defined by the _what_ parameter.
+/// What to do is defined by the *what* parameter.
 ///
 /// While dc_imex() returns immediately, the started job may take a while,
 /// you can stop it using dc_stop_ongoing_process(). During execution of the job,
@@ -75,37 +81,36 @@ pub fn imex(context: &Context, what: ImexMode, param1: Option<impl AsRef<Path>>)
     job_add(context, Action::ImexImap, 0, param, 0);
 }
 
-/// Returns the filename of the backup if found, nullptr otherwise.
+/// Returns the filename of the backup found (otherwise an error)
 pub fn has_backup(context: &Context, dir_name: impl AsRef<Path>) -> Result<String> {
     let dir_name = dir_name.as_ref();
     let dir_iter = std::fs::read_dir(dir_name)?;
     let mut newest_backup_time = 0;
     let mut newest_backup_path: Option<std::path::PathBuf> = None;
     for dirent in dir_iter {
-        match dirent {
-            Ok(dirent) => {
-                let path = dirent.path();
-                let name = dirent.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("delta-chat") && name.ends_with(".bak") {
-                    let sql = Sql::new();
-                    if sql.open(context, &path, 0x1) {
-                        let curr_backup_time =
-                            sql.get_raw_config_int(context, "backup_time")
-                                .unwrap_or_default() as u64;
-                        if curr_backup_time > newest_backup_time {
-                            newest_backup_path = Some(path);
-                            newest_backup_time = curr_backup_time;
-                        }
+        if let Ok(dirent) = dirent {
+            let path = dirent.path();
+            let name = dirent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("delta-chat") && name.ends_with(".bak") {
+                let sql = Sql::new();
+                if sql.open(context, &path, true) {
+                    let curr_backup_time = sql
+                        .get_raw_config_int(context, "backup_time")
+                        .unwrap_or_default();
+                    if curr_backup_time > newest_backup_time {
+                        newest_backup_path = Some(path);
+                        newest_backup_time = curr_backup_time;
                     }
+                    info!(context, "backup_time of {} is {}", name, curr_backup_time);
+                    sql.close(&context);
                 }
             }
-            Err(_) => (),
         }
     }
     match newest_backup_path {
         Some(path) => Ok(path.to_string_lossy().into_owned()),
-        None => bail!("no backup found"),
+        None => bail!("no backup found in {}", dir_name.display()),
     }
 }
 
@@ -124,21 +129,24 @@ fn do_initiate_key_transfer(context: &Context) -> Result<String> {
     let setup_file_content = render_setup_file(context, &setup_code)?;
     /* encrypting may also take a while ... */
     ensure!(!context.shall_stop_ongoing(), "canceled");
-    let setup_file_name = context.new_blob_file(
+    let setup_file_blob = BlobObject::create(
+        context,
         "autocrypt-setup-message.html",
         setup_file_content.as_bytes(),
     )?;
 
-    let chat_id = chat::create_by_contact_id(context, 1)?;
+    let chat_id = chat::create_by_contact_id(context, DC_CONTACT_ID_SELF)?;
     msg = Message::default();
-    msg.type_0 = Viewtype::File;
-    msg.param.set(Param::File, setup_file_name);
+    msg.viewtype = Viewtype::File;
+    msg.param.set(Param::File, setup_file_blob.as_name());
 
     msg.param
         .set(Param::MimeType, "application/autocrypt-setup");
-    msg.param.set_int(Param::Cmd, 6);
-    msg.param
-        .set_int(Param::ForcePlaintext, DC_FP_NO_AUTOCRYPT_HEADER);
+    msg.param.set_cmd(SystemMessage::AutocryptSetupMessage);
+    msg.param.set_int(
+        Param::ForcePlaintext,
+        ForcePlaintext::NoAutocryptHeader as i32,
+    );
 
     ensure!(!context.shall_stop_ongoing(), "canceled");
     let msg_id = chat::send_msg(context, chat_id, &mut msg)?;
@@ -152,6 +160,11 @@ fn do_initiate_key_transfer(context: &Context) -> Result<String> {
             }
         }
     }
+    // no maybe_add_bcc_self_device_msg() here.
+    // the ui shows the dialog with the setup code on this device,
+    // it would be too much noise to have two things popping up at the same time.
+    // maybe_add_bcc_self_device_msg() is called on the other device
+    // once the transfer is completed.
     Ok(setup_code)
 }
 
@@ -165,13 +178,13 @@ pub fn render_setup_file(context: &Context, passphrase: &str) -> Result<String> 
     );
     let self_addr = e2ee::ensure_secret_key_exists(context)?;
     let private_key = Key::from_self_private(context, self_addr, &context.sql)
-        .ok_or(format_err!("Failed to get private key."))?;
+        .ok_or_else(|| format_err!("Failed to get private key."))?;
     let ac_headers = match context.get_config_bool(Config::E2eeEnabled) {
         false => None,
         true => Some(("Autocrypt-Prefer-Encrypt", "mutual")),
     };
     let private_key_asc = private_key.to_asc(ac_headers);
-    let encr = dc_pgp_symm_encrypt(&passphrase, private_key_asc.as_bytes())?;
+    let encr = pgp::symm_encrypt(&passphrase, private_key_asc.as_bytes())?;
 
     let replacement = format!(
         concat!(
@@ -212,7 +225,7 @@ pub fn create_setup_code(_context: &Context) -> String {
     for i in 0..9 {
         loop {
             random_val = rng.gen();
-            if !(random_val as usize > 60000) {
+            if random_val as usize <= 60000 {
                 break;
             }
         }
@@ -227,32 +240,38 @@ pub fn create_setup_code(_context: &Context) -> String {
     ret
 }
 
-pub fn continue_key_transfer(context: &Context, msg_id: u32, setup_code: &str) -> Result<()> {
-    ensure!(msg_id > DC_MSG_ID_LAST_SPECIAL, "wrong id");
-
-    let msg = Message::load_from_db(context, msg_id);
-    if msg.is_err() {
-        bail!("Message is no Autocrypt Setup Message.");
+fn maybe_add_bcc_self_device_msg(context: &Context) -> Result<()> {
+    if !context.sql.get_raw_config_bool(context, "bcc_self") {
+        let mut msg = Message::new(Viewtype::Text);
+        // TODO: define this as a stockstring once the wording is settled.
+        msg.text = Some(
+            "It seems you are using multiple devices with Delta Chat. Great!\n\n\
+             If you also want to synchronize outgoing messages accross all devices, \
+             go to the settings and enable \"Send copy to self\"."
+                .to_string(),
+        );
+        chat::add_device_msg(context, Some("bcc-self-hint"), Some(&mut msg))?;
     }
-    let msg = msg.unwrap_or_default();
+    Ok(())
+}
+
+pub fn continue_key_transfer(context: &Context, msg_id: MsgId, setup_code: &str) -> Result<()> {
+    ensure!(!msg_id.is_special(), "wrong id");
+
+    let msg = Message::load_from_db(context, msg_id)?;
     ensure!(
         msg.is_setupmessage(),
         "Message is no Autocrypt Setup Message."
     );
 
     if let Some(filename) = msg.get_file(context) {
-        if let Ok(ref mut buf) = dc_read_file(context, filename) {
-            let sc = normalize_setup_code(setup_code);
-            if let Ok(armored_key) = decrypt_setup_file(context, sc, buf) {
-                set_self_key(context, &armored_key, true, true)?;
-            } else {
-                bail!("Bad setup code.")
-            }
+        let file = dc_open_file(context, filename)?;
+        let sc = normalize_setup_code(setup_code);
+        let armored_key = decrypt_setup_file(context, &sc, file)?;
+        set_self_key(context, &armored_key, true, true)?;
+        maybe_add_bcc_self_device_msg(context)?;
 
-            Ok(())
-        } else {
-            bail!("Cannot read Autocrypt Setup Message file.");
-        }
+        Ok(())
     } else {
         bail!("Message is no Autocrypt Setup Message.");
     }
@@ -326,53 +345,15 @@ fn set_self_key(
     Ok(())
 }
 
-fn decrypt_setup_file(
+fn decrypt_setup_file<T: std::io::Read + std::io::Seek>(
     _context: &Context,
-    passphrase: impl AsRef<str>,
-    filecontent: &mut [u8],
+    passphrase: &str,
+    file: T,
 ) -> Result<String> {
-    let mut fc_headerline = String::default();
-    let mut fc_base64: *const libc::c_char = ptr::null();
+    let plain_bytes = pgp::symm_decrypt(passphrase, file)?;
+    let plain_text = std::string::String::from_utf8(plain_bytes)?;
 
-    let split_result = unsafe {
-        dc_split_armored_data(
-            filecontent.as_mut_ptr().cast(),
-            &mut fc_headerline,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut fc_base64,
-        )
-    };
-
-    if !split_result || fc_headerline != "-----BEGIN PGP MESSAGE-----" || fc_base64.is_null() {
-        bail!("Invalid armored data");
-    }
-
-    // convert base64 to binary
-    let base64_encoded =
-        unsafe { std::slice::from_raw_parts(fc_base64 as *const u8, libc::strlen(fc_base64)) };
-
-    let data = base64_decode(&base64_encoded)?;
-
-    // decrypt symmetrically
-    let payload = dc_pgp_symm_decrypt(passphrase.as_ref(), &data)?;
-    let payload_str = String::from_utf8(payload)?;
-
-    Ok(payload_str)
-}
-
-/// Decode the base64 encoded slice. Handles line breaks.
-fn base64_decode(input: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let c = std::io::Cursor::new(input);
-    let lr = pgp::line_reader::LineReader::new(c);
-    let br = pgp::base64_reader::Base64Reader::new(lr);
-    let mut reader = pgp::base64_decoder::Base64Decoder::new(br);
-
-    let mut data = Vec::new();
-    reader.read_to_end(&mut data)?;
-
-    Ok(data)
+    Ok(plain_text)
 }
 
 pub fn normalize_setup_code(s: &str) -> String {
@@ -389,7 +370,7 @@ pub fn normalize_setup_code(s: &str) -> String {
 }
 
 #[allow(non_snake_case)]
-pub fn job_do_DC_JOB_IMEX_IMAP(context: &Context, job: &Job) -> Result<()> {
+pub fn JobImexImap(context: &Context, job: &Job) -> Result<()> {
     ensure!(context.alloc_ongoing(), "could not allocate ongoing");
     let what: Option<ImexMode> = job.param.get_int(Param::Cmd).and_then(ImexMode::from_i32);
     let param = job.param.get(Param::Arg).unwrap_or_default();
@@ -405,7 +386,7 @@ pub fn job_do_DC_JOB_IMEX_IMAP(context: &Context, job: &Job) -> Result<()> {
             context.free_ongoing();
             bail!("Cannot create private key or private key not available.");
         } else {
-            dc_create_folder(context, &param);
+            dc_create_folder(context, &param)?;
         }
     }
     let path = Path::new(param);
@@ -448,7 +429,7 @@ fn import_backup(context: &Context, backup_to_import: impl AsRef<Path>) -> Resul
     context.sql.close(&context);
     dc_delete_file(context, context.get_dbfile());
     ensure!(
-        !dc_file_exist(context, context.get_dbfile()),
+        !context.get_dbfile().exists(),
         "Cannot delete old database."
     );
 
@@ -459,9 +440,11 @@ fn import_backup(context: &Context, backup_to_import: impl AsRef<Path>) -> Resul
     /* error already logged */
     /* re-open copied database file */
     ensure!(
-        context.sql.open(&context, &context.get_dbfile(), 0),
+        context.sql.open(&context, &context.get_dbfile(), false),
         "could not re-open db"
     );
+
+    delete_and_reset_all_device_msgs(&context)?;
 
     let total_files_cnt = context
         .sql
@@ -484,7 +467,9 @@ fn import_backup(context: &Context, backup_to_import: impl AsRef<Path>) -> Resul
         |files| {
             for (processed_files_cnt, file) in files.enumerate() {
                 let (file_name, file_blob) = file?;
-                ensure!(!context.shall_stop_ongoing(), "received stop signal");
+                if context.shall_stop_ongoing() {
+                    return Ok(false);
+                }
                 let mut permille = processed_files_cnt * 1000 / total_files_cnt;
                 if permille < 10 {
                     permille = 10
@@ -498,25 +483,25 @@ fn import_backup(context: &Context, backup_to_import: impl AsRef<Path>) -> Resul
                 }
 
                 let path_filename = context.get_blobdir().join(file_name);
-                if dc_write_file(context, &path_filename, &file_blob) {
-                    continue;
-                }
-                bail!(
-                    "Storage full? Cannot write file {} with {} bytes.",
-                    path_filename.display(),
-                    file_blob.len(),
-                );
+                dc_write_file(context, &path_filename, &file_blob)?;
             }
-            Ok(())
+            Ok(true)
         },
     );
 
-    res.and_then(|_| {
-        // only delete backup_blobs if all files were successfully extracted
-        sql::execute(context, &context.sql, "DROP TABLE backup_blobs;", params![])?;
-        sql::try_execute(context, &context.sql, "VACUUM;").ok();
-        Ok(())
-    })
+    match res {
+        Ok(all_files_extracted) => {
+            if all_files_extracted {
+                // only delete backup_blobs if all files were successfully extracted
+                sql::execute(context, &context.sql, "DROP TABLE backup_blobs;", params![])?;
+                sql::try_execute(context, &context.sql, "VACUUM;").ok();
+                Ok(())
+            } else {
+                bail!("received stop signal");
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /*******************************************************************************
@@ -530,51 +515,56 @@ fn export_backup(context: &Context, dir: impl AsRef<Path>) -> Result<()> {
     // let dest_path_filename = dc_get_next_backup_file(context, dir, res);
     let now = time();
     let dest_path_filename = dc_get_next_backup_path(dir, now)?;
+    let dest_path_string = dest_path_filename.to_string_lossy().to_string();
 
     sql::housekeeping(context);
 
     sql::try_execute(context, &context.sql, "VACUUM;").ok();
+
+    // we close the database during the copy of the dbfile
     context.sql.close(context);
     info!(
         context,
-        "Backup \"{}\" to \"{}\".",
+        "Backup '{}' to '{}'.",
         context.get_dbfile().display(),
         dest_path_filename.display(),
     );
     let copied = dc_copy_file(context, context.get_dbfile(), &dest_path_filename);
-    context.sql.open(&context, &context.get_dbfile(), 0);
+    context.sql.open(&context, &context.get_dbfile(), false);
+
     if !copied {
-        let s = dest_path_filename.to_string_lossy().to_string();
         bail!(
-            "could not copy file from {:?} to {:?}",
-            context.get_dbfile(),
-            s
+            "could not copy file from '{}' to '{}'",
+            context.get_dbfile().display(),
+            dest_path_string
         );
     }
-    match add_files_to_export(context, &dest_path_filename) {
+    let dest_sql = Sql::new();
+    ensure!(
+        dest_sql.open(context, &dest_path_filename, false),
+        "could not open exported database {}",
+        dest_path_string
+    );
+    let res = match add_files_to_export(context, &dest_sql) {
         Err(err) => {
             dc_delete_file(context, &dest_path_filename);
             error!(context, "backup failed: {}", err);
             Err(err)
         }
         Ok(()) => {
-            context
-                .sql
-                .set_raw_config_int(context, "backup_time", now as i32)?;
-            context.call_cb(Event::ImexFileWritten(dest_path_filename.clone()));
+            dest_sql.set_raw_config_int(context, "backup_time", now as i32)?;
+            context.call_cb(Event::ImexFileWritten(dest_path_filename));
             Ok(())
         }
-    }
+    };
+    dest_sql.close(context);
+
+    Ok(res?)
 }
 
-fn add_files_to_export(context: &Context, dest_path_filename: &PathBuf) -> Result<()> {
+fn add_files_to_export(context: &Context, sql: &Sql) -> Result<()> {
     // add all files as blobs to the database copy (this does not require
     // the source to be locked, neigher the destination as it is used only here)
-    let sql = Sql::new();
-    ensure!(
-        sql.open(context, &dest_path_filename, 0),
-        "could not open db"
-    );
     if !sql.table_exists("backup_blobs") {
         sql::execute(
             context,
@@ -592,16 +582,15 @@ fn add_files_to_export(context: &Context, dest_path_filename: &PathBuf) -> Resul
     info!(context, "EXPORT: total_files_cnt={}", total_files_cnt);
     // scan directory, pass 2: copy files
     let dir_handle = std::fs::read_dir(&dir)?;
-    sql.prepare(
+    let exported_all_files = sql.prepare(
         "INSERT INTO backup_blobs (file_name, file_content) VALUES (?, ?);",
         |mut stmt, _| {
             let mut processed_files_cnt = 0;
             for entry in dir_handle {
                 let entry = entry?;
-                ensure!(
-                    !context.shall_stop_ongoing(),
-                    "canceled during export-files"
-                );
+                if context.shall_stop_ongoing() {
+                    return Ok(false);
+                }
                 processed_files_cnt += 1;
                 let permille = max(min(processed_files_cnt * 1000 / total_files_cnt, 990), 10);
                 context.call_cb(Event::ImexProgress(permille));
@@ -621,9 +610,10 @@ fn add_files_to_export(context: &Context, dest_path_filename: &PathBuf) -> Resul
                     stmt.execute(params![name, buf])?;
                 }
             }
-            Ok(())
+            Ok(true)
         },
     )?;
+    ensure!(exported_all_files, "canceled during export-files");
     Ok(())
 }
 
@@ -638,7 +628,6 @@ fn import_self_keys(context: &Context, dir: impl AsRef<Path>) -> Result<()> {
     Maybe we should make the "default" key handlong also a little bit smarter
     (currently, the last imported key is the standard key unless it contains the string "legacy" in its name) */
     let mut set_default: bool;
-    let mut key: String;
     let mut imported_cnt = 0;
 
     let dir_name = dir.as_ref().to_string_lossy();
@@ -663,40 +652,17 @@ fn import_self_keys(context: &Context, dir: impl AsRef<Path>) -> Result<()> {
                 continue;
             }
         }
-        let ccontent = if let Ok(content) = dc_read_file(context, &path_plus_name) {
-            key = String::from_utf8_lossy(&content).to_string();
-            CString::new(content).unwrap_or_default()
-        } else {
-            continue;
-        };
-
-        /* only import if we have a private key */
-        let mut buf2_headerline = String::default();
-        let split_res: bool;
-        unsafe {
-            let buf2 = dc_strdup(ccontent.as_ptr());
-            split_res = dc_split_armored_data(
-                buf2,
-                &mut buf2_headerline,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
-            libc::free(buf2 as *mut libc::c_void);
+        match dc_read_file(context, &path_plus_name) {
+            Ok(buf) => {
+                let armored = std::string::String::from_utf8_lossy(&buf);
+                if let Err(err) = set_self_key(context, &armored, set_default, false) {
+                    error!(context, "set_self_key: {}", err);
+                    continue;
+                }
+            }
+            Err(_) => continue,
         }
-        if split_res
-            && buf2_headerline.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----")
-            && !key.contains("-----BEGIN PGP PRIVATE KEY BLOCK")
-        {
-            info!(context, "ignoring public key file '{}", name_f);
-            // it's fine: DC exports public with private
-            continue;
-        }
-        if let Err(err) = set_self_key(context, &key, set_default, false) {
-            error!(context, "set_self_key: {}", err);
-            continue;
-        }
-        imported_cnt += 1
+        imported_cnt += 1;
     }
     ensure!(
         imported_cnt > 0,
@@ -727,14 +693,14 @@ fn export_self_keys(context: &Context, dir: impl AsRef<Path>) -> Result<()> {
                 let (id, public_key, private_key, is_default) = key_pair?;
                 let id = Some(id).filter(|_| is_default != 0);
                 if let Some(key) = public_key {
-                    if !export_key_to_asc_file(context, &dir, id, &key) {
+                    if export_key_to_asc_file(context, &dir, id, &key).is_err() {
                         export_errors += 1;
                     }
                 } else {
                     export_errors += 1;
                 }
                 if let Some(key) = private_key {
-                    if !export_key_to_asc_file(context, &dir, id, &key) {
+                    if export_key_to_asc_file(context, &dir, id, &key).is_err() {
                         export_errors += 1;
                     }
                 } else {
@@ -758,8 +724,7 @@ fn export_key_to_asc_file(
     dir: impl AsRef<Path>,
     id: Option<i64>,
     key: &Key,
-) -> bool {
-    let mut success = false;
+) -> std::io::Result<()> {
     let file_name = {
         let kind = if key.is_public() { "public" } else { "private" };
         let id = id.map_or("default".into(), |i| i.to_string());
@@ -769,21 +734,22 @@ fn export_key_to_asc_file(
     info!(context, "Exporting key {}", file_name.display());
     dc_delete_file(context, &file_name);
 
-    if !key.write_asc_to_file(&file_name, context) {
+    let res = key.write_asc_to_file(&file_name, context);
+    if res.is_err() {
         error!(context, "Cannot write key to {}", file_name.display());
     } else {
         context.call_cb(Event::ImexFileWritten(file_name));
-        success = true;
     }
-
-    success
+    res
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::pgp::{split_armored_data, HEADER_AUTOCRYPT, HEADER_SETUPCODE};
     use crate::test_utils::*;
+    use ::pgp::armor::BlockType;
 
     #[test]
     fn test_render_setup_file() {
@@ -805,19 +771,12 @@ mod tests {
         assert!(msg.contains("-----END PGP MESSAGE-----\n"));
     }
 
-    fn ac_setup_msg_cb(ctx: &Context, evt: Event) -> libc::uintptr_t {
-        match evt {
-            Event::GetString {
-                id: StockMessage::AcSetupMsgBody,
-                ..
-            } => unsafe { "hello\r\nthere".strdup() as usize },
-            _ => logging_cb(ctx, evt),
-        }
-    }
-
     #[test]
-    fn otest_render_setup_file_newline_replace() {
-        let t = test_context(Some(Box::new(ac_setup_msg_cb)));
+    fn test_render_setup_file_newline_replace() {
+        let t = dummy_context();
+        t.ctx
+            .set_stock_translation(StockMessage::AcSetupMsgBody, "hello\r\nthere".to_string())
+            .unwrap();
         configure_alice_keypair(&t.ctx);
         let msg = render_setup_file(&t.ctx, "pw").unwrap();
         println!("{}", &msg);
@@ -845,7 +804,7 @@ mod tests {
         let base64 = include_str!("../test-data/key/public.asc");
         let key = Key::from_base64(base64, KeyType::Public).unwrap();
         let blobdir = "$BLOBDIR";
-        assert!(export_key_to_asc_file(&context.ctx, blobdir, None, &key));
+        assert!(export_key_to_asc_file(&context.ctx, blobdir, None, &key).is_ok());
         let blobdir = context.ctx.get_blobdir().to_str().unwrap();
         let filename = format!("{}/public-key-default.asc", blobdir);
         let bytes = std::fs::read(&filename).unwrap();
@@ -873,50 +832,26 @@ mod tests {
         let ctx = dummy_context();
         let context = &ctx.ctx;
 
-        let mut headerline = String::default();
-        let mut setupcodebegin = ptr::null();
-        let mut preferencrypt = ptr::null();
+        let buf_1 = S_EM_SETUPFILE.as_bytes().to_vec();
+        let (typ, headers, base64) = split_armored_data(&buf_1).unwrap();
+        assert_eq!(typ, BlockType::Message);
+        assert!(S_EM_SETUPCODE.starts_with(headers.get(HEADER_SETUPCODE).unwrap()));
+        assert!(headers.get(HEADER_AUTOCRYPT).is_none());
 
-        unsafe {
-            let buf_1 = S_EM_SETUPFILE.strdup();
-            let res = dc_split_armored_data(
-                buf_1,
-                &mut headerline,
-                &mut setupcodebegin,
-                &mut preferencrypt,
-                ptr::null_mut(),
-            );
-            libc::free(buf_1 as *mut libc::c_void);
-            assert!(res);
-        }
-        assert_eq!(headerline, "-----BEGIN PGP MESSAGE-----");
-        assert!(!setupcodebegin.is_null());
+        assert!(!base64.is_empty());
 
-        // TODO: verify that this is the right check
-        assert!(S_EM_SETUPCODE.starts_with(as_str(setupcodebegin)));
+        let setup_file = S_EM_SETUPFILE.to_string();
+        let decrypted = decrypt_setup_file(
+            context,
+            S_EM_SETUPCODE,
+            std::io::Cursor::new(setup_file.as_bytes()),
+        )
+        .unwrap();
 
-        assert!(preferencrypt.is_null());
+        let (typ, headers, _base64) = split_armored_data(decrypted.as_bytes()).unwrap();
 
-        let mut setup_file = S_EM_SETUPFILE.to_string();
-        let decrypted = unsafe {
-            decrypt_setup_file(context, S_EM_SETUPCODE, setup_file.as_bytes_mut()).unwrap()
-        };
-
-        unsafe {
-            let buf1 = decrypted.strdup();
-            assert!(dc_split_armored_data(
-                buf1,
-                &mut headerline,
-                &mut setupcodebegin,
-                &mut preferencrypt,
-                ptr::null_mut(),
-            ));
-            libc::free(buf1 as *mut libc::c_void);
-        }
-
-        assert_eq!(headerline, "-----BEGIN PGP PRIVATE KEY BLOCK-----");
-        assert!(setupcodebegin.is_null());
-        assert!(!preferencrypt.is_null());
-        assert_eq!(as_str(preferencrypt), "mutual",);
+        assert_eq!(typ, BlockType::PrivateKey);
+        assert_eq!(headers.get(HEADER_AUTOCRYPT), Some(&"mutual".to_string()));
+        assert!(headers.get(HEADER_SETUPCODE).is_none());
     }
 }

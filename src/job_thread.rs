@@ -1,19 +1,20 @@
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::configure::*;
 use crate::context::Context;
+use crate::error::{Error, Result};
 use crate::imap::Imap;
+use crate::coi::CoiDeltachatMode;
 
-#[derive(Debug, Copy, Clone)]
-pub enum JobThreadKind {
-    SentBox,
-    MoveBox,
-}
+// #[derive(Debug, Copy, Clone)]
+// pub enum JobThreadKind {
+//     SentBox,
+//     MoveBox,
+// }
 
 #[derive(Debug)]
 pub struct JobThread {
     name: &'static str,
-    job_thread_kind: JobThreadKind,
+    pub folder_config_name: &'static str,
     pub imap: Imap,
     state: Arc<(Mutex<JobState>, Condvar)>,
 }
@@ -21,20 +22,17 @@ pub struct JobThread {
 #[derive(Clone, Debug, Default)]
 pub struct JobState {
     idle: bool,
-    jobs_needed: i32,
+    jobs_needed: bool,
     suspended: bool,
     using_handle: bool,
 }
 
 impl JobThread {
-    pub fn new(job_thread_kind: JobThreadKind, imap: Imap) -> Self {
-        let name = match job_thread_kind {
-            JobThreadKind::SentBox => "SENTBOX",
-            JobThreadKind::MoveBox => "MVBOX",
-        };
+    pub fn new(name: &'static str, folder_config_name: &'static str, imap: Imap) -> Self {
+    // pub fn new(job_thread_kind: JobThreadKind, imap: Imap) -> Self {
         JobThread {
             name,
-            job_thread_kind,
+            folder_config_name,
             imap,
             state: Arc::new((Mutex::new(Default::default()), Condvar::new())),
         }
@@ -68,21 +66,22 @@ impl JobThread {
 
     pub fn interrupt_idle(&self, context: &Context) {
         {
-            self.state.0.lock().unwrap().jobs_needed = 1;
+            self.state.0.lock().unwrap().jobs_needed = true;
         }
 
         info!(context, "Interrupting {}-IDLE...", self.name);
 
-        self.imap.interrupt_idle();
+        self.imap.interrupt_idle(context);
 
         let &(ref lock, ref cvar) = &*self.state.clone();
         let mut state = lock.lock().unwrap();
 
         state.idle = true;
         cvar.notify_one();
+        info!(context, "Interrupting {}-IDLE... finished", self.name);
     }
 
-    pub fn fetch(&mut self, context: &Context, use_network: bool) {
+    pub async fn fetch(&mut self, context: &Context, use_network: bool) {
         {
             let &(ref lock, _) = &*self.state.clone();
             let mut state = lock.lock().unwrap();
@@ -95,73 +94,69 @@ impl JobThread {
         }
 
         if use_network {
-            let start = std::time::Instant::now();
-            if self.connect_to_imap(context) {
-                info!(context, "{}-fetch started...", self.name);
-                self.imap.fetch(context);
-
-                if self.imap.should_reconnect() {
-                    info!(context, "{}-fetch aborted, starting over...", self.name,);
-                    self.imap.fetch(context);
+            if let Err(err) = self.connect_and_fetch(context).await {
+                warn!(context, "connect+fetch failed: {}, reconnect & retry", err);
+                self.imap.trigger_reconnect();
+                if let Err(err) = self.connect_and_fetch(context).await {
+                    warn!(context, "connect+fetch failed: {}", err);
                 }
-                info!(
-                    context,
-                    "{}-fetch done in {:.3} ms.",
-                    self.name,
-                    start.elapsed().as_millis(),
-                );
             }
         }
-
         self.state.0.lock().unwrap().using_handle = false;
     }
 
-    // XXX: This might be broken!
-    fn folder_config_name(&self) -> &str {
-        match self.job_thread_kind {
-            JobThreadKind::SentBox => "configured_sentbox_folder",
-            JobThreadKind::MoveBox => "configured_mvbox_folder",
+    async fn connect_and_fetch(&mut self, context: &Context) -> Result<()> {
+        let prefix = format!("{}-fetch", self.name);
+        match self.imap.connect_configured(context) {
+            Ok(()) => {
+                let coi_deltachat_mode =
+                    self.imap
+                    .get_coi_config().await
+                    .map(|config| config.get_coi_deltachat_mode())
+                    .unwrap_or(CoiDeltachatMode::Disabled);
+                context.set_coi_deltachat_mode(coi_deltachat_mode);
+                
+                if let Some(watch_folder) = self.get_watch_folder(context) {
+                    let start = std::time::Instant::now();
+                    info!(context, "{} started...", prefix);
+                    let res = self
+                        .imap
+                        .fetch(context, &watch_folder)
+                        .await
+                        .map_err(Into::into);
+                    let elapsed = start.elapsed().as_millis();
+                    info!(context, "{} done in {:.3} ms.", prefix, elapsed);
+
+                    res
+                } else {
+                    Err(Error::WatchFolderNotFound("not-set".to_string()))
+                }
+            }
+            Err(err) => Err(crate::error::Error::Message(err.to_string())),
         }
     }
 
     fn get_watch_folder(&self, context: &Context) -> Option<String> {
-        if let Some(mvbox_folder_override) = context.get_mvbox_folder_override() {
-            return Some(mvbox_folder_override);
+        let mut folder_override = None;
+        if self.folder_config_name == "configured_inbox_folder" {
+            folder_override = context.get_inbox_folder_override();
+        } else if self.folder_config_name == "configured_mvbox_folder" {
+            folder_override = context.get_mvbox_folder_override();
         }
- 
-        if let Some(mvbox_name) = context.sql.get_raw_config(context, self.folder_config_name()) {
-            Some(mvbox_name)
-        } else {
-            None
+        if folder_override.is_some() {
+            return folder_override;
         }
-    }
-
-    fn connect_to_imap(&self, context: &Context) -> bool {
-        if self.imap.is_connected() {
-            return true;
-        }
-
-        let mut ret_connected = dc_connect_to_configured_imap(context, &self.imap) != 0;
-
-        if ret_connected {
-            if context
-                .sql
-                .get_raw_config_int(context, "folders_configured")
-                .unwrap_or_default()
-                < 3
-            {
-                self.imap.configure_folders(context, 0x1);
-            }
-
-            if let Some(mvbox_name) = self.get_watch_folder(context) {
-                self.imap.set_watch_folder(mvbox_name);
-            } else {
-                self.imap.disconnect(context);
-                ret_connected = false;
+        match context.sql.get_raw_config(context, self.folder_config_name) {
+            Some(name) => Some(name),
+            None => {
+                if self.folder_config_name == "configured_inbox_folder" {
+                    // initialized with old version, so has not set configured_inbox_folder
+                    Some("INBOX".to_string())
+                } else {
+                    None
+                }
             }
         }
-
-        ret_connected
     }
 
     pub fn idle(&self, context: &Context, use_network: bool) {
@@ -169,13 +164,13 @@ impl JobThread {
             let &(ref lock, ref cvar) = &*self.state.clone();
             let mut state = lock.lock().unwrap();
 
-            if 0 != state.jobs_needed {
+            if state.jobs_needed {
                 info!(
                     context,
                     "{}-IDLE will not be started as it was interrupted while not ideling.",
                     self.name,
                 );
-                state.jobs_needed = 0;
+                state.jobs_needed = false;
                 return;
             }
 
@@ -200,10 +195,36 @@ impl JobThread {
             }
         }
 
-        self.connect_to_imap(context);
-        info!(context, "{}-IDLE started...", self.name,);
-        self.imap.idle(context);
-        info!(context, "{}-IDLE ended.", self.name);
+        let prefix = format!("{}-IDLE", self.name);
+        let do_fake_idle = match self.imap.connect_configured(context) {
+            Ok(()) => {
+                if !self.imap.can_idle() {
+                    true // we have to do fake_idle
+                } else {
+                    let watch_folder = self.get_watch_folder(context);
+                    info!(context, "{} started...", prefix);
+                    let res = self.imap.idle(context, watch_folder);
+                    info!(context, "{} ended...", prefix);
+                    if let Err(err) = res {
+                        warn!(context, "{} failed: {} -> reconnecting", prefix, err);
+                        // something is borked, let's start afresh on the next occassion
+                        self.imap.disconnect(context);
+                    }
+                    false
+                }
+            }
+            Err(err) => {
+                info!(context, "{}-IDLE connection fail: {:?}", self.name, err);
+                // if the connection fails, use fake_idle to retry periodically
+                // fake_idle() will be woken up by interrupt_idle() as
+                // well so will act on maybe_network events
+                true
+            }
+        };
+        if do_fake_idle {
+            let watch_folder = self.get_watch_folder(context);
+            self.imap.fake_idle(context, watch_folder);
+        }
 
         self.state.0.lock().unwrap().using_handle = false;
     }

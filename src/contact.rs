@@ -1,3 +1,5 @@
+//! Contacts module
+
 use std::path::PathBuf;
 
 use deltachat_derive::*;
@@ -5,16 +7,19 @@ use itertools::Itertools;
 use rusqlite;
 
 use crate::aheader::EncryptPreference;
+use crate::chat::ChatId;
 use crate::config::Config;
 use crate::constants::*;
 use crate::context::Context;
 use crate::dc_tools::*;
 use crate::e2ee;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::key::*;
 use crate::login_param::LoginParam;
-use crate::message::MessageState;
+use crate::message::{MessageState, MsgId};
+use crate::mimeparser::AvatarAction;
+use crate::param::*;
 use crate::peerstate::*;
 use crate::sql;
 use crate::stock::StockMessage;
@@ -23,15 +28,17 @@ use crate::stock::StockMessage;
 const DC_ORIGIN_MIN_CONTACT_LIST: i32 = 0x100;
 
 /// An object representing a single contact in memory.
+///
 /// The contact object is not updated.
 /// If you want an update, you have to recreate the object.
 ///
 /// The library makes sure
 /// only to use names _authorized_ by the contact in `To:` or `Cc:`.
-/// _Given-names _as "Daddy" or "Honey" are not used there.
+/// *Given-names* as "Daddy" or "Honey" are not used there.
 /// For this purpose, internally, two names are tracked -
-/// authorized-name and given-name.
+/// authorized name and given name.
 /// By default, these names are equal, but functions working with contact names
+/// only affect the given name.
 #[derive(Debug)]
 pub struct Contact {
     /// The contact ID.
@@ -42,20 +49,28 @@ pub struct Contact {
     ///
     /// Normal contact IDs are larger than these special ones (larger than DC_CONTACT_ID_LAST_SPECIAL).
     pub id: u32,
+
     /// Contact name. It is recommended to use `Contact::get_name`,
     /// `Contact::get_display_name` or `Contact::get_name_n_addr` to access this field.
     /// May be empty, initially set to `authname`.
     name: String,
+
     /// Name authorized by the contact himself. Only this name may be spread to others,
-    /// e.g. in To:-lists. May be empty. It is recommended to use `Contact::get_name`,
-    /// `Contact::get_display_name` or `Contact::get_name_n_addr` to access this field.
+    /// e.g. in To:-lists. May be empty. It is recommended to use `Contact::get_authname`,
+    /// to access this field.
     authname: String,
+
     /// E-Mail-Address of the contact. It is recommended to use `Contact::get_addr`` to access this field.
     addr: String,
+
     /// Blocked state. Use dc_contact_is_blocked to access this field.
-    blocked: bool,
+    pub blocked: bool,
+
     /// The origin/source of the contact.
     pub origin: Origin,
+
+    /// Parameters as Param::ProfileImage
+    pub param: Params,
 }
 
 /// Possible origins of a contact.
@@ -65,38 +80,54 @@ pub struct Contact {
 #[repr(i32)]
 pub enum Origin {
     Unknown = 0,
+
     /// From: of incoming messages of unknown sender
     IncomingUnknownFrom = 0x10,
+
     /// Cc: of incoming messages of unknown sender
     IncomingUnknownCc = 0x20,
+
     /// To: of incoming messages of unknown sender
     IncomingUnknownTo = 0x40,
+
     /// address scanned but not verified
     UnhandledQrScan = 0x80,
+
     /// Reply-To: of incoming message of known sender
     IncomingReplyTo = 0x100,
+
     /// Cc: of incoming message of known sender
     IncomingCc = 0x200,
+
     /// additional To:'s of incoming message of known sender
     IncomingTo = 0x400,
+
     /// a chat was manually created for this user, but no message yet sent
     CreateChat = 0x800,
+
     /// message sent by us
     OutgoingBcc = 0x1000,
+
     /// message sent by us
     OutgoingCc = 0x2000,
+
     /// message sent by us
     OutgoingTo = 0x4000,
+
     /// internal use
     Internal = 0x40000,
+
     /// address is in our address book
     AdressBook = 0x80000,
+
     /// set on Alice's side for contacts like Bob that have scanned the QR code offered by her. Only means the contact has once been established using the "securejoin" procedure in the past, getting the current key verification status requires calling dc_contact_is_verified() !
-    SecurejoinInvited = 0x1000000,
+    SecurejoinInvited = 0x0100_0000,
+
     /// set on Bob's side for contacts scanned and verified from a QR code. Only means the contact has once been established using the "securejoin" procedure in the past, getting the current key verification status requires calling dc_contact_is_verified() !
-    SecurejoinJoined = 0x2000000,
-    /// contact added mannually by dc_create_contact(), this should be the largets origin as otherwise the user cannot modify the names
-    ManuallyCreated = 0x4000000,
+    SecurejoinJoined = 0x0200_0000,
+
+    /// contact added mannually by dc_create_contact(), this should be the largest origin as otherwise the user cannot modify the names
+    ManuallyCreated = 0x0400_0000,
 }
 
 impl Default for Origin {
@@ -106,19 +137,11 @@ impl Default for Origin {
 }
 
 impl Origin {
-    /// Contacts that start a new "normal" chat, defaults to off.
-    pub fn is_start_new_chat(self) -> bool {
-        self as i32 >= 0x7FFFFFFF
-    }
-
-    /// Contacts that are verified and known not to be spam.
-    pub fn is_verified(self) -> bool {
-        self as i32 >= 0x100
-    }
-
-    /// Contacts that are shown in the contact list.
-    pub fn include_in_contactlist(self) -> bool {
-        self as i32 >= DC_ORIGIN_MIN_CONTACT_LIST
+    /// Contacts that are known, i. e. they came in via accepted contacts or
+    /// themselves an accepted contact. Known contacts are shown in the
+    /// contact list when one creates a chat and wants to add members etc.
+    pub fn is_known(self) -> bool {
+        self >= Origin::IncomingReplyTo
     }
 }
 
@@ -141,24 +164,11 @@ pub enum VerifiedStatus {
 }
 
 impl Contact {
-    pub fn load_from_db(context: &Context, contact_id: u32) -> Result<Self> {
-        if contact_id == DC_CONTACT_ID_SELF {
-            let contact = Contact {
-                id: contact_id,
-                name: context.stock_str(StockMessage::SelfMsg).into(),
-                authname: "".into(),
-                addr: context
-                    .get_config(Config::ConfiguredAddr)
-                    .unwrap_or_default(),
-                blocked: false,
-                origin: Origin::Unknown,
-            };
-
-            return Ok(contact);
-        }
-
-        context.sql.query_row(
-            "SELECT c.name, c.addr, c.origin, c.blocked, c.authname  FROM contacts c  WHERE c.id=?;",
+    pub fn load_from_db(context: &Context, contact_id: u32) -> crate::sql::Result<Self> {
+        let mut res = context.sql.query_row(
+            "SELECT c.name, c.addr, c.origin, c.blocked, c.authname, c.param
+               FROM contacts c
+              WHERE c.id=?;",
             params![contact_id as i32],
             |row| {
                 let contact = Self {
@@ -168,10 +178,21 @@ impl Contact {
                     addr: row.get::<_, String>(1)?,
                     blocked: row.get::<_, Option<i32>>(3)?.unwrap_or_default() != 0,
                     origin: row.get(2)?,
+                    param: row.get::<_, String>(5)?.parse().unwrap_or_default(),
                 };
                 Ok(contact)
-            }
-        )
+            },
+        )?;
+        if contact_id == DC_CONTACT_ID_SELF {
+            res.name = context.stock_str(StockMessage::SelfMsg).to_string();
+            res.addr = context
+                .get_config(Config::ConfiguredAddr)
+                .unwrap_or_default();
+        } else if contact_id == DC_CONTACT_ID_DEVICE {
+            res.name = context.stock_str(StockMessage::DeviceMessages).to_string();
+            res.addr = DC_CONTACT_ID_DEVICE_ADDR.to_string();
+        }
+        Ok(res)
     }
 
     /// Returns `true` if this contact is blocked.
@@ -199,7 +220,7 @@ impl Contact {
     /// Add a single contact as a result of an _explicit_ user action.
     ///
     /// We assume, the contact name, if any, is entered by the user and is used "as is" therefore,
-    /// normalize() is _not_ called for the name. If the contact is blocked, it is unblocked.
+    /// normalize() is *not* called for the name. If the contact is blocked, it is unblocked.
     ///
     /// To add a number of contacts, see `dc_add_address_book()` which is much faster for adding
     /// a bunch of addresses.
@@ -229,7 +250,7 @@ impl Contact {
     }
 
     /// Mark all messages sent by the given contact
-    /// as _noticed_.  See also dc_marknoticed_chat() and dc_markseen_msgs()
+    /// as *noticed*.  See also dc_marknoticed_chat() and dc_markseen_msgs()
     ///
     /// Calling this function usually results in the event `#DC_EVENT_MSGS_CHANGED`.
     pub fn mark_noticed(context: &Context, id: u32) {
@@ -242,8 +263,8 @@ impl Contact {
         .is_ok()
         {
             context.call_cb(Event::MsgsChanged {
-                chat_id: 0,
-                msg_id: 0,
+                chat_id: ChatId::new(0),
+                msg_id: MsgId::new(0),
             });
         }
     }
@@ -263,8 +284,8 @@ impl Contact {
             .get_config(Config::ConfiguredAddr)
             .unwrap_or_default();
 
-        if addr_normalized == addr_self {
-            return 1;
+        if addr_cmp(addr_normalized, addr_self) {
+            return DC_CONTACT_ID_SELF;
         }
 
         context.sql.query_get_value(
@@ -300,8 +321,8 @@ impl Contact {
             .get_config(Config::ConfiguredAddr)
             .unwrap_or_default();
 
-        if addr == addr_self {
-            return Ok((1, sth_modified));
+        if addr_cmp(addr, addr_self) {
+            return Ok((DC_CONTACT_ID_SELF, sth_modified));
         }
 
         if !may_be_valid_addr(&addr) {
@@ -390,18 +411,30 @@ impl Contact {
                 }
                 sth_modified = Modifier::Modified;
             }
-        } else if sql::execute(
-            context,
-            &context.sql,
-            "INSERT INTO contacts (name, addr, origin) VALUES(?, ?, ?);",
-            params![name.as_ref(), addr, origin,],
-        )
-        .is_ok()
-        {
-            row_id = sql::get_rowid(context, &context.sql, "contacts", "addr", addr);
-            sth_modified = Modifier::Created;
         } else {
-            error!(context, "Cannot add contact.");
+            if origin == Origin::IncomingUnknownFrom {
+                update_authname = true;
+            }
+
+            if sql::execute(
+                context,
+                &context.sql,
+                "INSERT INTO contacts (name, addr, origin, authname) VALUES(?, ?, ?, ?);",
+                params![
+                    name.as_ref(),
+                    addr,
+                    origin,
+                    if update_authname { name.as_ref() } else { "" }
+                ],
+            )
+            .is_ok()
+            {
+                row_id = sql::get_rowid(context, &context.sql, "contacts", "addr", addr);
+                sth_modified = Modifier::Created;
+                info!(context, "added contact id={} addr={}", row_id, addr);
+            } else {
+                error!(context, "Cannot add contact.");
+            }
         }
 
         Ok((row_id, sth_modified))
@@ -419,7 +452,7 @@ impl Contact {
     /// the event `DC_EVENT_CONTACTS_CHANGED` is sent.
     ///
     /// To add a single contact entered by the user, you should prefer `Contact::create`,
-    /// however, for adding a bunch of addresses, this function is _much_ faster.
+    /// however, for adding a bunch of addresses, this function is much faster.
     ///
     /// The `addr_book` is a multiline string in the format `Name one\nAddress one\nName two\nAddress two`.
     ///
@@ -485,7 +518,7 @@ impl Contact {
                 params![
                     self_addr,
                     DC_CONTACT_ID_LAST_SPECIAL as i32,
-                    0x100,
+                    Origin::IncomingReplyTo,
                     &s3str_like_cmd,
                     &s3str_like_cmd,
                     if flag_verified_only { 0 } else { 1 },
@@ -576,7 +609,12 @@ impl Contact {
 
             let mut self_key = Key::from_self_public(context, &loginparam.addr, &context.sql);
 
-            if peerstate.is_some() && peerstate.as_ref().and_then(|p| p.peek_key(0)).is_some() {
+            if peerstate.is_some()
+                && peerstate
+                    .as_ref()
+                    .and_then(|p| p.peek_key(PeerstateVerifiedStatus::Unverified))
+                    .is_some()
+            {
                 let peerstate = peerstate.as_ref().unwrap();
                 let p =
                     context.stock_str(if peerstate.prefer_encrypt == EncryptPreference::Mutual {
@@ -596,25 +634,25 @@ impl Contact {
                     .map(|k| k.formatted_fingerprint())
                     .unwrap_or_default();
                 let fingerprint_other_verified = peerstate
-                    .peek_key(2)
+                    .peek_key(PeerstateVerifiedStatus::BidirectVerified)
                     .map(|k| k.formatted_fingerprint())
                     .unwrap_or_default();
                 let fingerprint_other_unverified = peerstate
-                    .peek_key(0)
+                    .peek_key(PeerstateVerifiedStatus::Unverified)
                     .map(|k| k.formatted_fingerprint())
                     .unwrap_or_default();
-                if peerstate.addr.is_some() && &loginparam.addr < peerstate.addr.as_ref().unwrap() {
+                if loginparam.addr < peerstate.addr {
                     cat_fingerprint(&mut ret, &loginparam.addr, &fingerprint_self, "");
                     cat_fingerprint(
                         &mut ret,
-                        peerstate.addr.as_ref().unwrap(),
+                        peerstate.addr.clone(),
                         &fingerprint_other_verified,
                         &fingerprint_other_unverified,
                     );
                 } else {
                     cat_fingerprint(
                         &mut ret,
-                        peerstate.addr.as_ref().unwrap(),
+                        peerstate.addr.clone(),
                         &fingerprint_other_verified,
                         &fingerprint_other_unverified,
                     );
@@ -677,7 +715,7 @@ impl Contact {
                 }
                 Err(err) => {
                     error!(context, "delete_contact {} failed ({})", contact_id, err);
-                    return Err(err);
+                    return Err(err.into());
                 }
             }
         }
@@ -695,7 +733,17 @@ impl Contact {
     /// like "Me" in the selected language and the email address
     /// defined by dc_set_config().
     pub fn get_by_id(context: &Context, contact_id: u32) -> Result<Contact> {
-        Contact::load_from_db(context, contact_id)
+        Ok(Contact::load_from_db(context, contact_id)?)
+    }
+
+    pub fn update_param(&mut self, context: &Context) -> Result<()> {
+        sql::execute(
+            context,
+            &context.sql,
+            "UPDATE contacts SET param=? WHERE id=?",
+            params![self.param.to_string(), self.id as i32],
+        )?;
+        Ok(())
     }
 
     /// Get the ID of the contact.
@@ -708,6 +756,7 @@ impl Contact {
         &self.addr
     }
 
+    /// Get name authorized by the contact.
     pub fn get_authname(&self) -> &str {
         &self.authname
     }
@@ -729,6 +778,9 @@ impl Contact {
     pub fn get_display_name(&self) -> &str {
         if !self.name.is_empty() {
             return &self.name;
+        }
+        if !self.authname.is_empty() {
+            return &self.authname;
         }
         &self.addr
     }
@@ -765,8 +817,11 @@ impl Contact {
             if let Some(p) = context.get_config(Config::Selfavatar) {
                 return Some(PathBuf::from(p));
             }
+        } else if let Some(image_rel) = self.param.get(Param::ProfileImage) {
+            if !image_rel.is_empty() {
+                return Some(dc_get_abs_path(context, image_rel));
+            }
         }
-        // TODO: else get image_abs from contact param
         None
     }
 
@@ -849,24 +904,8 @@ impl Contact {
             .unwrap_or_default() as usize
     }
 
-    pub fn get_origin_by_id(context: &Context, contact_id: u32, ret_blocked: &mut i32) -> Origin {
-        let mut ret = Origin::Unknown;
-        *ret_blocked = 0;
-
-        if let Ok(contact) = Contact::load_from_db(context, contact_id) {
-            /* we could optimize this by loading only the needed fields */
-            if contact.blocked {
-                *ret_blocked = 1;
-            } else {
-                ret = contact.origin;
-            }
-        }
-
-        ret
-    }
-
     pub fn real_exists_by_id(context: &Context, contact_id: u32) -> bool {
-        if !context.sql.is_open() || contact_id <= 9 {
+        if !context.sql.is_open() || contact_id <= DC_CONTACT_ID_LAST_SPECIAL {
             return false;
         }
 
@@ -890,7 +929,8 @@ impl Contact {
     }
 }
 
-fn get_first_name<'a>(full_name: &'a str) -> &'a str {
+/// Extracts first name from full name.
+fn get_first_name(full_name: &str) -> &str {
     full_name.splitn(2, ' ').next().unwrap_or_default()
 }
 
@@ -900,6 +940,7 @@ pub fn may_be_valid_addr(addr: &str) -> bool {
     res.is_ok()
 }
 
+/// Returns address with whitespace trimmed and `mailto:` prefix removed.
 pub fn addr_normalize(addr: &str) -> &str {
     let norm = addr.trim();
 
@@ -911,26 +952,26 @@ pub fn addr_normalize(addr: &str) -> &str {
 }
 
 fn set_block_contact(context: &Context, contact_id: u32, new_blocking: bool) {
-    if contact_id <= 9 {
+    if contact_id <= DC_CONTACT_ID_LAST_SPECIAL {
         return;
     }
 
     if let Ok(contact) = Contact::load_from_db(context, contact_id) {
-        if contact.blocked != new_blocking {
-            if sql::execute(
+        if contact.blocked != new_blocking
+            && sql::execute(
                 context,
                 &context.sql,
                 "UPDATE contacts SET blocked=? WHERE id=?;",
                 params![new_blocking as i32, contact_id as i32],
             )
             .is_ok()
-            {
-                // also (un)block all chats with _only_ this contact - we do not delete them to allow a
-                // non-destructive blocking->unblocking.
-                // (Maybe, beside normal chats (type=100) we should also block group chats with only this user.
-                // However, I'm not sure about this point; it may be confusing if the user wants to add other people;
-                // this would result in recreating the same group...)
-                if sql::execute(
+        {
+            // also (un)block all chats with _only_ this contact - we do not delete them to allow a
+            // non-destructive blocking->unblocking.
+            // (Maybe, beside normal chats (type=100) we should also block group chats with only this user.
+            // However, I'm not sure about this point; it may be confusing if the user wants to add other people;
+            // this would result in recreating the same group...)
+            if sql::execute(
                     context,
                     &context.sql,
                     "UPDATE chats SET blocked=? WHERE type=? AND id IN (SELECT chat_id FROM chats_contacts WHERE contact_id=?);",
@@ -939,9 +980,34 @@ fn set_block_contact(context: &Context, contact_id: u32, new_blocking: bool) {
                     Contact::mark_noticed(context, contact_id);
                     context.call_cb(Event::ContactsChanged(None));
                 }
-            }
         }
     }
+}
+
+pub fn set_profile_image(
+    context: &Context,
+    contact_id: u32,
+    profile_image: &AvatarAction,
+) -> Result<()> {
+    // the given profile image is expected to be already in the blob directory
+    // as profile images can be set only by receiving messages, this should be always the case, however.
+    let mut contact = Contact::load_from_db(context, contact_id)?;
+    let changed = match profile_image {
+        AvatarAction::Change(profile_image) => {
+            contact.param.set(Param::ProfileImage, profile_image);
+            true
+        }
+        AvatarAction::Delete => {
+            contact.param.remove(Param::ProfileImage);
+            true
+        }
+        AvatarAction::None => false,
+    };
+    if changed {
+        contact.update_param(context)?;
+        context.call_cb(Event::ContactsChanged(Some(contact_id)));
+    }
+    Ok(())
 }
 
 /// Normalize a name.
@@ -1008,21 +1074,23 @@ fn cat_fingerprint(
     }
 }
 
-pub fn addr_cmp(addr1: impl AsRef<str>, addr2: impl AsRef<str>) -> bool {
-    let norm1 = addr_normalize(addr1.as_ref());
-    let norm2 = addr_normalize(addr2.as_ref());
+impl Context {
+    /// determine whether the specified addr maps to the/a self addr
+    pub fn is_self_addr(&self, addr: &str) -> Result<bool> {
+        let self_addr = match self.get_config(Config::ConfiguredAddr) {
+            Some(s) => s,
+            None => return Err(Error::NotConfigured),
+        };
 
-    norm1 == norm2
+        Ok(addr_cmp(self_addr, addr))
+    }
 }
 
-pub fn addr_equals_self(context: &Context, addr: impl AsRef<str>) -> bool {
-    if !addr.as_ref().is_empty() {
-        let normalized_addr = addr_normalize(addr.as_ref());
-        if let Some(self_addr) = context.get_config(Config::ConfiguredAddr) {
-            return normalized_addr == self_addr;
-        }
-    }
-    false
+pub fn addr_cmp(addr1: impl AsRef<str>, addr2: impl AsRef<str>) -> bool {
+    let norm1 = addr_normalize(addr1.as_ref()).to_lowercase();
+    let norm2 = addr_normalize(addr2.as_ref()).to_lowercase();
+
+    norm1 == norm2
 }
 
 fn split_address_book(book: &str) -> Vec<(&str, &str)> {
@@ -1043,6 +1111,8 @@ fn split_address_book(book: &str) -> Vec<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_utils::*;
 
     #[test]
     fn test_may_be_valid_addr() {
@@ -1070,6 +1140,10 @@ mod tests {
     fn test_normalize_addr() {
         assert_eq!(addr_normalize("mailto:john@doe.com"), "john@doe.com");
         assert_eq!(addr_normalize("  hello@world.com   "), "hello@world.com");
+
+        // normalisation preserves case to allow user-defined spelling.
+        // however, case is ignored on addr_cmp()
+        assert_ne!(addr_normalize("John@Doe.com"), "john@doe.com");
     }
 
     #[test]
@@ -1085,5 +1159,186 @@ mod tests {
             list,
             vec![("Name one", "Address one"), ("Name two", "Address two")]
         )
+    }
+
+    #[test]
+    fn test_get_contacts() {
+        let context = dummy_context();
+        let contacts = Contact::get_all(&context.ctx, 0, Some("some2")).unwrap();
+        assert_eq!(contacts.len(), 0);
+
+        let id = Contact::create(&context.ctx, "bob", "bob@mail.de").unwrap();
+        assert_ne!(id, 0);
+
+        let contacts = Contact::get_all(&context.ctx, 0, Some("bob")).unwrap();
+        assert_eq!(contacts.len(), 1);
+
+        let contacts = Contact::get_all(&context.ctx, 0, Some("alice")).unwrap();
+        assert_eq!(contacts.len(), 0);
+    }
+
+    #[test]
+    fn test_is_self_addr() -> Result<()> {
+        let t = test_context(None);
+        assert!(t.ctx.is_self_addr("me@me.org").is_err());
+
+        let addr = configure_alice_keypair(&t.ctx);
+        assert_eq!(t.ctx.is_self_addr("me@me.org")?, false);
+        assert_eq!(t.ctx.is_self_addr(&addr)?, true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_or_lookup() {
+        // add some contacts, this also tests add_address_book()
+        let t = dummy_context();
+        let book = concat!(
+            "  Name one  \n one@eins.org \n",
+            "Name two\ntwo@deux.net\n",
+            "\nthree@drei.sam\n",
+            "Name two\ntwo@deux.net\n" // should not be added again
+        );
+        assert_eq!(Contact::add_address_book(&t.ctx, book).unwrap(), 3);
+
+        // check first added contact, this does not modify because of lower origin
+        let (contact_id, sth_modified) =
+            Contact::add_or_lookup(&t.ctx, "bla foo", "one@eins.org", Origin::IncomingUnknownTo)
+                .unwrap();
+        assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
+        assert_eq!(sth_modified, Modifier::None);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_id(), contact_id);
+        assert_eq!(contact.get_name(), "Name one");
+        assert_eq!(contact.get_display_name(), "Name one");
+        assert_eq!(contact.get_addr(), "one@eins.org");
+        assert_eq!(contact.get_name_n_addr(), "Name one (one@eins.org)");
+
+        // modify first added contact
+        let (contact_id_test, sth_modified) = Contact::add_or_lookup(
+            &t.ctx,
+            "Real one",
+            " one@eins.org  ",
+            Origin::ManuallyCreated,
+        )
+        .unwrap();
+        assert_eq!(contact_id, contact_id_test);
+        assert_eq!(sth_modified, Modifier::Modified);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_name(), "Real one");
+        assert_eq!(contact.get_addr(), "one@eins.org");
+        assert!(!contact.is_blocked());
+
+        // check third added contact (contact without name)
+        let (contact_id, sth_modified) =
+            Contact::add_or_lookup(&t.ctx, "", "three@drei.sam", Origin::IncomingUnknownTo)
+                .unwrap();
+        assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
+        assert_eq!(sth_modified, Modifier::None);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_name(), "");
+        assert_eq!(contact.get_display_name(), "three@drei.sam");
+        assert_eq!(contact.get_addr(), "three@drei.sam");
+        assert_eq!(contact.get_name_n_addr(), "three@drei.sam");
+
+        // add name to third contact from incoming message (this becomes authorized name)
+        let (contact_id_test, sth_modified) = Contact::add_or_lookup(
+            &t.ctx,
+            "m. serious",
+            "three@drei.sam",
+            Origin::IncomingUnknownFrom,
+        )
+        .unwrap();
+        assert_eq!(contact_id, contact_id_test);
+        assert_eq!(sth_modified, Modifier::Modified);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_name_n_addr(), "m. serious (three@drei.sam)");
+        assert!(!contact.is_blocked());
+
+        // manually edit name of third contact (does not changed authorized name)
+        let (contact_id_test, sth_modified) = Contact::add_or_lookup(
+            &t.ctx,
+            "schnucki",
+            "three@drei.sam",
+            Origin::ManuallyCreated,
+        )
+        .unwrap();
+        assert_eq!(contact_id, contact_id_test);
+        assert_eq!(sth_modified, Modifier::Modified);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_authname(), "m. serious");
+        assert_eq!(contact.get_name_n_addr(), "schnucki (three@drei.sam)");
+        assert!(!contact.is_blocked());
+
+        // check SELF
+        let contact = Contact::load_from_db(&t.ctx, DC_CONTACT_ID_SELF).unwrap();
+        assert_eq!(DC_CONTACT_ID_SELF, 1);
+        assert_eq!(contact.get_name(), t.ctx.stock_str(StockMessage::SelfMsg));
+        assert_eq!(contact.get_addr(), ""); // we're not configured
+        assert!(!contact.is_blocked());
+    }
+
+    #[test]
+    fn test_remote_authnames() {
+        let t = dummy_context();
+
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t.ctx,
+            "bob1",
+            "bob@example.org",
+            Origin::IncomingUnknownFrom,
+        )
+        .unwrap();
+        assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
+        assert_eq!(sth_modified, Modifier::Created);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_authname(), "bob1");
+        assert_eq!(contact.get_name(), "bob1");
+        assert_eq!(contact.get_display_name(), "bob1");
+
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t.ctx,
+            "bob2",
+            "bob@example.org",
+            Origin::IncomingUnknownFrom,
+        )
+        .unwrap();
+        assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
+        assert_eq!(sth_modified, Modifier::Modified);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_authname(), "bob2");
+        assert_eq!(contact.get_name(), "bob2");
+        assert_eq!(contact.get_display_name(), "bob2");
+
+        let (contact_id, sth_modified) =
+            Contact::add_or_lookup(&t.ctx, "bob3", "bob@example.org", Origin::ManuallyCreated)
+                .unwrap();
+        assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
+        assert_eq!(sth_modified, Modifier::Modified);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_authname(), "bob2");
+        assert_eq!(contact.get_name(), "bob3");
+        assert_eq!(contact.get_display_name(), "bob3");
+
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t.ctx,
+            "bob4",
+            "bob@example.org",
+            Origin::IncomingUnknownFrom,
+        )
+        .unwrap();
+        assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
+        assert_eq!(sth_modified, Modifier::Modified);
+        let contact = Contact::load_from_db(&t.ctx, contact_id).unwrap();
+        assert_eq!(contact.get_authname(), "bob4");
+        assert_eq!(contact.get_name(), "bob3");
+        assert_eq!(contact.get_display_name(), "bob3");
+    }
+
+    #[test]
+    fn test_addr_cmp() {
+        assert!(addr_cmp("AA@AA.ORG", "aa@aa.ORG"));
+        assert!(addr_cmp(" aa@aa.ORG ", "AA@AA.ORG"));
+        assert!(addr_cmp(" mailto:AA@AA.ORG", "Aa@Aa.orG"));
     }
 }

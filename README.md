@@ -1,10 +1,8 @@
 # Delta Chat Rust
 
-> Project porting deltachat-core to rust
+> Deltachat-core written in Rust 
 
 [![CircleCI build status][circle-shield]][circle] [![Appveyor build status][appveyor-shield]][appveyor]
-
-Current commit on deltachat/deltachat-core: `12ef73c8e76185f9b78e844ea673025f56a959ab`.
 
 ## Installing Rust and Cargo
 
@@ -16,7 +14,7 @@ curl https://sh.rustup.rs -sSf | sh
 
 ## Using the CLI client
 
-Compile and run Delta Chat Core using `cargo`:
+Compile and run Delta Chat Core command line utility, using `cargo`:
 
 ```
 cargo run --example repl -- /path/to/db
@@ -89,6 +87,15 @@ $ cargo test --all
 $ cargo build -p deltachat_ffi --release
 ```
 
+## Debugging environment variables 
+
+- `DCC_IMAP_DEBUG`: if set IMAP protocol commands and responses will be
+  printed
+
+- `DCC_MIME_DEBUG`: if set outgoing and incoming message will be printed 
+
+
+
 ### Expensive tests
 
 Some tests are expensive and marked with `#[ignore]`, to run these
@@ -107,3 +114,22 @@ $ cargo test -- --ignored
 [circle]: https://circleci.com/gh/deltachat/deltachat-core-rust/
 [appveyor-shield]: https://ci.appveyor.com/api/projects/status/lqpegel3ld4ipxj8/branch/master?style=flat-square
 [appveyor]: https://ci.appveyor.com/project/dignifiedquire/deltachat-core-rust/branch/master
+
+## Language bindings and frontend projects
+
+Language bindings are available for:
+
+- [C](https://c.delta.chat)
+- [Node.js](https://www.npmjs.com/package/deltachat-node)
+- [Python](https://py.delta.chat)
+- [Go](https://github.com/hugot/go-deltachat/)
+- **Java** and **Swift** (contained in the Android/iOS repos)
+
+The following "frontend" projects make use of the Rust-library
+or its language bindings:
+
+- [Android](https://github.com/deltachat/deltachat-android)
+- [iOS](https://github.com/deltachat/deltachat-ios)
+- [Desktop](https://github.com/deltachat/deltachat-desktop)
+- [Pidgin](https://code.ur.gs/lupine/purple-plugin-delta/)
+- several **Bots**

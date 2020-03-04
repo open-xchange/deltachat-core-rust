@@ -1,9 +1,8 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use deltachat::chat::{self, Chat};
+use deltachat::chat::{self, Chat, ChatId};
 use deltachat::chatlist::*;
-use deltachat::config;
 use deltachat::constants::*;
 use deltachat::contact::*;
 use deltachat::context::*;
@@ -14,22 +13,22 @@ use deltachat::imex::*;
 use deltachat::job::*;
 use deltachat::location;
 use deltachat::lot::LotState;
-use deltachat::message::{self, Message, MessageState};
+use deltachat::message::{self, Message, MessageState, MsgId};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::sql;
 use deltachat::coi::CoiMessageFilter;
 use deltachat::Event;
-use libc::free;
+use deltachat::{config, provider};
 
-/// Reset database tables. This function is called from Core cmdline.
+/// Reset database tables.
 /// Argument is a bitmask, executing single or multiple actions in one call.
 /// e.g. bitmask 7 triggers actions definded with bits 1, 2 and 4.
-pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
-    info!(context, "Resetting tables ({})...", bits);
+fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
+    println!("Resetting tables ({})...", bits);
     if 0 != bits & 1 {
         sql::execute(context, &context.sql, "DELETE FROM jobs;", params![]).unwrap();
-        info!(context, "(1) Jobs reset.");
+        println!("(1) Jobs reset.");
     }
     if 0 != bits & 2 {
         sql::execute(
@@ -39,11 +38,11 @@ pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
             params![],
         )
         .unwrap();
-        info!(context, "(2) Peerstates reset.");
+        println!("(2) Peerstates reset.");
     }
     if 0 != bits & 4 {
         sql::execute(context, &context.sql, "DELETE FROM keypairs;", params![]).unwrap();
-        info!(context, "(4) Private keypairs reset.");
+        println!("(4) Private keypairs reset.");
     }
     if 0 != bits & 8 {
         sql::execute(
@@ -82,12 +81,12 @@ pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
         )
         .unwrap();
         sql::execute(context, &context.sql, "DELETE FROM leftgrps;", params![]).unwrap();
-        info!(context, "(8) Rest but server config reset.");
+        println!("(8) Rest but server config reset.");
     }
 
     context.call_cb(Event::MsgsChanged {
-        chat_id: 0,
-        msg_id: 0,
+        chat_id: ChatId::new(0),
+        msg_id: MsgId::new(0),
     });
 
     1
@@ -96,7 +95,9 @@ pub unsafe fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
 fn dc_poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<(), Error> {
     let data = dc_read_file(context, filename)?;
 
-    unsafe { dc_receive_imf(context, &data, "import", 0, 0, String::from("")) };
+    if let Err(err) = dc_receive_imf(context, &data, "import", 0, 0) {
+        println!("dc_receive_imf errored: {:?}", err);
+    }
     Ok(())
 }
 
@@ -108,18 +109,19 @@ fn dc_poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<(),
 /// @param context The context as created by dc_context_new().
 /// @param spec The file or directory to import. NULL for the last command.
 /// @return 1=success, 0=error.
-fn poke_spec(context: &Context, spec: *const libc::c_char) -> libc::c_int {
+fn poke_spec(context: &Context, spec: Option<&str>) -> libc::c_int {
     if !context.sql.is_open() {
         error!(context, "Import: Database not opened.");
         return 0;
     }
 
-    let real_spec: String;
     let mut read_cnt = 0;
 
+    let real_spec: String;
+
     /* if `spec` is given, remember it for later usage; if it is not given, try to use the last one */
-    if !spec.is_null() {
-        real_spec = to_string_lossy(spec);
+    if let Some(spec) = spec {
+        real_spec = spec.to_string();
         context
             .sql
             .set_raw_config(context, "import_spec", Some(&real_spec))
@@ -133,10 +135,8 @@ fn poke_spec(context: &Context, spec: *const libc::c_char) -> libc::c_int {
         real_spec = rs.unwrap();
     }
     if let Some(suffix) = dc_get_filesuffix_lc(&real_spec) {
-        if suffix == "eml" {
-            if dc_poke_eml_file(context, &real_spec).is_ok() {
-                read_cnt += 1
-            }
+        if suffix == "eml" && dc_poke_eml_file(context, &real_spec).is_ok() {
+            read_cnt += 1
         }
     } else {
         /* import a directory */
@@ -156,7 +156,7 @@ fn poke_spec(context: &Context, spec: *const libc::c_char) -> libc::c_int {
                 let name = name_f.to_string_lossy();
                 if name.ends_with(".eml") {
                     let path_plus_name = format!("{}/{}", &real_spec, name);
-                    info!(context, "Import: {}", path_plus_name);
+                    println!("Import: {}", path_plus_name);
                     if dc_poke_eml_file(context, path_plus_name).is_ok() {
                         read_cnt += 1
                     }
@@ -164,20 +164,17 @@ fn poke_spec(context: &Context, spec: *const libc::c_char) -> libc::c_int {
             }
         }
     }
-    info!(
-        context,
-        "Import: {} items read from \"{}\".", read_cnt, &real_spec
-    );
+    println!("Import: {} items read from \"{}\".", read_cnt, &real_spec);
     if read_cnt > 0 {
         context.call_cb(Event::MsgsChanged {
-            chat_id: 0,
-            msg_id: 0,
+            chat_id: ChatId::new(0),
+            msg_id: MsgId::new(0),
         });
     }
     1
 }
 
-unsafe fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
+fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
     let contact = Contact::get_by_id(context, msg.get_from_id()).expect("invalid contact");
     let contact_name = contact.get_name();
     let contact_id = contact.get_id();
@@ -191,11 +188,10 @@ unsafe fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
     };
     let temp2 = dc_timestamp_to_str(msg.get_timestamp());
     let msgtext = msg.get_text();
-    info!(
-        context,
-        "{}#{}{}{}: {} (Contact#{}): {} {}{}{}{} [{}]",
+    println!(
+        "{}{}{}{}: {} (Contact#{}): {} {}{}{}{}{} [{}]",
         prefix.as_ref(),
-        msg.get_id() as libc::c_int,
+        msg.get_id(),
         if msg.get_showpadlock() { "🔒" } else { "" },
         if msg.has_location() { "📍" } else { "" },
         &contact_name,
@@ -212,43 +208,45 @@ unsafe fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
             "[FRESH]"
         },
         if msg.is_info() { "[INFO]" } else { "" },
+        if msg.is_forwarded() {
+            "[FORWARDED]"
+        } else {
+            ""
+        },
         statestr,
         &temp2,
     );
 }
 
-unsafe fn log_msglist(context: &Context, msglist: &Vec<u32>) -> Result<(), Error> {
+fn log_msglist(context: &Context, msglist: &Vec<MsgId>) -> Result<(), Error> {
     let mut lines_out = 0;
     for &msg_id in msglist {
-        if msg_id == 9 as libc::c_uint {
-            info!(
-                context,
+        if msg_id.is_daymarker() {
+            println!(
                 "--------------------------------------------------------------------------------"
             );
 
             lines_out += 1
-        } else if msg_id > 0 {
+        } else if !msg_id.is_special() {
             if lines_out == 0 {
-                info!(
-                    context,
+                println!(
                     "--------------------------------------------------------------------------------",
                 );
                 lines_out += 1
             }
             let msg = Message::load_from_db(context, msg_id)?;
-            log_msg(context, "Msg", &msg);
+            log_msg(context, "", &msg);
         }
     }
     if lines_out > 0 {
-        info!(
-            context,
+        println!(
             "--------------------------------------------------------------------------------"
         );
     }
     Ok(())
 }
 
-unsafe fn log_contactlist(context: &Context, contacts: &Vec<u32>) {
+fn log_contactlist(context: &Context, contacts: &Vec<u32>) {
     let mut contacts = contacts.clone();
     if !contacts.contains(&1) {
         contacts.push(1);
@@ -291,7 +289,7 @@ unsafe fn log_contactlist(context: &Context, contacts: &Vec<u32>) {
                 );
             }
 
-            info!(context, "Contact#{}: {}{}", contact_id, line, line2);
+            println!("Contact#{}: {}{}", contact_id, line, line2);
         }
     }
 }
@@ -300,9 +298,9 @@ fn chat_prefix(chat: &Chat) -> &'static str {
     chat.typ.into()
 }
 
-pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
+pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
     let chat_id = *context.cmdline_sel_chat_id.read().unwrap();
-    let mut sel_chat = if chat_id > 0 {
+    let mut sel_chat = if !chat_id.is_unset() {
         Chat::load_from_db(context, chat_id).ok()
     } else {
         None
@@ -311,11 +309,6 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
     let mut args = line.splitn(3, ' ');
     let arg0 = args.next().unwrap_or_default();
     let arg1 = args.next().unwrap_or_default();
-    let arg1_c = if arg1.is_empty() {
-        std::ptr::null()
-    } else {
-        arg1.strdup() as *const _
-    };
     let arg2 = args.next().unwrap_or_default();
 
     let blobdir = context.get_blobdir();
@@ -349,6 +342,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                  configure\n\
                  connect\n\
                  disconnect\n\
+                 interrupt\n\
                  maybenetwork\n\
                  housekeeping\n\
                  help imex (Import/Export)\n\
@@ -374,6 +368,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                  sendimage <file> [<text>]\n\
                  sendfile <file> [<text>]\n\
                  draft [<text>]\n\
+                 devicemsg <text>\n\
                  listmedia\n\
                  archive <chat-id>\n\
                  unarchive <chat-id>\n\
@@ -403,8 +398,10 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                  getqr [<chat-id>]\n\
                  getbadqr\n\
                  checkqr <qr-content>\n\
+                 providerinfo <addr>\n\
                  event <event-id to test>\n\
                  fileinfo <file>\n\
+                 emptyserver <flags> (1=MVBOX 2=INBOX)\n\
                  clear -- clear screen\n\
                  exit or quit\n\
                  ============================================="
@@ -419,17 +416,17 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         },
         "get-setupcodebegin" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
-            let msg_id: u32 = arg1.parse()?;
+            let msg_id: MsgId = MsgId::new(arg1.parse()?);
             let msg = Message::load_from_db(context, msg_id)?;
             if msg.is_setupmessage() {
                 let setupcodebegin = msg.get_setupcodebegin(context);
                 println!(
-                    "The setup code for setup message Msg#{} starts with: {}",
+                    "The setup code for setup message {} starts with: {}",
                     msg_id,
                     setupcodebegin.unwrap_or_default(),
                 );
             } else {
-                bail!("Msg#{} is no setup message.", msg_id,);
+                bail!("{} is no setup message.", msg_id,);
             }
         }
         "continue-key-transfer" => {
@@ -437,7 +434,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 !arg1.is_empty() && !arg2.is_empty(),
                 "Arguments <msg-id> <setup-code> expected"
             );
-            continue_key_transfer(context, arg1.parse()?, &arg2)?;
+            continue_key_transfer(context, MsgId::new(arg1.parse()?), &arg2)?;
         }
         "has-backup" => {
             has_backup(context, blobdir)?;
@@ -467,7 +464,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             );
         }
         "poke" => {
-            ensure!(0 != poke_spec(context, arg1_c), "Poke failed");
+            ensure!(0 != poke_spec(context, Some(arg1)), "Poke failed");
         }
         "reset" => {
             ensure!(!arg1.is_empty(), "Argument <bits> missing: 1=jobs, 2=peerstates, 4=private keys, 8=rest but server config");
@@ -493,6 +490,9 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         "info" => {
             println!("{:#?}", context.get_info());
         }
+        "interrupt" => {
+            interrupt_inbox_idle(context);
+        }
         "maybenetwork" => {
             maybe_network(context);
         }
@@ -510,23 +510,18 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
 
             let cnt = chatlist.len();
             if cnt > 0 {
-                info!(
-                    context,
+                println!(
                     "================================================================================"
                 );
 
                 for i in (0..cnt).rev() {
                     let chat = Chat::load_from_db(context, chatlist.get_chat_id(i))?;
-                    let temp_subtitle = chat.get_subtitle(context);
-                    let temp_name = chat.get_name();
-                    info!(
-                        context,
-                        "{}#{}: {} [{}] [{} fresh]",
+                    println!(
+                        "{}#{}: {} [{} fresh]",
                         chat_prefix(&chat),
                         chat.get_id(),
-                        temp_name,
-                        temp_subtitle,
-                        chat::get_fresh_msg_cnt(context, chat.get_id()),
+                        chat.get_name(),
+                        chat.get_id().get_fresh_msg_cnt(context),
                     );
                     let lot = chatlist.get_summary(context, i, Some(&chat));
                     let statestr = if chat.is_archived() {
@@ -543,8 +538,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                     let timestr = dc_timestamp_to_str(lot.get_timestamp());
                     let text1 = lot.get_text1();
                     let text2 = lot.get_text2();
-                    info!(
-                        context,
+                    println!(
                         "{}{}{}{} [{}]{}",
                         text1.unwrap_or(""),
                         if text1.is_some() { ": " } else { "" },
@@ -557,14 +551,13 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                             ""
                         },
                     );
-                    info!(
-                        context,
+                    println!(
                         "================================================================================"
                     );
                 }
             }
-            if location::is_sending_locations_to_chat(context, 0) {
-                info!(context, "Location streaming enabled.");
+            if location::is_sending_locations_to_chat(context, ChatId::new(0)) {
+                println!("Location streaming enabled.");
             }
             println!("{} chats", cnt);
         }
@@ -573,8 +566,8 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 bail!("Argument [chat-id] is missing.");
             }
             if !arg1.is_empty() {
-                let chat_id = arg1.parse()?;
-                println!("Selecting chat #{}", chat_id);
+                let chat_id = ChatId::new(arg1.parse()?);
+                println!("Selecting chat {}", chat_id);
                 sel_chat = Some(Chat::load_from_db(context, chat_id)?);
                 *context.cmdline_sel_chat_id.write().unwrap() = chat_id;
             }
@@ -582,31 +575,41 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             ensure!(sel_chat.is_some(), "Failed to select chat");
             let sel_chat = sel_chat.as_ref().unwrap();
 
-            let msglist = chat::get_chat_msgs(context, sel_chat.get_id(), 0x1, 0);
-            let temp2 = sel_chat.get_subtitle(context);
-            let temp_name = sel_chat.get_name();
-            info!(
-                context,
-                "{}#{}: {} [{}]{}",
+            let msglist = chat::get_chat_msgs(context, sel_chat.get_id(), 0x1, None);
+            let members = chat::get_chat_contacts(context, sel_chat.id);
+            let subtitle = if sel_chat.is_device_talk() {
+                "device-talk".to_string()
+            } else if sel_chat.get_type() == Chattype::Single && !members.is_empty() {
+                let contact = Contact::get_by_id(context, members[0])?;
+                contact.get_addr().to_string()
+            } else {
+                format!("{} member(s)", members.len())
+            };
+            println!(
+                "{}#{}: {} [{}]{}{}",
                 chat_prefix(sel_chat),
                 sel_chat.get_id(),
-                temp_name,
-                temp2,
+                sel_chat.get_name(),
+                subtitle,
                 if sel_chat.is_sending_locations() {
                     "📍"
                 } else {
                     ""
                 },
+                match sel_chat.get_profile_image(context) {
+                    Some(icon) => match icon.to_str() {
+                        Some(icon) => format!(" Icon: {}", icon),
+                        _ => " Icon: Err".to_string(),
+                    },
+                    _ => "".to_string(),
+                },
             );
             log_msglist(context, &msglist)?;
-            if let Some(draft) = chat::get_draft(context, sel_chat.get_id())? {
+            if let Some(draft) = sel_chat.get_id().get_draft(context)? {
                 log_msg(context, "Draft", &draft);
             }
 
-            println!(
-                "{} messages.",
-                chat::get_msg_cnt(context, sel_chat.get_id())
-            );
+            println!("{} messages.", sel_chat.get_id().get_msg_cnt(context));
             chat::marknoticed_chat(context, sel_chat.get_id())?;
         }
         "createchat" => {
@@ -618,7 +621,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         }
         "createchatbymsg" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing");
-            let msg_id: u32 = arg1.parse()?;
+            let msg_id = MsgId::new(arg1.parse()?);
             let chat_id = chat::create_by_msg_id(context, msg_id)?;
             let chat = Chat::load_from_db(context, chat_id)?;
 
@@ -682,7 +685,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             ensure!(sel_chat.is_some(), "No chat selected.");
 
             let contacts = chat::get_chat_contacts(context, sel_chat.as_ref().unwrap().get_id());
-            info!(context, "Memberlist:");
+            println!("Memberlist:");
 
             log_contactlist(context, &contacts);
             println!(
@@ -708,9 +711,8 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let default_marker = "-".to_string();
             for location in &locations {
                 let marker = location.marker.as_ref().unwrap_or(&default_marker);
-                info!(
-                    context,
-                    "Loc#{}: {}: lat={} lng={} acc={} Chat#{} Contact#{} Msg#{} {}",
+                println!(
+                    "Loc#{}: {}: lat={} lng={} acc={} Chat#{} Contact#{} {} {}",
                     location.location_id,
                     dc_timestamp_to_str(location.timestamp),
                     location.latitude,
@@ -723,7 +725,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 );
             }
             if locations.is_empty() {
-                info!(context, "No locations.");
+                println!("No locations.");
             }
         }
         "sendlocations" => {
@@ -747,7 +749,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let longitude = arg2.parse()?;
 
             let continue_streaming = location::set(context, latitude, longitude, 0.);
-            if 0 != continue_streaming {
+            if continue_streaming {
                 println!("Success, streaming should be continued.");
             } else {
                 println!("Success, streaming can be stoppped.");
@@ -789,7 +791,7 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let chat = if let Some(ref sel_chat) = sel_chat {
                 sel_chat.get_id()
             } else {
-                0 as libc::c_uint
+                ChatId::new(0)
             };
 
             let msglist = context.search_msgs(chat, arg1);
@@ -803,16 +805,28 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             if !arg1.is_empty() {
                 let mut draft = Message::new(Viewtype::Text);
                 draft.set_text(Some(arg1.to_string()));
-                chat::set_draft(
-                    context,
-                    sel_chat.as_ref().unwrap().get_id(),
-                    Some(&mut draft),
-                );
+                sel_chat
+                    .as_ref()
+                    .unwrap()
+                    .get_id()
+                    .set_draft(context, Some(&mut draft));
                 println!("Draft saved.");
             } else {
-                chat::set_draft(context, sel_chat.as_ref().unwrap().get_id(), None);
+                sel_chat.as_ref().unwrap().get_id().set_draft(context, None);
                 println!("Draft deleted.");
             }
+        }
+        "devicemsg" => {
+            ensure!(
+                !arg1.is_empty(),
+                "Please specify text to add as device message."
+            );
+            let mut msg = Message::new(Viewtype::Text);
+            msg.set_text(Some(arg1.to_string()));
+            chat::add_device_msg(context, None, Some(&mut msg))?;
+        }
+        "updatedevicechats" => {
+            context.update_device_chats()?;
         }
         "listmedia" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
@@ -827,30 +841,26 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             println!("{} images or videos: ", images.len());
             for (i, data) in images.iter().enumerate() {
                 if 0 == i {
-                    print!("Msg#{}", data);
+                    print!("{}", data);
                 } else {
-                    print!(", Msg#{}", data);
+                    print!(", {}", data);
                 }
             }
             print!("\n");
         }
         "archive" | "unarchive" => {
             ensure!(!arg1.is_empty(), "Argument <chat-id> missing.");
-            let chat_id = arg1.parse()?;
-            chat::archive(
-                context,
-                chat_id,
-                if arg0 == "archive" { true } else { false },
-            )?;
+            let chat_id = ChatId::new(arg1.parse()?);
+            chat_id.set_archived(context, arg0 == "archive")?;
         }
         "delchat" => {
             ensure!(!arg1.is_empty(), "Argument <chat-id> missing.");
-            let chat_id = arg1.parse()?;
-            chat::delete(context, chat_id)?;
+            let chat_id = ChatId::new(arg1.parse()?);
+            chat_id.delete(context)?;
         }
         "msginfo" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
-            let id = arg1.parse()?;
+            let id = MsgId::new(arg1.parse()?);
             let res = message::get_msg_info(context, id);
             println!("{}", res);
         }
@@ -862,31 +872,31 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
         }
         "forward" => {
             ensure!(
-                !arg1.is_empty() && arg2.is_empty(),
+                !arg1.is_empty() && !arg2.is_empty(),
                 "Arguments <msg-id> <chat-id> expected"
             );
 
-            let mut msg_ids = [0; 1];
-            let chat_id = arg2.parse()?;
-            msg_ids[0] = arg1.parse()?;
+            let mut msg_ids = [MsgId::new(0); 1];
+            let chat_id = ChatId::new(arg2.parse()?);
+            msg_ids[0] = MsgId::new(arg1.parse()?);
             chat::forward_msgs(context, &msg_ids, chat_id)?;
         }
         "markseen" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
-            let mut msg_ids = [0; 1];
-            msg_ids[0] = arg1.parse()?;
+            let mut msg_ids = [MsgId::new(0); 1];
+            msg_ids[0] = MsgId::new(arg1.parse()?);
             message::markseen_msgs(context, &msg_ids);
         }
         "star" | "unstar" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
-            let mut msg_ids = [0; 1];
-            msg_ids[0] = arg1.parse()?;
+            let mut msg_ids = [MsgId::new(0); 1];
+            msg_ids[0] = MsgId::new(arg1.parse()?);
             message::star_msgs(context, &msg_ids, arg0 == "star");
         }
         "delmsg" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
-            let mut ids = [0; 1];
-            ids[0] = arg1.parse()?;
+            let mut ids = [MsgId::new(0); 1];
+            ids[0] = MsgId::new(arg1.parse()?);
             message::delete_msgs(context, &ids);
         }
         "listcontacts" | "contacts" | "listverified" => {
@@ -919,7 +929,14 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             let contact = Contact::get_by_id(context, contact_id)?;
             let name_n_addr = contact.get_name_n_addr();
 
-            let mut res = format!("Contact info for: {}:\n\n", name_n_addr);
+            let mut res = format!(
+                "Contact info for: {}:\nIcon: {}\n",
+                name_n_addr,
+                match contact.get_profile_image(context) {
+                    Some(image) => image.to_str().unwrap().to_string(),
+                    None => "NoIcon".to_string(),
+                }
+            );
 
             res += &Contact::get_encrinfo(context, contact_id)?;
 
@@ -955,6 +972,24 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
                 res.get_text1(),
                 res.get_text2()
             );
+        }
+        "providerinfo" => {
+            ensure!(!arg1.is_empty(), "Argument <addr> missing.");
+            match provider::get_provider_info(arg1) {
+                Some(info) => {
+                    println!("Information for provider belonging to {}:", arg1);
+                    println!("status: {}", info.status as u32);
+                    println!("before_login_hint: {}", info.before_login_hint);
+                    println!("after_login_hint: {}", info.after_login_hint);
+                    println!("overview_page: {}", info.overview_page);
+                    for server in info.server.iter() {
+                        println!("server: {}:{}", server.hostname, server.port,);
+                    }
+                }
+                None => {
+                    println!("No information for provider belonging to {} found.", arg1);
+                }
+            }
         }
         // TODO: implement this again, unclear how to match this through though, without writing a parser.
         // "event" => {
@@ -1003,11 +1038,14 @@ pub unsafe fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::E
             context.get_coi_message_filter(id);
             println!("coi-get-message-filter command queued with id: {}", id);
         }
+        "emptyserver" => {
+            ensure!(!arg1.is_empty(), "Argument <flags> missing");
+
+            message::dc_empty_server(context, arg1.parse()?);
+        }
         "" => (),
         _ => bail!("Unknown command: \"{}\" type ? for help.", arg0),
+
     }
-
-    free(arg1_c as *mut _);
-
     Ok(())
 }

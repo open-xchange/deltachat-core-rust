@@ -1,21 +1,24 @@
+//! Location handling
+
 use bitflags::bitflags;
 use quick_xml;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 
-use crate::chat;
+use crate::chat::{self, ChatId};
 use crate::config::Config;
 use crate::constants::*;
 use crate::context::*;
 use crate::dc_tools::*;
 use crate::error::Error;
 use crate::events::Event;
-use crate::job::*;
-use crate::message::Message;
+use crate::job::{self, job_action_exists, job_add, Job};
+use crate::message::{Message, MsgId};
+use crate::mimeparser::SystemMessage;
 use crate::param::*;
 use crate::sql;
 use crate::stock::StockMessage;
 
-// location handling
+/// Location record
 #[derive(Debug, Clone, Default)]
 pub struct Location {
     pub location_id: u32,
@@ -25,7 +28,7 @@ pub struct Location {
     pub timestamp: i64,
     pub contact_id: u32,
     pub msg_id: u32,
-    pub chat_id: u32,
+    pub chat_id: ChatId,
     pub marker: Option<String>,
     pub independent: u32,
 }
@@ -61,14 +64,11 @@ impl Kml {
         Default::default()
     }
 
-    pub fn parse(context: &Context, content: impl AsRef<str>) -> Result<Self, Error> {
-        ensure!(
-            content.as_ref().len() <= (1024 * 1024),
-            "A kml-files with {} bytes is larger than reasonably expected.",
-            content.as_ref().len()
-        );
+    pub fn parse(context: &Context, content: &[u8]) -> Result<Self, Error> {
+        ensure!(content.len() <= 1024 * 1024, "kml-file is too large");
 
-        let mut reader = quick_xml::Reader::from_str(content.as_ref());
+        let to_parse = String::from_utf8_lossy(content);
+        let mut reader = quick_xml::Reader::from_str(&to_parse);
         reader.trim_text(true);
 
         let mut kml = Kml::new();
@@ -193,12 +193,10 @@ impl Kml {
 }
 
 // location streaming
-pub fn send_locations_to_chat(context: &Context, chat_id: u32, seconds: i64) {
+pub fn send_locations_to_chat(context: &Context, chat_id: ChatId, seconds: i64) {
     let now = time();
-    let mut msg: Message;
-    let is_sending_locations_before: bool;
-    if !(seconds < 0 || chat_id <= 9i32 as libc::c_uint) {
-        is_sending_locations_before = is_sending_locations_to_chat(context, chat_id);
+    if !(seconds < 0 || chat_id.is_special()) {
+        let is_sending_locations_before = is_sending_locations_to_chat(context, chat_id);
         if sql::execute(
             context,
             &context.sql,
@@ -209,29 +207,29 @@ pub fn send_locations_to_chat(context: &Context, chat_id: u32, seconds: i64) {
             params![
                 if 0 != seconds { now } else { 0 },
                 if 0 != seconds { now + seconds } else { 0 },
-                chat_id as i32,
+                chat_id,
             ],
         )
         .is_ok()
         {
             if 0 != seconds && !is_sending_locations_before {
-                msg = Message::new(Viewtype::Text);
+                let mut msg = Message::new(Viewtype::Text);
                 msg.text =
                     Some(context.stock_system_msg(StockMessage::MsgLocationEnabled, "", "", 0));
-                msg.param.set_int(Param::Cmd, 8);
+                msg.param.set_cmd(SystemMessage::LocationStreamingEnabled);
                 chat::send_msg(context, chat_id, &mut msg).unwrap_or_default();
             } else if 0 == seconds && is_sending_locations_before {
                 let stock_str =
                     context.stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0);
-                chat::add_device_msg(context, chat_id, stock_str);
+                chat::add_info_msg(context, chat_id, stock_str);
             }
             context.call_cb(Event::ChatModified(chat_id));
             if 0 != seconds {
-                schedule_MAYBE_SEND_LOCATIONS(context, 0i32);
+                schedule_MAYBE_SEND_LOCATIONS(context, false);
                 job_add(
                     context,
-                    Action::MaybeSendLocationsEnded,
-                    chat_id as libc::c_int,
+                    job::Action::MaybeSendLocationsEnded,
+                    chat_id.to_u32() as i32,
                     Params::new(),
                     seconds + 1,
                 );
@@ -241,25 +239,31 @@ pub fn send_locations_to_chat(context: &Context, chat_id: u32, seconds: i64) {
 }
 
 #[allow(non_snake_case)]
-fn schedule_MAYBE_SEND_LOCATIONS(context: &Context, flags: i32) {
-    if 0 != flags & 0x1 || !job_action_exists(context, Action::MaybeSendLocations) {
-        job_add(context, Action::MaybeSendLocations, 0, Params::new(), 60);
+fn schedule_MAYBE_SEND_LOCATIONS(context: &Context, force_schedule: bool) {
+    if force_schedule || !job_action_exists(context, job::Action::MaybeSendLocations) {
+        job_add(
+            context,
+            job::Action::MaybeSendLocations,
+            0,
+            Params::new(),
+            60,
+        );
     };
 }
 
-pub fn is_sending_locations_to_chat(context: &Context, chat_id: u32) -> bool {
+pub fn is_sending_locations_to_chat(context: &Context, chat_id: ChatId) -> bool {
     context
         .sql
         .exists(
             "SELECT id  FROM chats  WHERE (? OR id=?)   AND locations_send_until>?;",
-            params![if chat_id == 0 { 1 } else { 0 }, chat_id as i32, time()],
+            params![if chat_id.is_unset() { 1 } else { 0 }, chat_id, time()],
         )
         .unwrap_or_default()
 }
 
-pub fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> libc::c_int {
+pub fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> bool {
     if latitude == 0.0 && longitude == 0.0 {
-        return 1;
+        return true;
     }
     let mut continue_streaming = false;
 
@@ -279,7 +283,7 @@ pub fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> l
                         accuracy,
                         time(),
                         chat_id,
-                        1,
+                        DC_CONTACT_ID_SELF,
                     ]
             ) {
                 warn!(context, "failed to store location {:?}", err);
@@ -288,17 +292,17 @@ pub fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> l
             }
         }
         if continue_streaming {
-            context.call_cb(Event::LocationChanged(Some(1)));
+            context.call_cb(Event::LocationChanged(Some(DC_CONTACT_ID_SELF)));
         };
-        schedule_MAYBE_SEND_LOCATIONS(context, 0);
+        schedule_MAYBE_SEND_LOCATIONS(context, false);
     }
 
-    continue_streaming as libc::c_int
+    continue_streaming
 }
 
 pub fn get_range(
     context: &Context,
-    chat_id: u32,
+    chat_id: ChatId,
     contact_id: u32,
     timestamp_from: i64,
     mut timestamp_to: i64,
@@ -306,19 +310,18 @@ pub fn get_range(
     if timestamp_to == 0 {
         timestamp_to = time() + 10;
     }
-
     context
         .sql
         .query_map(
             "SELECT l.id, l.latitude, l.longitude, l.accuracy, l.timestamp, l.independent, \
-             m.id, l.from_id, l.chat_id, m.txt \
+             COALESCE(m.id, 0) AS msg_id, l.from_id, l.chat_id, COALESCE(m.txt, '') AS txt \
              FROM locations l  LEFT JOIN msgs m ON l.id=m.location_id  WHERE (? OR l.chat_id=?) \
              AND (? OR l.from_id=?) \
              AND (l.independent=1 OR (l.timestamp>=? AND l.timestamp<=?)) \
-             ORDER BY l.timestamp DESC, l.id DESC, m.id DESC;",
+             ORDER BY l.timestamp DESC, l.id DESC, msg_id DESC;",
             params![
-                if chat_id == 0 { 1 } else { 0 },
-                chat_id as i32,
+                if chat_id.is_unset() { 1 } else { 0 },
+                chat_id,
                 if contact_id == 0 { 1 } else { 0 },
                 contact_id as i32,
                 timestamp_from,
@@ -332,7 +335,6 @@ pub fn get_range(
                 } else {
                     None
                 };
-
                 let loc = Location {
                     location_id: row.get(0)?,
                     latitude: row.get(1)?,
@@ -369,10 +371,7 @@ pub fn delete_all(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn get_kml(context: &Context, chat_id: u32) -> Result<(String, u32), Error> {
-    let now = time();
-    let mut location_count = 0;
-    let mut ret = String::new();
+pub fn get_kml(context: &Context, chat_id: ChatId) -> Result<(String, u32), Error> {
     let mut last_added_location_id = 0;
 
     let self_addr = context
@@ -381,7 +380,7 @@ pub fn get_kml(context: &Context, chat_id: u32) -> Result<(String, u32), Error> 
 
     let (locations_send_begin, locations_send_until, locations_last_sent) = context.sql.query_row(
         "SELECT locations_send_begin, locations_send_until, locations_last_sent  FROM chats  WHERE id=?;",
-        params![chat_id as i32], |row| {
+        params![chat_id], |row| {
             let send_begin: i64 = row.get(0)?;
             let send_until: i64 = row.get(1)?;
             let last_sent: i64 = row.get(2)?;
@@ -389,21 +388,24 @@ pub fn get_kml(context: &Context, chat_id: u32) -> Result<(String, u32), Error> 
             Ok((send_begin, send_until, last_sent))
         })?;
 
-    if !(locations_send_begin == 0 || now > locations_send_until) {
+    let now = time();
+    let mut location_count = 0;
+    let mut ret = String::new();
+    if locations_send_begin != 0 && now <= locations_send_until {
         ret += &format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"{}\">\n",
             self_addr,
         );
 
         context.sql.query_map(
-            "SELECT id, latitude, longitude, accuracy, timestamp\
+            "SELECT id, latitude, longitude, accuracy, timestamp \
              FROM locations  WHERE from_id=? \
              AND timestamp>=? \
              AND (timestamp>=? OR timestamp=(SELECT MAX(timestamp) FROM locations WHERE from_id=?)) \
              AND independent=0 \
              GROUP BY timestamp \
              ORDER BY timestamp;",
-            params![1, locations_send_begin, locations_last_sent, 1],
+            params![DC_CONTACT_ID_SELF, locations_send_begin, locations_last_sent, DC_CONTACT_ID_SELF],
             |row| {
                 let location_id: i32 = row.get(0)?;
                 let latitude: f64 = row.get(1)?;
@@ -417,7 +419,7 @@ pub fn get_kml(context: &Context, chat_id: u32) -> Result<(String, u32), Error> 
                 for row in rows {
                     let (location_id, latitude, longitude, accuracy, timestamp) = row?;
                     ret += &format!(
-                        "<Placemark><Timestamp><when>{}</when></Timestamp><Point><coordinates accuracy=\"{}\">{},{}</coordinates></Point></Placemark>\n\x00",
+                        "<Placemark><Timestamp><when>{}</when></Timestamp><Point><coordinates accuracy=\"{}\">{},{}</coordinates></Point></Placemark>\n",
                         timestamp,
                         accuracy,
                         longitude,
@@ -429,10 +431,10 @@ pub fn get_kml(context: &Context, chat_id: u32) -> Result<(String, u32), Error> 
                 Ok(())
             }
         )?;
+        ret += "</Document>\n</kml>";
     }
 
     ensure!(location_count > 0, "No locations processed");
-    ret += "</Document>\n</kml>";
 
     Ok((ret, last_added_location_id))
 }
@@ -463,25 +465,29 @@ pub fn get_message_kml(timestamp: i64, latitude: f64, longitude: f64) -> String 
 
 pub fn set_kml_sent_timestamp(
     context: &Context,
-    chat_id: u32,
+    chat_id: ChatId,
     timestamp: i64,
 ) -> Result<(), Error> {
     sql::execute(
         context,
         &context.sql,
         "UPDATE chats SET locations_last_sent=? WHERE id=?;",
-        params![timestamp, chat_id as i32],
+        params![timestamp, chat_id],
     )?;
 
     Ok(())
 }
 
-pub fn set_msg_location_id(context: &Context, msg_id: u32, location_id: u32) -> Result<(), Error> {
+pub fn set_msg_location_id(
+    context: &Context,
+    msg_id: MsgId,
+    location_id: u32,
+) -> Result<(), Error> {
     sql::execute(
         context,
         &context.sql,
         "UPDATE msgs SET location_id=? WHERE id=?;",
-        params![location_id, msg_id as i32],
+        params![location_id, msg_id],
     )?;
 
     Ok(())
@@ -489,58 +495,62 @@ pub fn set_msg_location_id(context: &Context, msg_id: u32, location_id: u32) -> 
 
 pub fn save(
     context: &Context,
-    chat_id: u32,
+    chat_id: ChatId,
     contact_id: u32,
     locations: &[Location],
-    independent: i32,
+    independent: bool,
 ) -> Result<u32, Error> {
-    ensure!(chat_id > 9, "Invalid chat id");
-    context.sql.prepare2(
-        "SELECT id FROM locations WHERE timestamp=? AND from_id=?",
-        "INSERT INTO locations\
-         (timestamp, from_id, chat_id, latitude, longitude, accuracy, independent) \
-         VALUES (?,?,?,?,?,?,?);",
-        |mut stmt_test, mut stmt_insert, conn| {
-            let mut newest_timestamp = 0;
-            let mut newest_location_id = 0;
+    ensure!(!chat_id.is_special(), "Invalid chat id");
+    context
+        .sql
+        .prepare2(
+            "SELECT id FROM locations WHERE timestamp=? AND from_id=?",
+            "INSERT INTO locations\
+             (timestamp, from_id, chat_id, latitude, longitude, accuracy, independent) \
+             VALUES (?,?,?,?,?,?,?);",
+            |mut stmt_test, mut stmt_insert, conn| {
+                let mut newest_timestamp = 0;
+                let mut newest_location_id = 0;
 
-            for location in locations {
-                let exists = stmt_test.exists(params![location.timestamp, contact_id as i32])?;
+                for location in locations {
+                    let exists =
+                        stmt_test.exists(params![location.timestamp, contact_id as i32])?;
 
-                if 0 != independent || !exists {
-                    stmt_insert.execute(params![
-                        location.timestamp,
-                        contact_id as i32,
-                        chat_id as i32,
-                        location.latitude,
-                        location.longitude,
-                        location.accuracy,
-                        independent,
-                    ])?;
-
-                    if location.timestamp > newest_timestamp {
-                        newest_timestamp = location.timestamp;
-                        newest_location_id = sql::get_rowid2_with_conn(
-                            context,
-                            conn,
-                            "locations",
-                            "timestamp",
+                    if independent || !exists {
+                        stmt_insert.execute(params![
                             location.timestamp,
-                            "from_id",
                             contact_id as i32,
-                        );
+                            chat_id,
+                            location.latitude,
+                            location.longitude,
+                            location.accuracy,
+                            independent,
+                        ])?;
+
+                        if location.timestamp > newest_timestamp {
+                            newest_timestamp = location.timestamp;
+                            newest_location_id = sql::get_rowid2_with_conn(
+                                context,
+                                conn,
+                                "locations",
+                                "timestamp",
+                                location.timestamp,
+                                "from_id",
+                                contact_id as i32,
+                            );
+                        }
                     }
                 }
-            }
-            Ok(newest_location_id)
-        },
-    )
+                Ok(newest_location_id)
+            },
+        )
+        .map_err(Into::into)
 }
 
 #[allow(non_snake_case)]
-pub fn job_do_DC_JOB_MAYBE_SEND_LOCATIONS(context: &Context, _job: &Job) {
+pub fn JobMaybeSendLocations(context: &Context, _job: &Job) -> job::Status {
     let now = time();
-    let mut continue_streaming: libc::c_int = 1;
+    let mut continue_streaming = false;
     info!(
         context,
         " ----------------- MAYBE_SEND_LOCATIONS -------------- ",
@@ -552,10 +562,10 @@ pub fn job_do_DC_JOB_MAYBE_SEND_LOCATIONS(context: &Context, _job: &Job) {
          WHERE locations_send_until>?;",
         params![now],
         |row| {
-            let chat_id: i32 = row.get(0)?;
+            let chat_id: ChatId = row.get(0)?;
             let locations_send_begin: i64 = row.get(1)?;
             let locations_last_sent: i64 = row.get(2)?;
-            continue_streaming = 1;
+            continue_streaming = true;
 
             // be a bit tolerant as the timer may not align exactly with time(NULL)
             if now - locations_last_sent < (60 - 3) {
@@ -585,7 +595,11 @@ pub fn job_do_DC_JOB_MAYBE_SEND_LOCATIONS(context: &Context, _job: &Job) {
                         .into_iter()
                         .filter_map(|(chat_id, locations_send_begin, locations_last_sent)| {
                             if !stmt_locations
-                                .exists(params![1, locations_send_begin, locations_last_sent,])
+                                .exists(params![
+                                    DC_CONTACT_ID_SELF,
+                                    locations_send_begin,
+                                    locations_last_sent,
+                                ])
                                 .unwrap_or_default()
                             {
                                 // if there is no new location, there's nothing to send.
@@ -603,7 +617,7 @@ pub fn job_do_DC_JOB_MAYBE_SEND_LOCATIONS(context: &Context, _job: &Job) {
                                 // and dc_set_location() is typically called periodically, this is ok)
                                 let mut msg = Message::new(Viewtype::Text);
                                 msg.hidden = true;
-                                msg.param.set_int(Param::Cmd, 9);
+                                msg.param.set_cmd(SystemMessage::LocationOnly);
                                 Some((chat_id, msg))
                             }
                         })
@@ -615,44 +629,46 @@ pub fn job_do_DC_JOB_MAYBE_SEND_LOCATIONS(context: &Context, _job: &Job) {
 
         for (chat_id, mut msg) in msgs.into_iter() {
             // TODO: better error handling
-            chat::send_msg(context, chat_id as u32, &mut msg).unwrap_or_default();
+            chat::send_msg(context, chat_id, &mut msg).unwrap_or_default();
         }
     }
-    if 0 != continue_streaming {
-        schedule_MAYBE_SEND_LOCATIONS(context, 0x1);
+    if continue_streaming {
+        schedule_MAYBE_SEND_LOCATIONS(context, true);
     }
+    job::Status::Finished(Ok(()))
 }
 
 #[allow(non_snake_case)]
-pub fn job_do_DC_JOB_MAYBE_SEND_LOC_ENDED(context: &Context, job: &mut Job) {
+pub fn JobMaybeSendLocationsEnded(context: &Context, job: &mut Job) -> job::Status {
     // this function is called when location-streaming _might_ have ended for a chat.
     // the function checks, if location-streaming is really ended;
     // if so, a device-message is added if not yet done.
 
-    let chat_id = job.foreign_id;
+    let chat_id = ChatId::new(job.foreign_id);
 
-    if let Ok((send_begin, send_until)) = context.sql.query_row(
+    let (send_begin, send_until) = job_try!(context.sql.query_row(
         "SELECT locations_send_begin, locations_send_until  FROM chats  WHERE id=?",
-        params![chat_id as i32],
+        params![chat_id],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    ) {
-        if !(send_begin != 0 && time() <= send_until) {
-            // still streaming -
-            // may happen as several calls to dc_send_locations_to_chat()
-            // do not un-schedule pending DC_MAYBE_SEND_LOC_ENDED jobs
-            if !(send_begin == 0 && send_until == 0) {
-                // not streaming, device-message already sent
-                if context.sql.execute(
-                    "UPDATE chats    SET locations_send_begin=0, locations_send_until=0  WHERE id=?",
-                    params![chat_id as i32],
-                ).is_ok() {
-                    let stock_str = context.stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0);
-                    chat::add_device_msg(context, chat_id, stock_str);
-                    context.call_cb(Event::ChatModified(chat_id));
-                }
-            }
+    ));
+
+    if !(send_begin != 0 && time() <= send_until) {
+        // still streaming -
+        // may happen as several calls to dc_send_locations_to_chat()
+        // do not un-schedule pending DC_MAYBE_SEND_LOC_ENDED jobs
+        if !(send_begin == 0 && send_until == 0) {
+            // not streaming, device-message already sent
+            job_try!(context.sql.execute(
+                "UPDATE chats    SET locations_send_begin=0, locations_send_until=0  WHERE id=?",
+                params![chat_id],
+            ));
+
+            let stock_str = context.stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0);
+            chat::add_info_msg(context, chat_id, stock_str);
+            context.call_cb(Event::ChatModified(chat_id));
         }
     }
+    job::Status::Finished(Ok(()))
 }
 
 #[cfg(test)]
@@ -665,9 +681,9 @@ mod tests {
         let context = dummy_context();
 
         let xml =
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"user@example.org\">\n<Placemark><Timestamp><when>2019-03-06T21:09:57Z</when></Timestamp><Point><coordinates accuracy=\"32.000000\">9.423110,53.790302</coordinates></Point></Placemark>\n<PlaceMARK>\n<Timestamp><WHEN > \n\t2018-12-13T22:11:12Z\t</WHEN></Timestamp><Point><coordinates aCCuracy=\"2.500000\"> 19.423110 \t , \n 63.790302\n </coordinates></Point></PlaceMARK>\n</Document>\n</kml>";
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"user@example.org\">\n<Placemark><Timestamp><when>2019-03-06T21:09:57Z</when></Timestamp><Point><coordinates accuracy=\"32.000000\">9.423110,53.790302</coordinates></Point></Placemark>\n<PlaceMARK>\n<Timestamp><WHEN > \n\t2018-12-13T22:11:12Z\t</WHEN></Timestamp><Point><coordinates aCCuracy=\"2.500000\"> 19.423110 \t , \n 63.790302\n </coordinates></Point></PlaceMARK>\n</Document>\n</kml>";
 
-        let kml = Kml::parse(&context.ctx, &xml).expect("parsing failed");
+        let kml = Kml::parse(&context.ctx, xml).expect("parsing failed");
 
         assert!(kml.addr.is_some());
         assert_eq!(kml.addr.as_ref().unwrap(), "user@example.org",);

@@ -1,3 +1,5 @@
+//! # QR code module
+
 use lazy_static::lazy_static;
 use percent_encoding::percent_decode_str;
 
@@ -67,7 +69,7 @@ fn decode_openpgp(context: &Context, qr: &str) -> Lot {
         (fp, &rest[1..])
     }) {
         Some(pair) => pair,
-        None => return format_err!("Invalid OPENPGP4FPR found").into(),
+        None => (payload, ""),
     };
 
     // replace & with \n to match expected param format
@@ -81,16 +83,17 @@ fn decode_openpgp(context: &Context, qr: &str) -> Lot {
 
     let addr = if let Some(addr) = param.get(Param::Forwarded) {
         match normalize_address(addr) {
-            Ok(addr) => addr,
+            Ok(addr) => Some(addr),
             Err(err) => return err.into(),
         }
     } else {
-        return format_err!("Missing address").into();
+        None
     };
 
     // what is up with that param name?
     let name = if let Some(encoded_name) = param.get(Param::SetLongitude) {
-        match percent_decode_str(encoded_name).decode_utf8() {
+        let encoded_name = encoded_name.replace("+", "%20"); // sometimes spaces are encoded as `+`
+        match percent_decode_str(&encoded_name).decode_utf8() {
             Ok(name) => name.to_string(),
             Err(err) => return format_err!("Invalid name: {}", err).into(),
         }
@@ -104,7 +107,8 @@ fn decode_openpgp(context: &Context, qr: &str) -> Lot {
 
     let grpname = if grpid.is_some() {
         if let Some(encoded_name) = param.get(Param::GroupName) {
-            match percent_decode_str(encoded_name).decode_utf8() {
+            let encoded_name = encoded_name.replace("+", "%20"); // sometimes spaces are encoded as `+`
+            match percent_decode_str(&encoded_name).decode_utf8() {
                 Ok(name) => Some(name.to_string()),
                 Err(err) => return format_err!("Invalid group name: {}", err).into(),
             }
@@ -135,29 +139,25 @@ fn decode_openpgp(context: &Context, qr: &str) -> Lot {
     if invitenumber.is_none() || auth.is_none() {
         if let Some(peerstate) = peerstate {
             lot.state = LotState::QrFprOk;
-            let addr = peerstate
-                .addr
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or_else(|| "");
 
-            lot.id = Contact::add_or_lookup(context, name, addr, Origin::UnhandledQrScan)
-                .map(|(id, _)| id)
-                .unwrap_or_default();
+            lot.id = Contact::add_or_lookup(
+                context,
+                name,
+                peerstate.addr.clone(),
+                Origin::UnhandledQrScan,
+            )
+            .map(|(id, _)| id)
+            .unwrap_or_default();
 
             let (id, _) = chat::create_or_lookup_by_contact_id(context, lot.id, Blocked::Deaddrop)
                 .unwrap_or_default();
 
-            chat::add_device_msg(
-                context,
-                id,
-                format!("{} verified.", peerstate.addr.unwrap_or_default()),
-            );
+            chat::add_info_msg(context, id, format!("{} verified.", peerstate.addr));
         } else {
             lot.state = LotState::QrFprWithoutAddr;
             lot.text1 = Some(dc_format_fingerprint(&fingerprint));
         }
-    } else {
+    } else if let Some(addr) = addr {
         if grpid.is_some() && grpname.is_some() {
             lot.state = LotState::QrAskVerifyGroup;
             lot.text1 = grpname;
@@ -172,6 +172,8 @@ fn decode_openpgp(context: &Context, qr: &str) -> Lot {
         lot.fingerprint = Some(fingerprint);
         lot.invitenumber = invitenumber;
         lot.auth = auth;
+    } else {
+        return format_err!("Missing address").into();
     }
 
     lot
@@ -186,7 +188,7 @@ fn decode_mailto(context: &Context, qr: &str) -> Lot {
     let addr = if let Some(query_index) = payload.find('?') {
         &payload[..query_index]
     } else {
-        return format_err!("Invalid mailto found").into();
+        payload
     };
 
     let addr = match normalize_address(addr) {
@@ -405,13 +407,21 @@ mod tests {
             &ctx.ctx,
             "mailto:stress@test.local?subject=hello&body=world",
         );
-
         println!("{:?}", res);
         assert_eq!(res.get_state(), LotState::QrAddr);
         assert_ne!(res.get_id(), 0);
-
         let contact = Contact::get_by_id(&ctx.ctx, res.get_id()).unwrap();
         assert_eq!(contact.get_addr(), "stress@test.local");
+
+        let res = check_qr(&ctx.ctx, "mailto:no-questionmark@example.org");
+        assert_eq!(res.get_state(), LotState::QrAddr);
+        assert_ne!(res.get_id(), 0);
+        let contact = Contact::get_by_id(&ctx.ctx, res.get_id()).unwrap();
+        assert_eq!(contact.get_addr(), "no-questionmark@example.org");
+
+        let res = check_qr(&ctx.ctx, "mailto:no-addr");
+        assert_eq!(res.get_state(), LotState::QrError);
+        assert!(res.get_text1().is_some());
     }
 
     #[test]
@@ -434,12 +444,13 @@ mod tests {
 
         let res = check_qr(
             &ctx.ctx,
-            "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&g=testtesttest&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+            "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
         );
 
         println!("{:?}", res);
         assert_eq!(res.get_state(), LotState::QrAskVerifyGroup);
         assert_ne!(res.get_id(), 0);
+        assert_eq!(res.get_text1().unwrap(), "test ? test !");
 
         let contact = Contact::get_by_id(&ctx.ctx, res.get_id()).unwrap();
         assert_eq!(contact.get_addr(), "cli@deltachat.de");
@@ -451,7 +462,7 @@ mod tests {
 
         let res = check_qr(
             &ctx.ctx,
-            "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&n=&i=TbnwJ6lSvD5&s=0ejvbdFSQxB"
+            "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&n=J%C3%B6rn%20P.+P.&i=TbnwJ6lSvD5&s=0ejvbdFSQxB"
         );
 
         println!("{:?}", res);
@@ -460,5 +471,26 @@ mod tests {
 
         let contact = Contact::get_by_id(&ctx.ctx, res.get_id()).unwrap();
         assert_eq!(contact.get_addr(), "cli@deltachat.de");
+        assert_eq!(contact.get_name(), "Jörn P. P.");
+    }
+
+    #[test]
+    fn test_decode_openpgp_without_addr() {
+        let ctx = dummy_context();
+
+        let res = check_qr(
+            &ctx.ctx,
+            "OPENPGP4FPR:1234567890123456789012345678901234567890",
+        );
+        assert_eq!(res.get_state(), LotState::QrFprWithoutAddr);
+        assert_eq!(
+            res.get_text1().unwrap(),
+            "1234 5678 9012 3456 7890\n1234 5678 9012 3456 7890"
+        );
+        assert_eq!(res.get_id(), 0);
+
+        let res = check_qr(&ctx.ctx, "OPENPGP4FPR:12345678901234567890");
+        assert_eq!(res.get_state(), LotState::QrError);
+        assert_eq!(res.get_id(), 0);
     }
 }

@@ -1,12 +1,16 @@
+//! # Key-value configuration management
+
 use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
 
+use crate::blob::BlobObject;
 use crate::constants::DC_VERSION_STR;
 use crate::context::Context;
 use crate::dc_tools::*;
-use crate::error::Error;
 use crate::job::*;
+use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::stock::StockMessage;
+use rusqlite::NO_PARAMS;
 
 /// The available configuration keys.
 #[derive(
@@ -26,27 +30,38 @@ pub enum Config {
     SendPort,
     SmtpCertificateChecks,
     ServerFlags,
+
     #[strum(props(default = "INBOX"))]
     ImapFolder,
+
     Displayname,
     Selfstatus,
     Selfavatar,
-    #[strum(props(default = "1"))]
+
+    #[strum(props(default = "0"))]
     BccSelf,
+
     #[strum(props(default = "1"))]
     E2eeEnabled,
+
     #[strum(props(default = "1"))]
     MdnsEnabled,
+
     #[strum(props(default = "1"))]
     InboxWatch,
+
     #[strum(props(default = "1"))]
     SentboxWatch,
+
     #[strum(props(default = "1"))]
     MvboxWatch,
+
     #[strum(props(default = "1"))]
     MvboxMove,
-    #[strum(props(default = "0"))]
+
+    #[strum(props(default = "0"))] // also change ShowEmails.default() on changes
     ShowEmails,
+
     SaveMimeHeaders,
     ConfiguredAddr,
     ConfiguredMailServer,
@@ -64,13 +79,16 @@ pub enum Config {
     ConfiguredSendSecurity,
     ConfiguredE2EEEnabled,
     Configured,
-    // Deprecated
+
     #[strum(serialize = "sys.version")]
     SysVersion,
+
     #[strum(serialize = "sys.msgsize_max_recommended")]
     SysMsgsizeMaxRecommended,
+
     #[strum(serialize = "rfc724_msg_id_prefix")]
     Rfc724MsgIdPrefix,   // To be removed when chat$ prefix has become the sole convention
+
     #[strum(serialize = "sys.config_keys")]
     SysConfigKeys,
 }
@@ -84,7 +102,7 @@ impl Context {
                 rel_path.map(|p| dc_get_abs_path(self, &p).to_string_lossy().into_owned())
             }
             Config::SysVersion => Some((&*DC_VERSION_STR).clone()),
-            Config::SysMsgsizeMaxRecommended => Some(format!("{}", 24 * 1024 * 1024 / 4 * 3)),
+            Config::SysMsgsizeMaxRecommended => Some(format!("{}", RECOMMENDED_FILE_SIZE)),
             Config::SysConfigKeys => Some(get_config_keys_string()),
             _ => self.sql.get_raw_config(self, key),
         };
@@ -112,16 +130,25 @@ impl Context {
 
     /// Set the given config key.
     /// If `None` is passed as a value the value is cleared and set to the default if there is one.
-    pub fn set_config(&self, key: Config, value: Option<&str>) -> Result<(), Error> {
+    pub fn set_config(&self, key: Config, value: Option<&str>) -> crate::sql::Result<()> {
         match key {
-            Config::Selfavatar if value.is_some() => {
-                let rel_path = std::fs::canonicalize(value.unwrap())?;
+            Config::Selfavatar => {
                 self.sql
-                    .set_raw_config(self, key, Some(&rel_path.to_string_lossy()))
+                    .execute("UPDATE contacts SET selfavatar_sent=0;", NO_PARAMS)?;
+                self.sql
+                    .set_raw_config_bool(self, "attach_selfavatar", true)?;
+                match value {
+                    Some(value) => {
+                        let blob = BlobObject::new_from_path(&self, value)?;
+                        blob.recode_to_avatar_size(self)?;
+                        self.sql.set_raw_config(self, key, Some(blob.as_name()))
+                    }
+                    None => self.sql.set_raw_config(self, key, None),
+                }
             }
             Config::InboxWatch => {
                 let ret = self.sql.set_raw_config(self, key, value);
-                interrupt_imap_idle(self);
+                interrupt_inbox_idle(self);
                 ret
             }
             Config::SentboxWatch => {
@@ -167,6 +194,12 @@ mod tests {
     use std::str::FromStr;
     use std::string::ToString;
 
+    use crate::constants::AVATAR_SIZE;
+    use crate::test_utils::*;
+    use image::GenericImageView;
+    use std::fs::File;
+    use std::io::Write;
+
     #[test]
     fn test_to_string() {
         assert_eq!(Config::MailServer.to_string(), "mail_server");
@@ -182,5 +215,58 @@ mod tests {
     #[test]
     fn test_default_prop() {
         assert_eq!(Config::ImapFolder.get_str("default"), Some("INBOX"));
+    }
+
+    #[test]
+    fn test_selfavatar_outside_blobdir() {
+        let t = dummy_context();
+        let avatar_src = t.dir.path().join("avatar.jpg");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
+        File::create(&avatar_src)
+            .unwrap()
+            .write_all(avatar_bytes)
+            .unwrap();
+        let avatar_blob = t.ctx.get_blobdir().join("avatar.jpg");
+        assert!(!avatar_blob.exists());
+        t.ctx
+            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))
+            .unwrap();
+        assert!(avatar_blob.exists());
+        assert!(std::fs::metadata(&avatar_blob).unwrap().len() < avatar_bytes.len() as u64);
+        let avatar_cfg = t.ctx.get_config(Config::Selfavatar);
+        assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
+
+        let img = image::open(avatar_src).unwrap();
+        assert_eq!(img.width(), 1000);
+        assert_eq!(img.height(), 1000);
+
+        let img = image::open(avatar_blob).unwrap();
+        assert_eq!(img.width(), AVATAR_SIZE);
+        assert_eq!(img.height(), AVATAR_SIZE);
+    }
+
+    #[test]
+    fn test_selfavatar_in_blobdir() {
+        let t = dummy_context();
+        let avatar_src = t.ctx.get_blobdir().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar900x900.png");
+        File::create(&avatar_src)
+            .unwrap()
+            .write_all(avatar_bytes)
+            .unwrap();
+
+        let img = image::open(&avatar_src).unwrap();
+        assert_eq!(img.width(), 900);
+        assert_eq!(img.height(), 900);
+
+        t.ctx
+            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))
+            .unwrap();
+        let avatar_cfg = t.ctx.get_config(Config::Selfavatar);
+        assert_eq!(avatar_cfg, avatar_src.to_str().map(|s| s.to_string()));
+
+        let img = image::open(avatar_src).unwrap();
+        assert_eq!(img.width(), AVATAR_SIZE);
+        assert_eq!(img.height(), AVATAR_SIZE);
     }
 }

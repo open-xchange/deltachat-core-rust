@@ -9,8 +9,12 @@ const COI_METADATA_MESSAGE_FILTER: &str =
     "/private/vendor/vendor.dovecot/coi/config/message-filter";
 
 impl Context {
+    pub async fn get_coi_config_async(&self) -> Option<CoiConfig> {
+        self.inbox_thread.read().unwrap().imap.get_coi_config().await
+    }
+    
     pub fn get_coi_config(&self) -> Option<CoiConfig> {
-        self.inbox.read().unwrap().get_coi_config()
+        async_std::task::block_on(self.get_coi_config_async())
     }
 
     pub fn set_coi_enabled(&self, enable: bool, id: i32) {
@@ -50,6 +54,17 @@ impl Context {
 
     pub fn has_mvbox_folder_override(&self) -> bool {
         self.with_coi_deltachat_mode(|mode| mode.get_mvbox_folder_override().is_some())
+    }
+
+    pub fn get_inbox_folder_override(&self) -> Option<String> {
+        self.with_coi_deltachat_mode(|mode| {
+            mode.get_inbox_folder_override()
+                .map(|inbox_override| inbox_override.into())
+        })
+    }
+
+    pub fn has_inbox_folder_override(&self) -> bool {
+        self.with_coi_deltachat_mode(|mode| mode.get_inbox_folder_override().is_some())
     }
 
     /// DCC will move messages depending on two settings:

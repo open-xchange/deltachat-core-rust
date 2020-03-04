@@ -1,137 +1,118 @@
-use std::collections::HashSet;
-use std::convert::TryInto;
-use std::io::Cursor;
-use std::ptr;
+//! OpenPGP helper module using [rPGP facilities](https://github.com/rpgp/rpgp)
 
-use libc::{strchr, strlen, strncmp, strspn, strstr};
+use std::collections::{BTreeMap, HashSet};
+use std::convert::TryInto;
+use std::io;
+use std::io::Cursor;
+
+use pgp::armor::BlockType;
 use pgp::composed::{
     Deserializable, KeyType as PgpKeyType, Message, SecretKeyParamsBuilder, SignedPublicKey,
-    SignedSecretKey, SubkeyParamsBuilder,
+    SignedPublicSubKey, SignedSecretKey, SubkeyParamsBuilder,
 };
 use pgp::crypto::{HashAlgorithm, SymmetricKeyAlgorithm};
-use pgp::types::{CompressionAlgorithm, KeyTrait, SecretKeyTrait, StringToKey};
-use rand::thread_rng;
+use pgp::types::{
+    CompressionAlgorithm, KeyTrait, Mpi, PublicKeyTrait, SecretKeyTrait, StringToKey,
+};
+use rand::{thread_rng, CryptoRng, Rng};
 
-use crate::dc_tools::*;
-use crate::error::Error;
+use crate::error::Result;
 use crate::key::*;
 use crate::keyring::*;
 
-pub unsafe fn dc_split_armored_data(
-    buf: *mut libc::c_char,
-    ret_headerline: *mut String,
-    ret_setupcodebegin: *mut *const libc::c_char,
-    ret_preferencrypt: *mut *const libc::c_char,
-    ret_base64: *mut *const libc::c_char,
-) -> bool {
-    let mut success = false;
-    let mut line_chars: libc::size_t = 0;
-    let mut line: *mut libc::c_char = buf;
-    let mut p1: *mut libc::c_char = buf;
-    let mut p2: *mut libc::c_char;
-    let mut headerline: *mut libc::c_char = ptr::null_mut();
-    let mut base64: *mut libc::c_char = ptr::null_mut();
-    if !ret_setupcodebegin.is_null() {
-        *ret_setupcodebegin = ptr::null_mut();
-    }
-    if !ret_preferencrypt.is_null() {
-        *ret_preferencrypt = ptr::null();
-    }
-    if !ret_base64.is_null() {
-        *ret_base64 = ptr::null();
-    }
-    if !buf.is_null() {
-        dc_remove_cr_chars(buf);
-        while 0 != *p1 {
-            if i32::from(*p1) == '\n' as i32 {
-                *line.offset(line_chars as isize) = 0i32 as libc::c_char;
-                if headerline.is_null() {
-                    dc_trim(line);
-                    if strncmp(
-                        line,
-                        b"-----BEGIN \x00" as *const u8 as *const libc::c_char,
-                        1,
-                    ) == 0i32
-                        && strncmp(
-                            &mut *line.offset(strlen(line).wrapping_sub(5) as isize),
-                            b"-----\x00" as *const u8 as *const libc::c_char,
-                            5,
-                        ) == 0i32
-                    {
-                        headerline = line;
-                        *ret_headerline = as_str(headerline).to_string();
-                    }
-                } else if strspn(line, b"\t\r\n \x00" as *const u8 as *const libc::c_char)
-                    == strlen(line)
-                {
-                    base64 = p1.offset(1isize);
-                    break;
-                } else {
-                    p2 = strchr(line, ':' as i32);
-                    if p2.is_null() {
-                        *line.add(line_chars) = '\n' as i32 as libc::c_char;
-                        base64 = line;
-                        break;
-                    } else {
-                        *p2 = 0i32 as libc::c_char;
-                        dc_trim(line);
-                        if strcasecmp(
-                            line,
-                            b"Passphrase-Begin\x00" as *const u8 as *const libc::c_char,
-                        ) == 0i32
-                        {
-                            p2 = p2.offset(1isize);
-                            dc_trim(p2);
-                            if !ret_setupcodebegin.is_null() {
-                                *ret_setupcodebegin = p2
-                            }
-                        } else if strcasecmp(
-                            line,
-                            b"Autocrypt-Prefer-Encrypt\x00" as *const u8 as *const libc::c_char,
-                        ) == 0i32
-                        {
-                            p2 = p2.offset(1isize);
-                            dc_trim(p2);
-                            if !ret_preferencrypt.is_null() {
-                                *ret_preferencrypt = p2
-                            }
-                        }
-                    }
-                }
-                p1 = p1.offset(1isize);
-                line = p1;
-                line_chars = 0;
-            } else {
-                p1 = p1.offset(1isize);
-                line_chars = line_chars.wrapping_add(1)
-            }
-        }
-        if !(headerline.is_null() || base64.is_null()) {
-            /* now, line points to beginning of base64 data, search end */
-            /*the trailing space makes sure, this is not a normal base64 sequence*/
-            p1 = strstr(base64, b"-----END \x00" as *const u8 as *const libc::c_char);
-            if !(p1.is_null()
-                || strncmp(
-                    p1.offset(9isize),
-                    headerline.offset(11isize),
-                    strlen(headerline.offset(11isize)),
-                ) != 0i32)
-            {
-                *p1 = 0i32 as libc::c_char;
-                dc_trim(base64);
-                if !ret_base64.is_null() {
-                    *ret_base64 = base64
-                }
-                success = true;
-            }
+pub const HEADER_AUTOCRYPT: &str = "autocrypt-prefer-encrypt";
+pub const HEADER_SETUPCODE: &str = "passphrase-begin";
+
+/// A wrapper for rPGP public key types
+#[derive(Debug)]
+enum SignedPublicKeyOrSubkey<'a> {
+    Key(&'a SignedPublicKey),
+    Subkey(&'a SignedPublicSubKey),
+}
+
+impl<'a> KeyTrait for SignedPublicKeyOrSubkey<'a> {
+    fn fingerprint(&self) -> Vec<u8> {
+        match self {
+            Self::Key(k) => k.fingerprint(),
+            Self::Subkey(k) => k.fingerprint(),
         }
     }
 
-    success
+    fn key_id(&self) -> pgp::types::KeyId {
+        match self {
+            Self::Key(k) => k.key_id(),
+            Self::Subkey(k) => k.key_id(),
+        }
+    }
+
+    fn algorithm(&self) -> pgp::crypto::PublicKeyAlgorithm {
+        match self {
+            Self::Key(k) => k.algorithm(),
+            Self::Subkey(k) => k.algorithm(),
+        }
+    }
+}
+
+impl<'a> PublicKeyTrait for SignedPublicKeyOrSubkey<'a> {
+    fn verify_signature(
+        &self,
+        hash: HashAlgorithm,
+        data: &[u8],
+        sig: &[Mpi],
+    ) -> pgp::errors::Result<()> {
+        match self {
+            Self::Key(k) => k.verify_signature(hash, data, sig),
+            Self::Subkey(k) => k.verify_signature(hash, data, sig),
+        }
+    }
+
+    fn encrypt<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        plain: &[u8],
+    ) -> pgp::errors::Result<Vec<Mpi>> {
+        match self {
+            Self::Key(k) => k.encrypt(rng, plain),
+            Self::Subkey(k) => k.encrypt(rng, plain),
+        }
+    }
+
+    fn to_writer_old(&self, writer: &mut impl io::Write) -> pgp::errors::Result<()> {
+        match self {
+            Self::Key(k) => k.to_writer_old(writer),
+            Self::Subkey(k) => k.to_writer_old(writer),
+        }
+    }
+}
+
+/// Split data from PGP Armored Data as defined in https://tools.ietf.org/html/rfc4880#section-6.2.
+///
+/// Returns (type, headers, base64 encoded body).
+pub fn split_armored_data(buf: &[u8]) -> Result<(BlockType, BTreeMap<String, String>, Vec<u8>)> {
+    use std::io::Read;
+
+    let cursor = Cursor::new(buf);
+    let mut dearmor = pgp::armor::Dearmor::new(cursor);
+
+    let mut bytes = Vec::with_capacity(buf.len());
+
+    dearmor.read_to_end(&mut bytes)?;
+    ensure!(dearmor.typ.is_some(), "Failed to parse type");
+
+    let typ = dearmor.typ.unwrap();
+
+    // normalize headers
+    let headers = dearmor
+        .headers
+        .into_iter()
+        .map(|(key, value)| (key.trim().to_lowercase(), value.trim().to_string()))
+        .collect();
+
+    Ok((typ, headers, bytes))
 }
 
 /// Create a new key pair.
-pub fn dc_pgp_create_keypair(addr: impl AsRef<str>) -> Option<(Key, Key)> {
+pub fn create_keypair(addr: impl AsRef<str>) -> Option<(Key, Key)> {
     let user_id = format!("<{}>", addr.as_ref());
 
     let key_params = SecretKeyParamsBuilder::default()
@@ -181,20 +162,49 @@ pub fn dc_pgp_create_keypair(addr: impl AsRef<str>) -> Option<(Key, Key)> {
     Some((Key::Public(public_key), Key::Secret(private_key)))
 }
 
-pub fn dc_pgp_pk_encrypt(
+/// Select public key or subkey to use for encryption.
+///
+/// First, tries to use subkeys. If none of the subkeys are suitable
+/// for encryption, tries to use primary key. Returns `None` if the public
+/// key cannot be used for encryption.
+///
+/// TODO: take key flags and expiration dates into account
+fn select_pk_for_encryption(key: &SignedPublicKey) -> Option<SignedPublicKeyOrSubkey> {
+    key.public_subkeys
+        .iter()
+        .find(|subkey| subkey.is_encryption_key())
+        .map_or_else(
+            || {
+                // No usable subkey found, try primary key
+                if key.is_encryption_key() {
+                    Some(SignedPublicKeyOrSubkey::Key(key))
+                } else {
+                    None
+                }
+            },
+            |subkey| Some(SignedPublicKeyOrSubkey::Subkey(subkey)),
+        )
+}
+
+/// Encrypts `plain` text using `public_keys_for_encryption`
+/// and signs it using `private_key_for_signing`.
+pub fn pk_encrypt(
     plain: &[u8],
     public_keys_for_encryption: &Keyring,
     private_key_for_signing: Option<&Key>,
-) -> Result<String, Error> {
+) -> Result<String> {
     let lit_msg = Message::new_literal_bytes("", plain);
-    let pkeys: Vec<&SignedPublicKey> = public_keys_for_encryption
+    let pkeys: Vec<SignedPublicKeyOrSubkey> = public_keys_for_encryption
         .keys()
         .iter()
         .filter_map(|key| {
-            let k: &Key = &key;
-            k.try_into().ok()
+            key.as_ref()
+                .try_into()
+                .ok()
+                .and_then(select_pk_for_encryption)
         })
         .collect();
+    let pkeys_refs: Vec<&SignedPublicKeyOrSubkey> = pkeys.iter().collect();
 
     let mut rng = thread_rng();
 
@@ -207,9 +217,9 @@ pub fn dc_pgp_pk_encrypt(
         lit_msg
             .sign(skey, || "".into(), Default::default())
             .and_then(|msg| msg.compress(CompressionAlgorithm::ZLIB))
-            .and_then(|msg| msg.encrypt_to_keys(&mut rng, Default::default(), &pkeys))
+            .and_then(|msg| msg.encrypt_to_keys(&mut rng, Default::default(), &pkeys_refs))
     } else {
-        lit_msg.encrypt_to_keys(&mut rng, Default::default(), &pkeys)
+        lit_msg.encrypt_to_keys(&mut rng, Default::default(), &pkeys_refs)
     };
 
     let msg = encrypted_msg?;
@@ -218,12 +228,13 @@ pub fn dc_pgp_pk_encrypt(
     Ok(encoded_msg)
 }
 
-pub fn dc_pgp_pk_decrypt(
+#[allow(clippy::implicit_hasher)]
+pub fn pk_decrypt(
     ctext: &[u8],
     private_keys_for_decryption: &Keyring,
     public_keys_for_validation: &Keyring,
     ret_signature_fingerprints: Option<&mut HashSet<String>>,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>> {
     let (msg, _) = Message::from_armor_single(Cursor::new(ctext))?;
     let skeys: Vec<&SignedSecretKey> = private_keys_for_decryption
         .keys()
@@ -235,7 +246,7 @@ pub fn dc_pgp_pk_decrypt(
         .collect();
 
     let (decryptor, _) = msg.decrypt(|| "".into(), || "".into(), &skeys[..])?;
-    let msgs = decryptor.collect::<Result<Vec<_>, _>>()?;
+    let msgs = decryptor.collect::<pgp::errors::Result<Vec<_>>>()?;
     ensure!(!msgs.is_empty(), "No valid messages found");
 
     let dec_msg = &msgs[0];
@@ -267,7 +278,7 @@ pub fn dc_pgp_pk_decrypt(
 }
 
 /// Symmetric encryption.
-pub fn dc_pgp_symm_encrypt(passphrase: &str, plain: &[u8]) -> Result<String, Error> {
+pub fn symm_encrypt(passphrase: &str, plain: &[u8]) -> Result<String> {
     let mut rng = thread_rng();
     let lit_msg = Message::new_literal_bytes("", plain);
 
@@ -281,15 +292,50 @@ pub fn dc_pgp_symm_encrypt(passphrase: &str, plain: &[u8]) -> Result<String, Err
 }
 
 /// Symmetric decryption.
-pub fn dc_pgp_symm_decrypt(passphrase: &str, ctext: &[u8]) -> Result<Vec<u8>, Error> {
-    let enc_msg = Message::from_bytes(Cursor::new(ctext))?;
+pub fn symm_decrypt<T: std::io::Read + std::io::Seek>(
+    passphrase: &str,
+    ctext: T,
+) -> Result<Vec<u8>> {
+    let (enc_msg, _) = Message::from_armor_single(ctext)?;
     let decryptor = enc_msg.decrypt_with_password(|| passphrase.into())?;
 
-    let msgs = decryptor.collect::<Result<Vec<_>, _>>()?;
+    let msgs = decryptor.collect::<pgp::errors::Result<Vec<_>>>()?;
     ensure!(!msgs.is_empty(), "No valid messages found");
 
     match msgs[0].get_content()? {
         Some(content) => Ok(content),
         None => bail!("Decrypted message is empty"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_armored_data_1() {
+        let (typ, _headers, base64) = split_armored_data(
+            b"-----BEGIN PGP MESSAGE-----\nNoVal:\n\naGVsbG8gd29ybGQ=\n-----END PGP MESSAGE----",
+        )
+        .unwrap();
+
+        assert_eq!(typ, BlockType::Message);
+        assert!(!base64.is_empty());
+        assert_eq!(
+            std::string::String::from_utf8(base64).unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_split_armored_data_2() {
+        let (typ, headers, base64) = split_armored_data(
+            b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nAutocrypt-Prefer-Encrypt: mutual \n\naGVsbG8gd29ybGQ=\n-----END PGP PRIVATE KEY BLOCK-----"
+        )
+            .unwrap();
+
+        assert_eq!(typ, BlockType::PrivateKey);
+        assert!(!base64.is_empty());
+        assert_eq!(headers.get(HEADER_AUTOCRYPT), Some(&"mutual".to_string()));
     }
 }

@@ -16,8 +16,12 @@ impl Default for WebPushConfig {
 const SUBSCRIPTIONS: &str = "/private/vendor/vendor.dovecot/webpush/subscriptions/";
 
 impl Context {
+    pub async fn get_webpush_config_async(&self) -> Option<WebPushConfig> {
+        self.inbox_thread.read().unwrap().imap.get_webpush_config().await
+    }
+    
     pub fn get_webpush_config(&self) -> Option<WebPushConfig> {
-        self.inbox.read().unwrap().get_webpush_config()
+        async_std::task::block_on(self.get_webpush_config_async())
     }
 
     pub fn subscribe_webpush(&self, uid: &str, json: Option<&str>, id: i32) {

@@ -1,7 +1,6 @@
-""" chatting related objects: Contact, Chat, Message. """
+""" The Message object. """
 
 import os
-import shutil
 from . import props
 from .cutil import from_dc_charpointer, as_dc_charpointer
 from .capi import lib, ffi
@@ -13,7 +12,7 @@ class Message(object):
     """ Message object.
 
     You obtain instances of it through :class:`deltachat.account.Account` or
-    :class:`deltachat.chatting.Chat`.
+    :class:`deltachat.chat.Chat`.
     """
     def __init__(self, account, dc_msg):
         self.account = account
@@ -58,8 +57,6 @@ class Message(object):
 
     def set_text(self, text):
         """set text of this message. """
-        assert self.id > 0, "message not prepared"
-        assert self.is_out_preparing()
         lib.dc_msg_set_text(self._dc_msg, as_dc_charpointer(text))
 
     @props.with_doc
@@ -72,19 +69,6 @@ class Message(object):
         mtype = ffi.NULL if mime_type is None else as_dc_charpointer(mime_type)
         if not os.path.exists(path):
             raise ValueError("path does not exist: {!r}".format(path))
-        blobdir = self.account.get_blobdir()
-        if not path.startswith(blobdir):
-            for i in range(50):
-                ext = "" if i == 0 else "-" + str(i)
-                dest = os.path.join(blobdir, os.path.basename(path) + ext)
-                if os.path.exists(dest):
-                    continue
-                shutil.copyfile(path, dest)
-                break
-            else:
-                raise ValueError("could not create blobdir-path for {}".format(path))
-            path = dest
-        assert path.startswith(blobdir), path
         lib.dc_msg_set_file(self._dc_msg, as_dc_charpointer(path), mtype)
 
     @props.with_doc
@@ -108,6 +92,10 @@ class Message(object):
     def is_encrypted(self):
         """ return True if this message was encrypted. """
         return bool(lib.dc_msg_get_showpadlock(self._dc_msg))
+
+    def is_forwarded(self):
+        """ return True if this message was forwarded. """
+        return bool(lib.dc_msg_is_forwarded(self._dc_msg))
 
     def get_message_info(self):
         """ Return informational text for a single message.
@@ -158,25 +146,25 @@ class Message(object):
         if mime_headers:
             s = ffi.string(ffi.gc(mime_headers, lib.dc_str_unref))
             if isinstance(s, bytes):
-                s = s.decode("ascii")
+                return email.message_from_bytes(s)
             return email.message_from_string(s)
 
     @property
     def chat(self):
         """chat this message was posted in.
 
-        :returns: :class:`deltachat.chatting.Chat` object
+        :returns: :class:`deltachat.chat.Chat` object
         """
-        from .chatting import Chat
+        from .chat import Chat
         chat_id = lib.dc_msg_get_chat_id(self._dc_msg)
         return Chat(self.account, chat_id)
 
     def get_sender_contact(self):
         """return the contact of who wrote the message.
 
-        :returns: :class:`deltachat.chatting.Contact` instance
+        :returns: :class:`deltachat.chat.Contact` instance
         """
-        from .chatting import Contact
+        from .contact import Contact
         contact_id = lib.dc_msg_get_from_id(self._dc_msg)
         return Contact(self._dc_context, contact_id)
 
@@ -186,7 +174,7 @@ class Message(object):
     @property
     def _msgstate(self):
         if self.id == 0:
-            dc_msg = self.message._dc_msg
+            dc_msg = self._dc_msg
         else:
             # load message from db to get a fresh/current state
             dc_msg = ffi.gc(

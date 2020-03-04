@@ -1,9 +1,6 @@
-#![deny(clippy::correctness, missing_debug_implementations)]
-// TODO: make all of these errors, such that clippy actually passes.
-#![warn(clippy::all, clippy::perf, clippy::not_unsafe_ptr_arg_deref)]
-// This is nice, but for now just annoying.
-#![allow(clippy::unreadable_literal)]
-#![feature(ptr_wrapping_offset_from)]
+#![forbid(unsafe_code)]
+#![deny(clippy::correctness, missing_debug_implementations, clippy::all)]
+#![allow(clippy::match_bool)]
 
 #[macro_use]
 extern crate failure_derive;
@@ -17,19 +14,20 @@ extern crate strum;
 #[macro_use]
 extern crate strum_macros;
 #[macro_use]
-extern crate jetscii;
-#[macro_use]
 extern crate debug_stub_derive;
 
 #[macro_use]
-mod log;
+pub mod log;
 #[macro_use]
 pub mod error;
+
+pub mod headerdef;
 
 pub(crate) mod events;
 pub use events::*;
 
 mod aheader;
+pub mod blob;
 pub mod chat;
 pub mod chatlist;
 pub mod coi;
@@ -40,7 +38,9 @@ pub mod contact;
 pub mod context;
 pub mod e2ee;
 mod imap;
+mod imap_client;
 pub mod imex;
+#[macro_use]
 pub mod job;
 mod job_thread;
 pub mod key;
@@ -50,27 +50,31 @@ mod login_param;
 pub mod lot;
 pub mod message;
 mod mimefactory;
+pub mod mimeparser;
 pub mod oauth2;
 mod param;
 pub mod peerstate;
 pub mod pgp;
+pub mod provider;
 pub mod qr;
 pub mod securejoin;
+mod simplify;
 mod smtp;
 pub mod sql;
-mod stock;
 pub mod webpush;
+pub mod stock;
 mod token;
 #[macro_use]
-mod wrapmime;
+mod dehtml;
 
-pub mod dc_array;
-mod dc_dehtml;
-pub mod dc_mimeparser;
 pub mod dc_receive_imf;
-mod dc_simplify;
-mod dc_strencode;
 pub mod dc_tools;
+
+/// if set imap/incoming and smtp/outgoing MIME messages will be printed
+pub const DCC_MIME_DEBUG: &str = "DCC_MIME_DEBUG";
+
+/// if set IMAP protocol commands and responses will be printed
+pub const DCC_IMAP_DEBUG: &str = "DCC_IMAP_DEBUG";
 
 #[cfg(test)]
 mod test_utils;

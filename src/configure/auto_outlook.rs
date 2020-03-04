@@ -1,3 +1,5 @@
+//! Outlook's Autodiscover
+
 use quick_xml;
 use quick_xml::events::BytesEnd;
 
@@ -5,9 +7,35 @@ use crate::constants::*;
 use crate::context::Context;
 use crate::login_param::LoginParam;
 
-use super::read_autoconf_file;
+use super::read_url::read_url;
 
-/// Outlook's Autodiscover
+#[derive(Debug, Fail)]
+pub enum Error {
+    #[fail(display = "XML error at position {}", position)]
+    InvalidXml {
+        position: usize,
+        #[cause]
+        error: quick_xml::Error,
+    },
+
+    #[fail(display = "Bad or incomplete autoconfig")]
+    IncompleteAutoconfig(LoginParam),
+
+    #[fail(display = "Failed to get URL {}", _0)]
+    ReadUrlError(#[cause] super::read_url::Error),
+
+    #[fail(display = "Number of redirection is exceeded")]
+    RedirectionError,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<super::read_url::Error> for Error {
+    fn from(err: super::read_url::Error) -> Error {
+        Error::ReadUrlError(err)
+    }
+}
+
 struct OutlookAutodiscover {
     pub out: LoginParam,
     pub out_imap_set: bool,
@@ -19,108 +47,117 @@ struct OutlookAutodiscover {
     pub config_redirecturl: Option<String>,
 }
 
+enum ParsingResult {
+    LoginParam(LoginParam),
+    RedirectUrl(String),
+}
+
+fn parse_xml(xml_raw: &str) -> Result<ParsingResult> {
+    let mut outlk_ad = OutlookAutodiscover {
+        out: LoginParam::new(),
+        out_imap_set: false,
+        out_smtp_set: false,
+        config_type: None,
+        config_server: String::new(),
+        config_port: 0,
+        config_ssl: String::new(),
+        config_redirecturl: None,
+    };
+
+    let mut reader = quick_xml::Reader::from_str(&xml_raw);
+    reader.trim_text(true);
+
+    let mut buf = Vec::new();
+
+    let mut current_tag: Option<String> = None;
+
+    loop {
+        let event = reader
+            .read_event(&mut buf)
+            .map_err(|error| Error::InvalidXml {
+                position: reader.buffer_position(),
+                error,
+            })?;
+
+        match event {
+            quick_xml::events::Event::Start(ref e) => {
+                let tag = String::from_utf8_lossy(e.name()).trim().to_lowercase();
+
+                if tag == "protocol" {
+                    outlk_ad.config_type = None;
+                    outlk_ad.config_server = String::new();
+                    outlk_ad.config_port = 0;
+                    outlk_ad.config_ssl = String::new();
+                    outlk_ad.config_redirecturl = None;
+
+                    current_tag = None;
+                } else {
+                    current_tag = Some(tag);
+                }
+            }
+            quick_xml::events::Event::End(ref e) => {
+                outlk_autodiscover_endtag_cb(e, &mut outlk_ad);
+                current_tag = None;
+            }
+            quick_xml::events::Event::Text(ref e) => {
+                let val = e.unescape_and_decode(&reader).unwrap_or_default();
+
+                if let Some(ref tag) = current_tag {
+                    match tag.as_str() {
+                        "type" => {
+                            outlk_ad.config_type = Some(val.trim().to_lowercase().to_string())
+                        }
+                        "server" => outlk_ad.config_server = val.trim().to_string(),
+                        "port" => outlk_ad.config_port = val.trim().parse().unwrap_or_default(),
+                        "ssl" => outlk_ad.config_ssl = val.trim().to_string(),
+                        "redirecturl" => outlk_ad.config_redirecturl = Some(val.trim().to_string()),
+                        _ => {}
+                    };
+                }
+            }
+            quick_xml::events::Event::Eof => break,
+            _ => (),
+        }
+        buf.clear();
+    }
+
+    // XML redirect via redirecturl
+    let res = if outlk_ad.config_redirecturl.is_none()
+        || outlk_ad.config_redirecturl.as_ref().unwrap().is_empty()
+    {
+        if outlk_ad.out.mail_server.is_empty()
+            || outlk_ad.out.mail_port == 0
+            || outlk_ad.out.send_server.is_empty()
+            || outlk_ad.out.send_port == 0
+        {
+            return Err(Error::IncompleteAutoconfig(outlk_ad.out));
+        }
+        ParsingResult::LoginParam(outlk_ad.out)
+    } else {
+        ParsingResult::RedirectUrl(outlk_ad.config_redirecturl.unwrap())
+    };
+    Ok(res)
+}
+
 pub fn outlk_autodiscover(
     context: &Context,
     url: &str,
     _param_in: &LoginParam,
-) -> Option<LoginParam> {
+) -> Result<LoginParam> {
     let mut url = url.to_string();
-    /* Follow up to 10 xml-redirects (http-redirects are followed in read_autoconf_file() */
+    /* Follow up to 10 xml-redirects (http-redirects are followed in read_url() */
     for _i in 0..10 {
-        let mut outlk_ad = OutlookAutodiscover {
-            out: LoginParam::new(),
-            out_imap_set: false,
-            out_smtp_set: false,
-            config_type: None,
-            config_server: String::new(),
-            config_port: 0,
-            config_ssl: String::new(),
-            config_redirecturl: None,
-        };
-
-        if let Some(xml_raw) = read_autoconf_file(context, &url) {
-            let mut reader = quick_xml::Reader::from_str(&xml_raw);
-            reader.trim_text(true);
-
-            let mut buf = Vec::new();
-
-            let mut current_tag: Option<String> = None;
-
-            loop {
-                match reader.read_event(&mut buf) {
-                    Ok(quick_xml::events::Event::Start(ref e)) => {
-                        let tag = String::from_utf8_lossy(e.name()).trim().to_lowercase();
-
-                        if tag == "protocol" {
-                            outlk_ad.config_type = None;
-                            outlk_ad.config_server = String::new();
-                            outlk_ad.config_port = 0;
-                            outlk_ad.config_ssl = String::new();
-                            outlk_ad.config_redirecturl = None;
-
-                            current_tag = None;
-                        } else {
-                            current_tag = Some(tag);
-                        }
-                    }
-                    Ok(quick_xml::events::Event::End(ref e)) => {
-                        outlk_autodiscover_endtag_cb(e, &mut outlk_ad);
-                        current_tag = None;
-                    }
-                    Ok(quick_xml::events::Event::Text(ref e)) => {
-                        let val = e.unescape_and_decode(&reader).unwrap_or_default();
-
-                        if let Some(ref tag) = current_tag {
-                            match tag.as_str() {
-                                "type" => outlk_ad.config_type = Some(val.trim().to_string()),
-                                "server" => outlk_ad.config_server = val.trim().to_string(),
-                                "port" => {
-                                    outlk_ad.config_port = val.trim().parse().unwrap_or_default()
-                                }
-                                "ssl" => outlk_ad.config_ssl = val.trim().to_string(),
-                                "redirecturl" => {
-                                    outlk_ad.config_redirecturl = Some(val.trim().to_string())
-                                }
-                                _ => {}
-                            };
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            context,
-                            "Configure xml: Error at position {}: {:?}",
-                            reader.buffer_position(),
-                            e
-                        );
-                    }
-                    Ok(quick_xml::events::Event::Eof) => break,
-                    _ => (),
-                }
-                buf.clear();
-            }
-
-            // XML redirect via redirecturl
-            if outlk_ad.config_redirecturl.is_none()
-                || outlk_ad.config_redirecturl.as_ref().unwrap().is_empty()
-            {
-                if outlk_ad.out.mail_server.is_empty()
-                    || outlk_ad.out.mail_port == 0
-                    || outlk_ad.out.send_server.is_empty()
-                    || outlk_ad.out.send_port == 0
-                {
-                    let r = outlk_ad.out.to_string();
-                    warn!(context, "Bad or incomplete autoconfig: {}", r,);
-                    return None;
-                }
-                return Some(outlk_ad.out);
-            } else {
-                url = outlk_ad.config_redirecturl.unwrap();
-            }
-        } else {
-            return None;
+        let xml_raw = read_url(context, &url)?;
+        let res = parse_xml(&xml_raw);
+        if let Err(err) = &res {
+            warn!(context, "{}", err);
+        }
+        match res? {
+            ParsingResult::RedirectUrl(redirect_url) => url = redirect_url,
+            ParsingResult::LoginParam(login_param) => return Ok(login_param),
         }
     }
-    None
+    Err(Error::RedirectionError)
 }
 
 fn outlk_autodiscover_endtag_cb(event: &BytesEnd, outlk_ad: &mut OutlookAutodiscover) {
@@ -151,6 +188,81 @@ fn outlk_autodiscover_endtag_cb(event: &BytesEnd, outlk_ad: &mut OutlookAutodisc
                     outlk_ad.out.server_flags |= DC_LP_SMTP_SOCKET_PLAIN as i32
                 }
                 outlk_ad.out_smtp_set = true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_redirect() {
+        let res = parse_xml("
+<?xml version=\"1.0\" encoding=\"utf-8\"?>
+  <Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">
+    <Response xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a\">
+      <Account>
+        <AccountType>email</AccountType>
+        <Action>redirectUrl</Action>
+        <RedirectUrl>https://mail.example.com/autodiscover/autodiscover.xml</RedirectUrl>
+      </Account>
+    </Response>
+  </Autodiscover>
+ ").expect("XML is not parsed successfully");
+        match res {
+            ParsingResult::LoginParam(_lp) => {
+                panic!("redirecturl is not found");
+            }
+            ParsingResult::RedirectUrl(url) => {
+                assert_eq!(
+                    url,
+                    "https://mail.example.com/autodiscover/autodiscover.xml"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_loginparam() {
+        let res = parse_xml(
+            "\
+<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">
+  <Response xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a\">
+    <Account>
+      <AccountType>email</AccountType>
+      <Action>settings</Action>
+      <Protocol>
+        <Type>IMAP</Type>
+        <Server>example.com</Server>
+        <Port>993</Port>
+        <SSL>on</SSL>
+        <AuthRequired>on</AuthRequired>
+      </Protocol>
+      <Protocol>
+        <Type>SMTP</Type>
+        <Server>smtp.example.com</Server>
+        <Port>25</Port>
+        <SSL>off</SSL>
+        <AuthRequired>on</AuthRequired>
+      </Protocol>
+    </Account>
+  </Response>
+</Autodiscover>",
+        )
+        .expect("XML is not parsed successfully");
+
+        match res {
+            ParsingResult::LoginParam(lp) => {
+                assert_eq!(lp.mail_server, "example.com");
+                assert_eq!(lp.mail_port, 993);
+                assert_eq!(lp.send_server, "smtp.example.com");
+                assert_eq!(lp.send_port, 25);
+            }
+            ParsingResult::RedirectUrl(_) => {
+                panic!("RedirectUrl is not expected");
             }
         }
     }

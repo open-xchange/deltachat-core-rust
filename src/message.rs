@@ -1,25 +1,165 @@
+//! # Messages and their identifiers
+
 use std::path::{Path, PathBuf};
-use std::ptr;
 
 use deltachat_derive::{FromSql, ToSql};
+use failure::Fail;
 
-use crate::chat::{self, Chat};
+use crate::chat::{self, Chat, ChatId};
 use crate::constants::*;
 use crate::contact::*;
 use crate::context::*;
-use crate::dc_mimeparser::SystemMessage;
 use crate::dc_tools::*;
 use crate::error::Error;
 use crate::events::Event;
 use crate::job::*;
 use crate::lot::{Lot, LotState, Meaning};
+use crate::mimeparser::SystemMessage;
 use crate::param::*;
 use crate::pgp::*;
 use crate::sql;
 use crate::stock::StockMessage;
 
-/// In practice, the user additionally cuts the string himself pixel-accurate.
+// In practice, the user additionally cuts the string themselves
+// pixel-accurate.
 const SUMMARY_CHARACTERS: usize = 160;
+
+/// Message ID, including reserved IDs.
+///
+/// Some message IDs are reserved to identify special message types.
+/// This type can represent both the special as well as normal
+/// messages.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct MsgId(u32);
+
+impl MsgId {
+    /// Create a new [MsgId].
+    pub fn new(id: u32) -> MsgId {
+        MsgId(id)
+    }
+
+    /// Create a new unset [MsgId].
+    pub fn new_unset() -> MsgId {
+        MsgId(0)
+    }
+
+    /// Whether the message ID signifies a special message.
+    ///
+    /// This kind of message ID can not be used for real messages.
+    pub fn is_special(self) -> bool {
+        self.0 <= DC_MSG_ID_LAST_SPECIAL
+    }
+
+    /// Whether the message ID is unset.
+    ///
+    /// When a message is created it initially has a ID of `0`, which
+    /// is filled in by a real message ID once the message is saved in
+    /// the database.  This returns true while the message has not
+    /// been saved and thus not yet been given an actual message ID.
+    ///
+    /// When this is `true`, [MsgId::is_special] will also always be
+    /// `true`.
+    pub fn is_unset(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether the message ID is the special marker1 marker.
+    ///
+    /// See the docs of the `dc_get_chat_msgs` C API for details.
+    pub fn is_marker1(self) -> bool {
+        self.0 == DC_MSG_ID_MARKER1
+    }
+
+    /// Whether the message ID is the special day marker.
+    ///
+    /// See the docs of the `dc_get_chat_msgs` C API for details.
+    pub fn is_daymarker(self) -> bool {
+        self.0 == DC_MSG_ID_DAYMARKER
+    }
+
+    /// Bad evil escape hatch.
+    ///
+    /// Avoid using this, eventually types should be cleaned up enough
+    /// that it is no longer necessary.
+    pub fn to_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MsgId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Would be nice if we could use match here, but no computed values in ranges.
+        if self.0 == DC_MSG_ID_MARKER1 {
+            write!(f, "Msg#Marker1")
+        } else if self.0 == DC_MSG_ID_DAYMARKER {
+            write!(f, "Msg#DayMarker")
+        } else if self.0 <= DC_MSG_ID_LAST_SPECIAL {
+            write!(f, "Msg#UnknownSpecial")
+        } else {
+            write!(f, "Msg#{}", self.0)
+        }
+    }
+}
+
+/// Allow converting [MsgId] to an SQLite type.
+///
+/// This allows you to directly store [MsgId] into the database.
+///
+/// # Errors
+///
+/// This **does** ensure that no special message IDs are written into
+/// the database and the conversion will fail if this is not the case.
+impl rusqlite::types::ToSql for MsgId {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+        if self.0 <= DC_MSG_ID_LAST_SPECIAL {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                InvalidMsgId.compat(),
+            )));
+        }
+        let val = rusqlite::types::Value::Integer(self.0 as i64);
+        let out = rusqlite::types::ToSqlOutput::Owned(val);
+        Ok(out)
+    }
+}
+
+/// Allow converting an SQLite integer directly into [MsgId].
+impl rusqlite::types::FromSql for MsgId {
+    fn column_result(value: rusqlite::types::ValueRef) -> rusqlite::types::FromSqlResult<Self> {
+        // Would be nice if we could use match here, but alas.
+        i64::column_result(value).and_then(|val| {
+            if 0 <= val && val <= std::u32::MAX as i64 {
+                Ok(MsgId::new(val as u32))
+            } else {
+                Err(rusqlite::types::FromSqlError::OutOfRange(val))
+            }
+        })
+    }
+}
+
+/// Message ID was invalid.
+///
+/// This usually occurs when trying to use a message ID of
+/// [DC_MSG_ID_LAST_SPECIAL] or below in a situation where this is not
+/// possible.
+#[derive(Debug, Fail)]
+#[fail(display = "Invalid Message ID.")]
+pub struct InvalidMsgId;
+
+#[derive(Debug, Copy, Clone, PartialEq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+#[repr(u8)]
+pub enum MessengerMessage {
+    No = 0,
+    Yes = 1,
+
+    /// No, but reply to messenger message.
+    Reply = 2,
+}
+
+impl Default for MessengerMessage {
+    fn default() -> Self {
+        Self::No
+    }
+}
 
 /// An object representing a single message in memory.
 /// The message object is not updated.
@@ -30,12 +170,11 @@ const SUMMARY_CHARACTERS: usize = 160;
 /// approx. max. length returned by dc_get_msg_info()
 #[derive(Debug, Clone, Default)]
 pub struct Message {
-    pub(crate) id: u32,
+    pub(crate) id: MsgId,
     pub(crate) from_id: u32,
     pub(crate) to_id: u32,
-    pub(crate) chat_id: u32,
-    pub(crate) move_state: MoveState,
-    pub(crate) type_0: Viewtype,
+    pub(crate) chat_id: ChatId,
+    pub(crate) viewtype: Viewtype,
     pub(crate) state: MessageState,
     pub(crate) hidden: bool,
     pub(crate) timestamp_sort: i64,
@@ -46,8 +185,7 @@ pub struct Message {
     pub(crate) in_reply_to: Option<String>,
     pub(crate) server_folder: Option<String>,
     pub(crate) server_uid: u32,
-    // TODO: enum
-    pub(crate) is_dc_message: u32,
+    pub(crate) is_dc_message: MessengerMessage,
     pub(crate) starred: bool,
     pub(crate) chat_blocked: Blocked,
     pub(crate) location_id: u32,
@@ -57,74 +195,111 @@ pub struct Message {
 impl Message {
     pub fn new(viewtype: Viewtype) -> Self {
         let mut msg = Message::default();
-        msg.type_0 = viewtype;
+        msg.viewtype = viewtype;
 
         msg
     }
 
-    pub fn load_from_db(context: &Context, id: u32) -> Result<Message, Error> {
-        context.sql.query_row(
-        "SELECT  \
-         m.id,rfc724_mid,m.mime_in_reply_to,m.server_folder,m.server_uid,m.move_state,m.chat_id,  \
-         m.from_id,m.to_id,m.timestamp,m.timestamp_sent,m.timestamp_rcvd, m.type,m.state,m.msgrmsg,m.txt,  \
-         m.param,m.starred,m.hidden,m.location_id, c.blocked  \
-         FROM msgs m \
-         LEFT JOIN chats c ON c.id=m.chat_id WHERE m.id=?;",
-        params![id as i32],
-        |row| {
-            let mut msg = Message::default();
-            msg.id = row.get::<_, i32>(0)? as u32;
-            msg.rfc724_mid = row.get::<_, String>(1)?;
-            msg.in_reply_to = row.get::<_, Option<String>>(2)?;
-            msg.server_folder = row.get::<_, Option<String>>(3)?;
-            msg.server_uid = row.get(4)?;
-            msg.move_state = row.get(5)?;
-            msg.chat_id = row.get(6)?;
-            msg.from_id = row.get(7)?;
-            msg.to_id = row.get(8)?;
-            msg.timestamp_sort = row.get(9)?;
-            msg.timestamp_sent = row.get(10)?;
-            msg.timestamp_rcvd = row.get(11)?;
-            msg.type_0 = row.get(12)?;
-            msg.state = row.get(13)?;
-            msg.is_dc_message = row.get(14)?;
+    pub fn load_from_db(context: &Context, id: MsgId) -> Result<Message, Error> {
+        ensure!(
+            !id.is_special(),
+            "Can not load special message IDs from DB."
+        );
+        context
+            .sql
+            .query_row(
+                concat!(
+                    "SELECT",
+                    "    m.id AS id,",
+                    "    rfc724_mid AS rfc724mid,",
+                    "    m.mime_in_reply_to AS mime_in_reply_to,",
+                    "    m.server_folder AS server_folder,",
+                    "    m.server_uid AS server_uid,",
+                    "    m.chat_id AS chat_id,",
+                    "    m.from_id AS from_id,",
+                    "    m.to_id AS to_id,",
+                    "    m.timestamp AS timestamp,",
+                    "    m.timestamp_sent AS timestamp_sent,",
+                    "    m.timestamp_rcvd AS timestamp_rcvd,",
+                    "    m.type AS type,",
+                    "    m.state AS state,",
+                    "    m.msgrmsg AS msgrmsg,",
+                    "    m.txt AS txt,",
+                    "    m.param AS param,",
+                    "    m.starred AS starred,",
+                    "    m.hidden AS hidden,",
+                    "    m.location_id AS location,",
+                    "    c.blocked AS blocked",
+                    " FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id",
+                    " WHERE m.id=?;"
+                ),
+                params![id],
+                |row| {
+                    let mut msg = Message::default();
+                    // msg.id = row.get::<_, AnyMsgId>("id")?;
+                    msg.id = row.get("id")?;
+                    msg.rfc724_mid = row.get::<_, String>("rfc724mid")?;
+                    msg.in_reply_to = row.get::<_, Option<String>>("mime_in_reply_to")?;
+                    msg.server_folder = row.get::<_, Option<String>>("server_folder")?;
+                    msg.server_uid = row.get("server_uid")?;
+                    msg.chat_id = row.get("chat_id")?;
+                    msg.from_id = row.get("from_id")?;
+                    msg.to_id = row.get("to_id")?;
+                    msg.timestamp_sort = row.get("timestamp")?;
+                    msg.timestamp_sent = row.get("timestamp_sent")?;
+                    msg.timestamp_rcvd = row.get("timestamp_rcvd")?;
+                    msg.viewtype = row.get("type")?;
+                    msg.state = row.get("state")?;
+                    msg.is_dc_message = row.get("msgrmsg")?;
 
-            let text;
-            if let rusqlite::types::ValueRef::Text(buf) = row.get_raw(15) {
-                if let Ok(t) = String::from_utf8(buf.to_vec()) {
-                    text = t;
-                } else {
-                    warn!(context, "dc_msg_load_from_db: could not get text column as non-lossy utf8 id {}", id);
-                    text = String::from_utf8_lossy(buf).into_owned();
-                }
-            } else {
-                text = "".to_string();
-            }
-            msg.text = Some(text);
+                    let text;
+                    if let rusqlite::types::ValueRef::Text(buf) = row.get_raw("txt") {
+                        if let Ok(t) = String::from_utf8(buf.to_vec()) {
+                            text = t;
+                        } else {
+                            warn!(
+                                context,
+                                concat!(
+                                    "dc_msg_load_from_db: could not get ",
+                                    "text column as non-lossy utf8 id {}"
+                                ),
+                                id
+                            );
+                            text = String::from_utf8_lossy(buf).into_owned();
+                        }
+                    } else {
+                        text = "".to_string();
+                    }
+                    msg.text = Some(text);
 
-            msg.param = row.get::<_, String>(16)?.parse().unwrap_or_default();
-            msg.starred = row.get(17)?;
-            msg.hidden = row.get(18)?;
-            msg.location_id = row.get(19)?;
-            msg.chat_blocked = row.get::<_, Option<Blocked>>(20)?.unwrap_or_default();
-            Ok(msg)
-        })
+                    msg.param = row.get::<_, String>("param")?.parse().unwrap_or_default();
+                    msg.starred = row.get("starred")?;
+                    msg.hidden = row.get("hidden")?;
+                    msg.location_id = row.get("location")?;
+                    msg.chat_blocked = row
+                        .get::<_, Option<Blocked>>("blocked")?
+                        .unwrap_or_default();
+
+                    Ok(msg)
+                },
+            )
+            .map_err(Into::into)
     }
 
-    pub fn delete_from_db(context: &Context, msg_id: u32) {
+    pub fn delete_from_db(context: &Context, msg_id: MsgId) {
         if let Ok(msg) = Message::load_from_db(context, msg_id) {
             sql::execute(
                 context,
                 &context.sql,
                 "DELETE FROM msgs WHERE id=?;",
-                params![msg.id as i32],
+                params![msg.id],
             )
             .ok();
             sql::execute(
                 context,
                 &context.sql,
                 "DELETE FROM msgs_mdns WHERE msg_id=?;",
-                params![msg.id as i32],
+                params![msg.id],
             )
             .ok();
         }
@@ -145,9 +320,33 @@ impl Message {
     }
 
     pub fn get_file(&self, context: &Context) -> Option<PathBuf> {
-        self.param
-            .get(Param::File)
-            .map(|f| dc_get_abs_path(context, f))
+        self.param.get_path(Param::File, context).unwrap_or(None)
+    }
+
+    pub fn try_calc_and_set_dimensions(&mut self, context: &Context) -> Result<(), Error> {
+        if chat::msgtype_has_file(self.viewtype) {
+            let file_param = self.param.get_path(Param::File, context)?;
+            if let Some(path_and_filename) = file_param {
+                if (self.viewtype == Viewtype::Image || self.viewtype == Viewtype::Gif)
+                    && !self.param.exists(Param::Width)
+                {
+                    self.param.set_int(Param::Width, 0);
+                    self.param.set_int(Param::Height, 0);
+
+                    if let Ok(buf) = dc_read_file(context, path_and_filename) {
+                        if let Ok((width, height)) = dc_get_filemeta(&buf) {
+                            self.param.set_int(Param::Width, width as i32);
+                            self.param.set_int(Param::Height, height as i32);
+                        }
+                    }
+
+                    if !self.id.is_unset() {
+                        self.save_param_to_disk(context);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check if a message has a location bound to it.
@@ -190,7 +389,7 @@ impl Message {
         }
     }
 
-    pub fn get_id(&self) -> u32 {
+    pub fn get_id(&self) -> MsgId {
         self.id
     }
 
@@ -198,16 +397,16 @@ impl Message {
         self.from_id
     }
 
-    pub fn get_chat_id(&self) -> u32 {
+    pub fn get_chat_id(&self) -> ChatId {
         if self.chat_blocked != Blocked::Not {
-            1
+            ChatId::new(DC_CHAT_ID_DEADDROP)
         } else {
             self.chat_id
         }
     }
 
     pub fn get_viewtype(&self) -> Viewtype {
-        self.type_0
+        self.viewtype
     }
 
     pub fn get_state(&self) -> MessageState {
@@ -237,8 +436,9 @@ impl Message {
 
     pub fn get_filebytes(&self, context: &Context) -> u64 {
         self.param
-            .get(Param::File)
-            .map(|file| dc_get_filebytes(context, &file))
+            .get_path(Param::File, context)
+            .unwrap_or(None)
+            .map(|path| dc_get_filebytes(context, &path))
             .unwrap_or_default()
     }
 
@@ -255,7 +455,7 @@ impl Message {
     }
 
     pub fn get_showpadlock(&self) -> bool {
-        self.param.get_int(Param::GuranteeE2ee).unwrap_or_default() != 0
+        self.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() != 0
     }
 
     pub fn get_summary(&mut self, context: &Context, chat: Option<&Chat>) -> Lot {
@@ -271,8 +471,8 @@ impl Message {
             return ret;
         };
 
-        let contact = if self.from_id != DC_CONTACT_ID_SELF as libc::c_uint
-            && ((*chat).typ == Chattype::Group || (*chat).typ == Chattype::VerifiedGroup)
+        let contact = if self.from_id != DC_CONTACT_ID_SELF as u32
+            && (chat.typ == Chattype::Group || chat.typ == Chattype::VerifiedGroup)
         {
             Contact::get_by_id(context, self.from_id).ok()
         } else {
@@ -284,11 +484,11 @@ impl Message {
         ret
     }
 
-    pub fn get_summarytext(&mut self, context: &Context, approx_characters: usize) -> String {
+    pub fn get_summarytext(&self, context: &Context, approx_characters: usize) -> String {
         get_summarytext_by_raw(
-            self.type_0,
+            self.viewtype,
             self.text.as_ref(),
-            &mut self.param,
+            &self.param,
             approx_characters,
             context,
         )
@@ -316,17 +516,25 @@ impl Message {
 
     pub fn is_info(&self) -> bool {
         let cmd = self.param.get_cmd();
-        self.from_id == DC_CONTACT_ID_DEVICE as libc::c_uint
-            || self.to_id == DC_CONTACT_ID_DEVICE as libc::c_uint
+        self.from_id == DC_CONTACT_ID_INFO as u32
+            || self.to_id == DC_CONTACT_ID_INFO as u32
             || cmd != SystemMessage::Unknown && cmd != SystemMessage::AutocryptSetupMessage
     }
 
+    /// Whether the message is still being created.
+    ///
+    /// Messages with attachments might be created before the
+    /// attachment is ready.  In this case some more restrictions on
+    /// the attachment apply, e.g. if the file to be attached is still
+    /// being written to or otherwise will still change it can not be
+    /// copied to the blobdir.  Thus those attachments need to be
+    /// created immediately in the blobdir with a valid filename.
     pub fn is_increation(&self) -> bool {
-        chat::msgtype_has_file(self.type_0) && self.state == MessageState::OutPreparing
+        chat::msgtype_has_file(self.viewtype) && self.state == MessageState::OutPreparing
     }
 
     pub fn is_setupmessage(&self) -> bool {
-        if self.type_0 != Viewtype::File {
+        if self.viewtype != Viewtype::File {
             return false;
         }
 
@@ -339,23 +547,10 @@ impl Message {
         }
 
         if let Some(filename) = self.get_file(context) {
-            if let Ok(mut buf) = dc_read_file(context, filename) {
-                unsafe {
-                    // just a pointer inside buf, MUST NOT be free()'d
-                    let mut buf_headerline = String::default();
-                    // just a pointer inside buf, MUST NOT be free()'d
-                    let mut buf_setupcodebegin = ptr::null();
-
-                    if dc_split_armored_data(
-                        buf.as_mut_ptr().cast(),
-                        &mut buf_headerline,
-                        &mut buf_setupcodebegin,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                    ) && buf_headerline == "-----BEGIN PGP MESSAGE-----"
-                        && !buf_setupcodebegin.is_null()
-                    {
-                        return Some(to_string_lossy(buf_setupcodebegin));
+            if let Ok(ref buf) = dc_read_file(context, filename) {
+                if let Ok((typ, headers, _)) = split_armored_data(buf) {
+                    if typ == pgp::armor::BlockType::Message {
+                        return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
                     }
                 }
             }
@@ -406,30 +601,81 @@ impl Message {
             context,
             &context.sql,
             "UPDATE msgs SET param=? WHERE id=?;",
-            params![self.param.to_string(), self.id as i32],
+            params![self.param.to_string(), self.id],
         )
         .is_ok()
     }
 }
 
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, ToSql, FromSql)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, ToSql, FromSql)]
 #[repr(i32)]
 pub enum MessageState {
     Undefined = 0,
+
+    /// Incoming *fresh* message. Fresh messages are neither noticed
+    /// nor seen and are typically shown in notifications.
     InFresh = 10,
+
+    /// Incoming *noticed* message. E.g. chat opened but message not
+    /// yet read - noticed messages are not counted as unread but did
+    /// not marked as read nor resulted in MDNs.
     InNoticed = 13,
+
+    /// Incoming message, really *seen* by the user. Marked as read on
+    /// IMAP and MDN may be sent.
     InSeen = 16,
+
+    /// For files which need time to be prepared before they can be
+    /// sent, the message enters this state before
+    /// OutPending.
     OutPreparing = 18,
+
+    /// Message saved as draft.
     OutDraft = 19,
+
+    /// The user has pressed the "send" button but the message is not
+    /// yet sent and is pending in some way. Maybe we're offline (no
+    /// checkmark).
     OutPending = 20,
+
+    /// *Unrecoverable* error (*recoverable* errors result in pending
+    /// messages).
     OutFailed = 24,
+
+    /// Outgoing message successfully delivered to server (one
+    /// checkmark). Note, that already delivered messages may get into
+    /// the OutFailed state if we get such a hint from the server.
     OutDelivered = 26,
+
+    /// Outgoing message read by the recipient (two checkmarks; this
+    /// requires goodwill on the receiver's side)
     OutMdnRcvd = 28,
 }
 
 impl Default for MessageState {
     fn default() -> Self {
         MessageState::Undefined
+    }
+}
+
+impl std::fmt::Display for MessageState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Undefined => "Undefined",
+                Self::InFresh => "Fresh",
+                Self::InNoticed => "Noticed",
+                Self::InSeen => "Seen",
+                Self::OutPreparing => "Preparing",
+                Self::OutDraft => "Draft",
+                Self::OutPending => "Pending",
+                Self::OutFailed => "Failed",
+                Self::OutDelivered => "Delivered",
+                Self::OutMdnRcvd => "Read",
+            }
+        )
     }
 }
 
@@ -488,7 +734,7 @@ impl Lot {
                 self.text1 = None;
                 self.text1_meaning = Meaning::None;
             } else {
-                if chat.id == DC_CHAT_ID_DEADDROP {
+                if chat.id.is_deaddrop() {
                     if let Some(contact) = contact {
                         self.text1 = Some(contact.get_display_name().into());
                     } else {
@@ -504,9 +750,9 @@ impl Lot {
         }
 
         self.text2 = Some(get_summarytext_by_raw(
-            msg.type_0,
+            msg.viewtype,
             msg.text.as_ref(),
-            &mut msg.param,
+            &msg.param,
             SUMMARY_CHARACTERS,
             context,
         ));
@@ -516,7 +762,7 @@ impl Lot {
     }
 }
 
-pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
+pub fn get_msg_info(context: &Context, msg_id: MsgId) -> String {
     let mut ret = String::new();
 
     let msg = Message::load_from_db(context, msg_id);
@@ -529,15 +775,15 @@ pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
     let rawtxt: Option<String> = context.sql.query_get_value(
         context,
         "SELECT txt_raw FROM msgs WHERE id=?;",
-        params![msg_id as i32],
+        params![msg_id],
     );
 
     if rawtxt.is_none() {
-        ret += &format!("Cannot load message #{}.", msg_id as usize);
+        ret += &format!("Cannot load message {}.", msg_id);
         return ret;
     }
     let rawtxt = rawtxt.unwrap_or_default();
-    let rawtxt = dc_truncate(rawtxt.trim(), 100000, false);
+    let rawtxt = dc_truncate(rawtxt.trim(), 100_000, false);
 
     let fts = dc_timestamp_to_str(msg.get_timestamp());
     ret += &format!("Sent: {}", fts);
@@ -549,7 +795,7 @@ pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
     ret += &format!(" by {}", name);
     ret += "\n";
 
-    if msg.from_id != DC_CONTACT_ID_SELF as libc::c_uint {
+    if msg.from_id != DC_CONTACT_ID_SELF as u32 {
         let s = dc_timestamp_to_str(if 0 != msg.timestamp_rcvd {
             msg.timestamp_rcvd
         } else {
@@ -559,14 +805,14 @@ pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
         ret += "\n";
     }
 
-    if msg.from_id == 2 || msg.to_id == 2 {
+    if msg.from_id == DC_CONTACT_ID_INFO || msg.to_id == DC_CONTACT_ID_INFO {
         // device-internal message, no further details needed
         return ret;
     }
 
     if let Ok(rows) = context.sql.query_map(
         "SELECT contact_id, timestamp_sent FROM msgs_mdns WHERE msg_id=?;",
-        params![msg_id as i32],
+        params![msg_id],
         |row| {
             let contact_id: i32 = row.get(0)?;
             let ts: i64 = row.get(1)?;
@@ -587,19 +833,7 @@ pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
         }
     }
 
-    ret += "State: ";
-    use MessageState::*;
-    match msg.state {
-        InFresh => ret += "Fresh",
-        InNoticed => ret += "Noticed",
-        InSeen => ret += "Seen",
-        OutDelivered => ret += "Delivered",
-        OutFailed => ret += "Failed",
-        OutMdnRcvd => ret += "Read",
-        OutPending => ret += "Pending",
-        OutPreparing => ret += "Preparing",
-        _ => ret += &format!("{}", msg.state),
-    }
+    ret += &format!("State: {}", msg.state);
 
     if msg.has_location() {
         ret += ", Location sent";
@@ -611,7 +845,7 @@ pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
         if 0 != e2ee_errors & 0x2 {
             ret += ", Encrypted, no valid signature";
         }
-    } else if 0 != msg.param.get_int(Param::GuranteeE2ee).unwrap_or_default() {
+    } else if 0 != msg.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() {
         ret += ", Encrypted";
     }
 
@@ -625,9 +859,9 @@ pub fn get_msg_info(context: &Context, msg_id: u32) -> String {
         ret += &format!("\nFile: {}, {}, bytes\n", path.display(), bytes);
     }
 
-    if msg.type_0 != Viewtype::Text {
+    if msg.viewtype != Viewtype::Text {
         ret += "Type: ";
-        ret += &format!("{}", msg.type_0);
+        ret += &format!("{}", msg.viewtype);
         ret += "\n";
         ret += &format!("Mimetype: {}\n", &msg.get_filemime().unwrap_or_default());
     }
@@ -661,6 +895,7 @@ pub fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)> {
         "mp3" => (Viewtype::Audio, "audio/mpeg"),
         "aac" => (Viewtype::Audio, "audio/aac"),
         "mp4" => (Viewtype::Video, "video/mp4"),
+        "webm" => (Viewtype::Video, "video/webm"),
         "jpg" => (Viewtype::Image, "image/jpeg"),
         "jpeg" => (Viewtype::Image, "image/jpeg"),
         "jpe" => (Viewtype::Image, "image/jpeg"),
@@ -676,21 +911,26 @@ pub fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)> {
     Some(info)
 }
 
-pub fn get_mime_headers(context: &Context, msg_id: u32) -> Option<String> {
+pub fn get_mime_headers(context: &Context, msg_id: MsgId) -> Option<String> {
     context.sql.query_get_value(
         context,
         "SELECT mime_headers FROM msgs WHERE id=?;",
-        params![msg_id as i32],
+        params![msg_id],
     )
 }
 
-pub fn delete_msgs(context: &Context, msg_ids: &[u32]) {
+pub fn delete_msgs(context: &Context, msg_ids: &[MsgId]) {
     for msg_id in msg_ids.iter() {
-        update_msg_chat_id(context, *msg_id, DC_CHAT_ID_TRASH);
+        if let Ok(msg) = Message::load_from_db(context, *msg_id) {
+            if msg.location_id > 0 {
+                delete_poi_location(context, msg.location_id);
+            }
+        }
+        update_msg_chat_id(context, *msg_id, ChatId::new(DC_CHAT_ID_TRASH));
         job_add(
             context,
             Action::DeleteMsgOnImap,
-            *msg_id as libc::c_int,
+            msg_id.to_u32() as i32,
             Params::new(),
             0,
         );
@@ -698,36 +938,56 @@ pub fn delete_msgs(context: &Context, msg_ids: &[u32]) {
 
     if !msg_ids.is_empty() {
         context.call_cb(Event::MsgsChanged {
-            chat_id: 0,
-            msg_id: 0,
+            chat_id: ChatId::new(0),
+            msg_id: MsgId::new(0),
         });
         job_kill_action(context, Action::Housekeeping);
         job_add(context, Action::Housekeeping, 0, Params::new(), 10);
     };
 }
 
-fn update_msg_chat_id(context: &Context, msg_id: u32, chat_id: u32) -> bool {
+fn update_msg_chat_id(context: &Context, msg_id: MsgId, chat_id: ChatId) -> bool {
     sql::execute(
         context,
         &context.sql,
         "UPDATE msgs SET chat_id=? WHERE id=?;",
-        params![chat_id as i32, msg_id as i32],
+        params![chat_id, msg_id],
     )
     .is_ok()
 }
 
-pub fn markseen_msgs(context: &Context, msg_ids: &[u32]) -> bool {
+fn delete_poi_location(context: &Context, location_id: u32) -> bool {
+    sql::execute(
+        context,
+        &context.sql,
+        "DELETE FROM locations WHERE independent = 1 AND id=?;",
+        params![location_id as i32],
+    )
+    .is_ok()
+}
+
+pub fn markseen_msgs(context: &Context, msg_ids: &[MsgId]) -> bool {
     if msg_ids.is_empty() {
         return false;
     }
 
     let msgs = context.sql.prepare(
-        "SELECT m.state, c.blocked  FROM msgs m  LEFT JOIN chats c ON c.id=m.chat_id  WHERE m.id=? AND m.chat_id>9",
+        concat!(
+            "SELECT",
+            "    m.state AS state,",
+            "    c.blocked AS blocked",
+            " FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id",
+            " WHERE m.id=? AND m.chat_id>9"
+        ),
         |mut stmt, _| {
             let mut res = Vec::with_capacity(msg_ids.len());
             for id in msg_ids.iter() {
-                let query_res = stmt.query_row(params![*id as i32], |row| {
-                    Ok((row.get::<_, MessageState>(0)?, row.get::<_, Option<Blocked>>(1)?.unwrap_or_default()))
+                let query_res = stmt.query_row(params![*id], |row| {
+                    Ok((
+                        row.get::<_, MessageState>("state")?,
+                        row.get::<_, Option<Blocked>>("blocked")?
+                            .unwrap_or_default(),
+                    ))
                 });
                 if let Err(rusqlite::Error::QueryReturnedNoRows) = query_res {
                     continue;
@@ -737,7 +997,7 @@ pub fn markseen_msgs(context: &Context, msg_ids: &[u32]) -> bool {
             }
 
             Ok(res)
-        }
+        },
     );
 
     if msgs.is_err() {
@@ -751,12 +1011,12 @@ pub fn markseen_msgs(context: &Context, msg_ids: &[u32]) -> bool {
         if curr_blocked == Blocked::Not {
             if curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed {
                 update_msg_state(context, *id, MessageState::InSeen);
-                info!(context, "Seen message #{}.", id);
+                info!(context, "Seen message {}.", id);
 
                 job_add(
                     context,
                     Action::MarkseenMsgOnImap,
-                    *id as i32,
+                    id.to_u32() as i32,
                     Params::new(),
                     0,
                 );
@@ -770,25 +1030,25 @@ pub fn markseen_msgs(context: &Context, msg_ids: &[u32]) -> bool {
 
     if send_event {
         context.call_cb(Event::MsgsChanged {
-            chat_id: 0,
-            msg_id: 0,
+            chat_id: ChatId::new(0),
+            msg_id: MsgId::new(0),
         });
     }
 
     true
 }
 
-pub fn update_msg_state(context: &Context, msg_id: u32, state: MessageState) -> bool {
+pub fn update_msg_state(context: &Context, msg_id: MsgId, state: MessageState) -> bool {
     sql::execute(
         context,
         &context.sql,
         "UPDATE msgs SET state=? WHERE id=?;",
-        params![state, msg_id as i32],
+        params![state, msg_id],
     )
     .is_ok()
 }
 
-pub fn star_msgs(context: &Context, msg_ids: &[u32], star: bool) -> bool {
+pub fn star_msgs(context: &Context, msg_ids: &[MsgId], star: bool) -> bool {
     if msg_ids.is_empty() {
         return false;
     }
@@ -796,7 +1056,7 @@ pub fn star_msgs(context: &Context, msg_ids: &[u32], star: bool) -> bool {
         .sql
         .prepare("UPDATE msgs SET starred=? WHERE id=?;", |mut stmt, _| {
             for msg_id in msg_ids.iter() {
-                stmt.execute(params![star as i32, *msg_id as i32])?;
+                stmt.execute(params![star as i32, *msg_id])?;
             }
             Ok(())
         })
@@ -807,7 +1067,7 @@ pub fn star_msgs(context: &Context, msg_ids: &[u32], star: bool) -> bool {
 pub fn get_summarytext_by_raw(
     viewtype: Viewtype,
     text: Option<impl AsRef<str>>,
-    param: &mut Params,
+    param: &Params,
     approx_characters: usize,
     context: &Context,
 ) -> String {
@@ -825,17 +1085,14 @@ pub fn get_summarytext_by_raw(
                     .stock_str(StockMessage::AcSetupMsgSubject)
                     .to_string()
             } else {
-                let file_name: String = if let Some(file_path) = param.get(Param::File) {
-                    if let Some(file_name) = Path::new(file_path).file_name() {
-                        Some(file_name.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-                .unwrap_or_else(|| "ErrFileName".to_string());
-
+                let file_name: String = param
+                    .get_path(Param::File, context)
+                    .unwrap_or(None)
+                    .and_then(|path| {
+                        path.file_name()
+                            .map(|fname| fname.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| String::from("ErrFileName"));
                 let label = context.stock_str(if viewtype == Viewtype::Audio {
                     StockMessage::Audio
                 } else {
@@ -859,7 +1116,9 @@ pub fn get_summarytext_by_raw(
     }
 
     if let Some(text) = text {
-        if prefix.is_empty() {
+        if text.as_ref().is_empty() {
+            prefix
+        } else if prefix.is_empty() {
             dc_truncate(text.as_ref(), approx_characters, true).to_string()
         } else {
             let tmp = format!("{} – {}", prefix, text.as_ref());
@@ -877,37 +1136,25 @@ pub fn get_summarytext_by_raw(
 
 // Context functions to work with messages
 
-pub fn exists(context: &Context, msg_id: u32) -> bool {
-    if msg_id <= DC_CHAT_ID_LAST_SPECIAL {
+pub fn exists(context: &Context, msg_id: MsgId) -> bool {
+    if msg_id.is_special() {
         return false;
     }
 
-    let chat_id: Option<u32> = context.sql.query_get_value(
+    let chat_id: Option<ChatId> = context.sql.query_get_value(
         context,
         "SELECT chat_id FROM msgs WHERE id=?;",
         params![msg_id],
     );
 
     if let Some(chat_id) = chat_id {
-        chat_id != DC_CHAT_ID_TRASH
+        !chat_id.is_trash()
     } else {
         false
     }
 }
 
-pub fn update_msg_move_state(context: &Context, rfc724_mid: &str, state: MoveState) -> bool {
-    // we update the move_state for all messages belonging to a given Message-ID
-    // so that the state stay intact when parts are deleted
-    sql::execute(
-        context,
-        &context.sql,
-        "UPDATE msgs SET move_state=? WHERE rfc724_mid=?;",
-        params![state as i32, rfc724_mid],
-    )
-    .is_ok()
-}
-
-pub fn set_msg_failed(context: &Context, msg_id: u32, error: Option<impl AsRef<str>>) {
+pub fn set_msg_failed(context: &Context, msg_id: MsgId, error: Option<impl AsRef<str>>) {
     if let Ok(mut msg) = Message::load_from_db(context, msg_id) {
         if msg.state.can_fail() {
             msg.state = MessageState::OutFailed;
@@ -921,7 +1168,7 @@ pub fn set_msg_failed(context: &Context, msg_id: u32, error: Option<impl AsRef<s
             context,
             &context.sql,
             "UPDATE msgs SET state=?, param=? WHERE id=?;",
-            params![msg.state, msg.param.to_string(), msg_id as i32],
+            params![msg.state, msg.param.to_string(), msg_id],
         )
         .is_ok()
         {
@@ -933,38 +1180,44 @@ pub fn set_msg_failed(context: &Context, msg_id: u32, error: Option<impl AsRef<s
     }
 }
 
-/// returns true if an event should be send
+/// returns Some if an event should be send
 pub fn mdn_from_ext(
     context: &Context,
     from_id: u32,
     rfc724_mid: &str,
     timestamp_sent: i64,
-    ret_chat_id: &mut u32,
-    ret_msg_id: &mut u32,
-) -> bool {
-    if from_id <= 9 || rfc724_mid.is_empty() || *ret_chat_id != 0 || *ret_msg_id != 0 {
-        return false;
+) -> Option<(ChatId, MsgId)> {
+    if from_id <= DC_MSG_ID_LAST_SPECIAL || rfc724_mid.is_empty() {
+        return None;
     }
 
-    let mut read_by_all = false;
-
-    if let Ok((msg_id, chat_id, chat_type, msg_state)) = context.sql.query_row(
-        "SELECT m.id, c.id, c.type, m.state FROM msgs m  \
-         LEFT JOIN chats c ON m.chat_id=c.id  \
-         WHERE rfc724_mid=? AND from_id=1  \
-         ORDER BY m.id;",
+    let res = context.sql.query_row(
+        concat!(
+            "SELECT",
+            "    m.id AS msg_id,",
+            "    c.id AS chat_id,",
+            "    c.type AS type,",
+            "    m.state AS state",
+            " FROM msgs m LEFT JOIN chats c ON m.chat_id=c.id",
+            " WHERE rfc724_mid=? AND from_id=1",
+            " ORDER BY m.id;"
+        ),
         params![rfc724_mid],
         |row| {
             Ok((
-                row.get::<_, i32>(0)?,
-                row.get::<_, i32>(1)?,
-                row.get::<_, Chattype>(2)?,
-                row.get::<_, MessageState>(3)?,
+                row.get::<_, MsgId>("msg_id")?,
+                row.get::<_, ChatId>("chat_id")?,
+                row.get::<_, Chattype>("type")?,
+                row.get::<_, MessageState>("state")?,
             ))
         },
-    ) {
-        *ret_msg_id = msg_id as u32;
-        *ret_chat_id = chat_id as u32;
+    );
+    if let Err(ref err) = res {
+        info!(context, "Failed to select MDN {:?}", err);
+    }
+
+    if let Ok((msg_id, chat_id, chat_type, msg_state)) = res {
+        let mut read_by_all = false;
 
         // if already marked as MDNS_RCVD msgstate_can_fail() returns false.
         // however, it is important, that ret_msg_id is set above as this
@@ -974,20 +1227,20 @@ pub fn mdn_from_ext(
                 .sql
                 .exists(
                     "SELECT contact_id FROM msgs_mdns WHERE msg_id=? AND contact_id=?;",
-                    params![*ret_msg_id as i32, from_id as i32,],
+                    params![msg_id, from_id as i32,],
                 )
                 .unwrap_or_default();
 
             if !mdn_already_in_table {
                 context.sql.execute(
                     "INSERT INTO msgs_mdns (msg_id, contact_id, timestamp_sent) VALUES (?, ?, ?);",
-                    params![*ret_msg_id as i32, from_id as i32, timestamp_sent],
+                    params![msg_id, from_id as i32, timestamp_sent],
                 ).unwrap_or_default(); // TODO: better error handling
             }
 
             // Normal chat? that's quite easy.
             if chat_type == Chattype::Single {
-                update_msg_state(context, *ret_msg_id, MessageState::OutMdnRcvd);
+                update_msg_state(context, msg_id, MessageState::OutMdnRcvd);
                 read_by_all = true;
             } else {
                 // send event about new state
@@ -996,7 +1249,7 @@ pub fn mdn_from_ext(
                     .query_get_value::<_, isize>(
                         context,
                         "SELECT COUNT(*) FROM msgs_mdns WHERE msg_id=?;",
-                        params![*ret_msg_id as i32],
+                        params![msg_id],
                     )
                     .unwrap_or_default() as usize;
                 /*
@@ -1012,20 +1265,24 @@ pub fn mdn_from_ext(
                 (S=Sender, R=Recipient)
                  */
                 // for rounding, SELF is already included!
-                let soll_cnt = (chat::get_chat_contact_cnt(context, *ret_chat_id) + 1) / 2;
+                let soll_cnt = (chat::get_chat_contact_cnt(context, chat_id) + 1) / 2;
                 if ist_cnt >= soll_cnt {
-                    update_msg_state(context, *ret_msg_id, MessageState::OutMdnRcvd);
+                    update_msg_state(context, msg_id, MessageState::OutMdnRcvd);
                     read_by_all = true;
                 } // else wait for more receipts
             }
         }
+        return if read_by_all {
+            Some((chat_id, msg_id))
+        } else {
+            None
+        };
     }
-
-    read_by_all
+    None
 }
 
 /// The number of messages assigned to real chat (!=deaddrop, !=trash)
-pub fn get_real_msg_cnt(context: &Context) -> libc::c_int {
+pub fn get_real_msg_cnt(context: &Context) -> i32 {
     match context.sql.query_row(
         "SELECT COUNT(*) \
          FROM msgs m  LEFT JOIN chats c ON c.id=m.chat_id \
@@ -1041,7 +1298,7 @@ pub fn get_real_msg_cnt(context: &Context) -> libc::c_int {
     }
 }
 
-pub fn get_deaddrop_msg_cnt(context: &Context) -> libc::size_t {
+pub fn get_deaddrop_msg_cnt(context: &Context) -> usize {
     match context.sql.query_row(
         "SELECT COUNT(*) \
          FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id \
@@ -1049,7 +1306,7 @@ pub fn get_deaddrop_msg_cnt(context: &Context) -> libc::size_t {
         rusqlite::NO_PARAMS,
         |row| row.get::<_, isize>(0),
     ) {
-        Ok(res) => res as libc::size_t,
+        Ok(res) => res as usize,
         Err(err) => {
             error!(context, "dc_get_deaddrop_msg_cnt() failed. {}", err);
             0
@@ -1057,7 +1314,7 @@ pub fn get_deaddrop_msg_cnt(context: &Context) -> libc::size_t {
     }
 }
 
-pub fn rfc724_mid_cnt(context: &Context, rfc724_mid: &str) -> libc::c_int {
+pub fn rfc724_mid_cnt(context: &Context, rfc724_mid: &str) -> i32 {
     // check the number of messages with the same rfc724_mid
     match context.sql.query_row(
         "SELECT COUNT(*) FROM msgs WHERE rfc724_mid=?;",
@@ -1075,20 +1332,23 @@ pub fn rfc724_mid_cnt(context: &Context, rfc724_mid: &str) -> libc::c_int {
 pub(crate) fn rfc724_mid_exists(
     context: &Context,
     rfc724_mid: &str,
-) -> Result<(String, u32, u32), Error> {
+) -> Result<(String, u32, MsgId), Error> {
     ensure!(!rfc724_mid.is_empty(), "empty rfc724_mid");
 
-    context.sql.query_row(
-        "SELECT server_folder, server_uid, id FROM msgs WHERE rfc724_mid=?",
-        &[rfc724_mid],
-        |row| {
-            let server_folder = row.get::<_, Option<String>>(0)?.unwrap_or_default();
-            let server_uid = row.get(1)?;
-            let msg_id = row.get(2)?;
+    context
+        .sql
+        .query_row(
+            "SELECT server_folder, server_uid, id FROM msgs WHERE rfc724_mid=?",
+            &[rfc724_mid],
+            |row| {
+                let server_folder = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+                let server_uid = row.get(1)?;
+                let msg_id: MsgId = row.get(2)?;
 
-            Ok((server_folder, server_uid, msg_id))
-        },
-    )
+                Ok((server_folder, server_uid, msg_id))
+            },
+        )
+        .map_err(Into::into)
 }
 
 pub fn update_server_uid(
@@ -1106,6 +1366,12 @@ pub fn update_server_uid(
             warn!(context, "msg: failed to update server_uid: {}", err);
         }
     }
+}
+
+#[allow(dead_code)]
+pub fn dc_empty_server(context: &Context, flags: u32) {
+    job_kill_action(context, Action::EmptyServer);
+    job_add(context, Action::EmptyServer, flags as i32, Params::new(), 0);
 }
 
 #[cfg(test)]
@@ -1142,5 +1408,86 @@ mod tests {
 
         let _msg2 = Message::load_from_db(ctx, msg_id).unwrap();
         assert_eq!(_msg2.get_filemime(), None);
+    }
+
+    #[test]
+    pub fn test_get_summarytext_by_raw() {
+        let d = test::dummy_context();
+        let ctx = &d.ctx;
+
+        let some_text = Some("bla bla".to_string());
+        let empty_text = Some("".to_string());
+        let no_text: Option<String> = None;
+
+        let mut some_file = Params::new();
+        some_file.set(Param::File, "foo.bar");
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Text, some_text.as_ref(), &Params::new(), 50, &ctx),
+            "bla bla" // for simple text, the type is not added to the summary
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Image, no_text.as_ref(), &some_file, 50, &ctx,),
+            "Image" // file names are not added for images
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Video, no_text.as_ref(), &some_file, 50, &ctx,),
+            "Video" // file names are not added for videos
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Gif, no_text.as_ref(), &some_file, 50, &ctx,),
+            "GIF" // file names are not added for GIFs
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Sticker, no_text.as_ref(), &some_file, 50, &ctx,),
+            "Sticker" // file names are not added for stickers
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Voice, empty_text.as_ref(), &some_file, 50, &ctx,),
+            "Voice message" // file names are not added for voice messages, empty text is skipped
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Voice, no_text.as_ref(), &mut some_file, 50, &ctx),
+            "Voice message" // file names are not added for voice messages
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Voice, some_text.as_ref(), &some_file, 50, &ctx),
+            "Voice message \u{2013} bla bla" // `\u{2013}` explicitly checks for "EN DASH"
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Audio, no_text.as_ref(), &mut some_file, 50, &ctx),
+            "Audio \u{2013} foo.bar" // file name is added for audio
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Audio, empty_text.as_ref(), &some_file, 50, &ctx,),
+            "Audio \u{2013} foo.bar" // file name is added for audio, empty text is not added
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::Audio, some_text.as_ref(), &some_file, 50, &ctx),
+            "Audio \u{2013} foo.bar \u{2013} bla bla" // file name and text added for audio
+        );
+
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::File, some_text.as_ref(), &mut some_file, 50, &ctx),
+            "File \u{2013} foo.bar \u{2013} bla bla" // file name is added for files
+        );
+
+        let mut asm_file = Params::new();
+        asm_file.set(Param::File, "foo.bar");
+        asm_file.set_cmd(SystemMessage::AutocryptSetupMessage);
+        assert_eq!(
+            get_summarytext_by_raw(Viewtype::File, no_text.as_ref(), &mut asm_file, 50, &ctx),
+            "Autocrypt Setup Message" // file name is not added for autocrypt setup messages
+        );
     }
 }

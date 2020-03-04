@@ -3,6 +3,7 @@
 from __future__ import print_function
 import atexit
 import threading
+import os
 import re
 import time
 from array import array
@@ -16,15 +17,17 @@ import deltachat
 from . import const
 from .capi import ffi, lib
 from .cutil import as_dc_charpointer, from_dc_charpointer, iter_array, DCLot
-from .chatting import Contact, Chat, Message
+from .chat import Chat
+from .message import Message
+from .contact import Contact
 
 
 class Account(object):
     """ Each account is tied to a sqlite database file which is fully managed
-    by the underlying deltachat c-library.  All public Account methods are
+    by the underlying deltachat core library.  All public Account methods are
     meant to be memory-safe and return memory-safe objects.
     """
-    def __init__(self, db_path, logid=None, eventlogging=True, debug=True):
+    def __init__(self, db_path, logid=None, eventlogging=True, os_name=None, debug=True):
         """ initialize account object.
 
         :param db_path: a path to the account database. The database
@@ -32,10 +35,11 @@ class Account(object):
         :param logid: an optional logging prefix that should be used with
                       the default internal logging.
         :param eventlogging: if False no eventlogging and no context callback will be configured
+        :param os_name: this will be put to the X-Mailer header in outgoing messages
         :param debug: turn on debug logging for events.
         """
         self._dc_context = ffi.gc(
-            lib.dc_context_new(lib.py_dc_callback, ffi.NULL, ffi.NULL),
+            lib.dc_context_new(lib.py_dc_callback, ffi.NULL, as_dc_charpointer(os_name)),
             _destroy_dc_context,
         )
         if eventlogging:
@@ -72,6 +76,18 @@ class Account(object):
             d[key.lower()] = value
         return d
 
+    def set_stock_translation(self, id, string):
+        """ set stock translation string.
+
+        :param id: id of stock string (const.DC_STR_*)
+        :param value: string to set as new transalation
+        :returns: None
+        """
+        string = string.encode("utf8")
+        res = lib.dc_set_stock_translation(self._dc_context, id, string)
+        if res == 0:
+            raise ValueError("could not set translation string")
+
     def set_config(self, name, value):
         """ set configuration values.
 
@@ -81,9 +97,12 @@ class Account(object):
         """
         self._check_config_key(name)
         name = name.encode("utf8")
-        value = value.encode("utf8")
         if name == b"addr" and self.is_configured():
             raise ValueError("can not change 'addr' after account is configured.")
+        if value is not None:
+            value = value.encode("utf8")
+        else:
+            value = ffi.NULL
         lib.dc_set_config(self._dc_context, name, value)
 
     def get_config(self, name):
@@ -118,6 +137,18 @@ class Account(object):
         :returns: True if account is configured.
         """
         return lib.dc_is_configured(self._dc_context)
+
+    def set_avatar(self, img_path):
+        """Set self avatar.
+
+        :raises ValueError: if profile image could not be set
+        :returns: None
+        """
+        if img_path is None:
+            self.set_config("selfavatar", None)
+        else:
+            assert os.path.exists(img_path), img_path
+            self.set_config("selfavatar", img_path)
 
     def check_is_configured(self):
         """ Raise ValueError if this account is not configured. """
@@ -198,11 +229,29 @@ class Account(object):
         """
         lib.dc_validate_webpush(self._dc_context, uid.encode("utf8"),
                                 msg.encode("utf8"), id)
+    def empty_server_folders(self, inbox=False, mvbox=False):
+        """ empty server folders. """
+        flags = 0
+        if inbox:
+            flags |= const.DC_EMPTY_INBOX
+        if mvbox:
+            flags |= const.DC_EMPTY_MVBOX
+        if not flags:
+            raise ValueError("no flags set")
+        lib.dc_empty_server(self._dc_context, flags)
 
     def get_infostring(self):
         """ return info of the configured account. """
         self.check_is_configured()
         return from_dc_charpointer(lib.dc_get_info(self._dc_context))
+
+    def get_latest_backupfile(self, backupdir):
+        """ return the latest backup file in a given directory.
+        """
+        res = lib.dc_imex_has_backup(self._dc_context, as_dc_charpointer(backupdir))
+        if res == ffi.NULL:
+            return None
+        return from_dc_charpointer(res)
 
     def get_blobdir(self):
         """ return the directory for files.
@@ -213,9 +262,9 @@ class Account(object):
         return from_dc_charpointer(lib.dc_get_blobdir(self._dc_context))
 
     def get_self_contact(self):
-        """ return this account's identity as a :class:`deltachat.chatting.Contact`.
+        """ return this account's identity as a :class:`deltachat.contact.Contact`.
 
-        :returns: :class:`deltachat.chatting.Contact`
+        :returns: :class:`deltachat.contact.Contact`
         """
         self.check_is_configured()
         return Contact(self._dc_context, const.DC_CONTACT_ID_SELF)
@@ -227,7 +276,7 @@ class Account(object):
 
         :param email: email-address (text type)
         :param name: display name for this contact (optional)
-        :returns: :class:`deltachat.chatting.Contact` instance.
+        :returns: :class:`deltachat.contact.Contact` instance.
         """
         name = as_dc_charpointer(name)
         email = as_dc_charpointer(email)
@@ -253,7 +302,7 @@ class Account(object):
                       whose name or e-mail matches query.
         :param only_verified: if true only return verified contacts.
         :param with_self: if true the self-contact is also returned.
-        :returns: list of :class:`deltachat.chatting.Contact` objects.
+        :returns: list of :class:`deltachat.contact.Contact` objects.
         """
         flags = 0
         query = as_dc_charpointer(query)
@@ -271,7 +320,7 @@ class Account(object):
         """ create or get an existing 1:1 chat object for the specified contact or contact id.
 
         :param contact: chat_id (int) or contact object.
-        :returns: a :class:`deltachat.chatting.Chat` object.
+        :returns: a :class:`deltachat.chat.Chat` object.
         """
         if hasattr(contact, "id"):
             if contact._dc_context != self._dc_context:
@@ -288,7 +337,7 @@ class Account(object):
         the specified message.
 
         :param message: messsage id or message instance.
-        :returns: a :class:`deltachat.chatting.Chat` object.
+        :returns: a :class:`deltachat.chat.Chat` object.
         """
         if hasattr(message, "id"):
             if self._dc_context != message._dc_context:
@@ -306,7 +355,7 @@ class Account(object):
         Chats are unpromoted until the first message is sent.
 
         :param verified: if true only verified contacts can be added.
-        :returns: a :class:`deltachat.chatting.Chat` object.
+        :returns: a :class:`deltachat.chat.Chat` object.
         """
         bytes_name = name.encode("utf8")
         chat_id = lib.dc_create_group_chat(self._dc_context, int(verified), bytes_name)
@@ -315,7 +364,7 @@ class Account(object):
     def get_chats(self):
         """ return list of chats.
 
-        :returns: a list of :class:`deltachat.chatting.Chat` objects.
+        :returns: a list of :class:`deltachat.chat.Chat` objects.
         """
         dc_chatlist = ffi.gc(
             lib.dc_get_chatlist(self._dc_context, 0, ffi.NULL, 0),
@@ -333,8 +382,23 @@ class Account(object):
         return Chat(self, const.DC_CHAT_ID_DEADDROP)
 
     def get_message_by_id(self, msg_id):
-        """ return Message instance. """
+        """ return Message instance.
+        :param msg_id: integer id of this message.
+        :returns: :class:`deltachat.message.Message` instance.
+        """
         return Message.from_db(self, msg_id)
+
+    def get_chat_by_id(self, chat_id):
+        """ return Chat instance.
+        :param chat_id: integer id of this chat.
+        :returns: :class:`deltachat.chat.Chat` instance.
+        :raises: ValueError if chat does not exist.
+        """
+        res = lib.dc_get_chat(self._dc_context, chat_id)
+        if res == ffi.NULL:
+            raise ValueError("cannot get chat with id={}".format(chat_id))
+        lib.dc_chat_unref(res)
+        return Chat(self, chat_id)
 
     def mark_seen_messages(self, messages):
         """ mark the given set of messages as seen.
@@ -352,7 +416,7 @@ class Account(object):
         """ Forward list of messages to a chat.
 
         :param messages: list of :class:`deltachat.message.Message` object.
-        :param chat: :class:`deltachat.chatting.Chat` object.
+        :param chat: :class:`deltachat.chat.Chat` object.
         :returns: None
         """
         msg_ids = [msg.id for msg in messages]
@@ -464,7 +528,7 @@ class Account(object):
         """ setup contact and return a Chat after contact is established.
 
         Note that this function may block for a long time as messages are exchanged
-        with the emitter of the QR code.  On success a :class:`deltachat.chatting.Chat` instance
+        with the emitter of the QR code.  On success a :class:`deltachat.chat.Chat` instance
         is returned.
         :param qr: valid "setup contact" QR code (all other QR codes will result in an exception)
         """
@@ -478,7 +542,7 @@ class Account(object):
         """ join a chat group through a QR code.
 
         Note that this function may block for a long time as messages are exchanged
-        with the emitter of the QR code.  On success a :class:`deltachat.chatting.Chat` instance
+        with the emitter of the QR code.  On success a :class:`deltachat.chat.Chat` instance
         is returned which is the chat that we just joined.
 
         :param qr: valid "join-group" QR code (all other QR codes will result in an exception)
@@ -513,8 +577,9 @@ class Account(object):
 
     def stop_threads(self, wait=True):
         """ stop IMAP/SMTP threads. """
-        self.stop_ongoing()
-        self._threads.stop(wait=wait)
+        if self._threads.is_started():
+            self.stop_ongoing()
+            self._threads.stop(wait=wait)
 
     def shutdown(self, wait=True):
         """ stop threads and close and remove underlying dc_context and callbacks. """
@@ -545,6 +610,20 @@ class Account(object):
     def on_dc_event_imex_file_written(self, data1, data2):
         self._imex_events.put(data1)
 
+    def set_location(self, latitude=0.0, longitude=0.0, accuracy=0.0):
+        """set a new location. It effects all chats where we currently
+        have enabled location streaming.
+
+        :param latitude: float (use 0.0 if not known)
+        :param longitude: float (use 0.0 if not known)
+        :param accuracy: float (use 0.0 if not known)
+        :raises: ValueError if no chat is currently streaming locations
+        :returns: None
+        """
+        dc_res = lib.dc_set_location(self._dc_context, latitude, longitude, accuracy)
+        if dc_res == 0:
+            raise ValueError("no chat is streaming locations")
+
 
 class IOThreads:
     def __init__(self, dc_context, log_event=lambda *args: None):
@@ -574,6 +653,11 @@ class IOThreads:
 
     def stop(self, wait=False):
         self._thread_quitflag = True
+
+        # Workaround for a race condition. Make sure that thread is
+        # not in between checking for quitflag and entering idle.
+        time.sleep(0.5)
+
         lib.dc_interrupt_imap_idle(self._dc_context)
         lib.dc_interrupt_smtp_idle(self._dc_context)
         lib.dc_interrupt_mvbox_idle(self._dc_context)
@@ -586,31 +670,38 @@ class IOThreads:
         self._log_event("py-bindings-info", 0, "INBOX THREAD START")
         while not self._thread_quitflag:
             lib.dc_perform_imap_jobs(self._dc_context)
-            lib.dc_perform_imap_fetch(self._dc_context)
-            lib.dc_perform_imap_idle(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_imap_fetch(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_imap_idle(self._dc_context)
         self._log_event("py-bindings-info", 0, "INBOX THREAD FINISHED")
 
     def mvbox_thread_run(self):
         self._log_event("py-bindings-info", 0, "MVBOX THREAD START")
         while not self._thread_quitflag:
             lib.dc_perform_mvbox_jobs(self._dc_context)
-            lib.dc_perform_mvbox_fetch(self._dc_context)
-            lib.dc_perform_mvbox_idle(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_mvbox_fetch(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_mvbox_idle(self._dc_context)
         self._log_event("py-bindings-info", 0, "MVBOX THREAD FINISHED")
 
     def sentbox_thread_run(self):
         self._log_event("py-bindings-info", 0, "SENTBOX THREAD START")
         while not self._thread_quitflag:
             lib.dc_perform_sentbox_jobs(self._dc_context)
-            lib.dc_perform_sentbox_fetch(self._dc_context)
-            lib.dc_perform_sentbox_idle(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_sentbox_fetch(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_sentbox_idle(self._dc_context)
         self._log_event("py-bindings-info", 0, "SENTBOX THREAD FINISHED")
 
     def smtp_thread_run(self):
         self._log_event("py-bindings-info", 0, "SMTP THREAD START")
         while not self._thread_quitflag:
             lib.dc_perform_smtp_jobs(self._dc_context)
-            lib.dc_perform_smtp_idle(self._dc_context)
+            if not self._thread_quitflag:
+                lib.dc_perform_smtp_idle(self._dc_context)
         self._log_event("py-bindings-info", 0, "SMTP THREAD FINISHED")
 
 

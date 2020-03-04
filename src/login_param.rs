@@ -1,8 +1,9 @@
+//! # Login parameters
+
 use std::borrow::Cow;
 use std::fmt;
 
 use crate::context::Context;
-use crate::error::Error;
 
 #[derive(Copy, Clone, Debug, Display, FromPrimitive)]
 #[repr(i32)]
@@ -10,7 +11,11 @@ use crate::error::Error;
 pub enum CertificateChecks {
     Automatic = 0,
     Strict = 1,
-    AcceptInvalidHostnames = 2,
+
+    /// Same as AcceptInvalidCertificates
+    /// Previously known as AcceptInvalidHostnames, now deprecated.
+    AcceptInvalidCertificates2 = 2,
+
     AcceptInvalidCertificates = 3,
 }
 
@@ -100,7 +105,7 @@ impl LoginParam {
         let server_flags = sql.get_raw_config_int(context, key).unwrap_or_default();
 
         LoginParam {
-            addr: addr.to_string(),
+            addr,
             mail_server,
             mail_user,
             mail_pw,
@@ -124,7 +129,7 @@ impl LoginParam {
         &self,
         context: &Context,
         prefix: impl AsRef<str>,
-    ) -> Result<(), Error> {
+    ) -> crate::sql::Result<()> {
         let prefix = prefix.as_ref();
         let sql = &context.sql;
 
@@ -194,6 +199,7 @@ impl fmt::Display for LoginParam {
     }
 }
 
+#[allow(clippy::ptr_arg)]
 fn unset_empty(s: &String) -> Cow<String> {
     if s.is_empty() {
         Cow::Owned("unset".to_string())
@@ -202,44 +208,45 @@ fn unset_empty(s: &String) -> Cow<String> {
     }
 }
 
+#[allow(clippy::useless_let_if_seq)]
 fn get_readable_flags(flags: i32) -> String {
     let mut res = String::new();
     for bit in 0..31 {
         if 0 != flags & 1 << bit {
-            let mut flag_added = 0;
+            let mut flag_added = false;
             if 1 << bit == 0x2 {
                 res += "OAUTH2 ";
-                flag_added = 1;
+                flag_added = true;
             }
             if 1 << bit == 0x4 {
                 res += "AUTH_NORMAL ";
-                flag_added = 1;
+                flag_added = true;
             }
             if 1 << bit == 0x100 {
                 res += "IMAP_STARTTLS ";
-                flag_added = 1;
+                flag_added = true;
             }
             if 1 << bit == 0x200 {
                 res += "IMAP_SSL ";
-                flag_added = 1;
+                flag_added = true;
             }
             if 1 << bit == 0x400 {
                 res += "IMAP_PLAIN ";
-                flag_added = 1;
+                flag_added = true;
             }
             if 1 << bit == 0x10000 {
                 res += "SMTP_STARTTLS ";
-                flag_added = 1
+                flag_added = true;
             }
             if 1 << bit == 0x20000 {
                 res += "SMTP_SSL ";
-                flag_added = 1
+                flag_added = true;
             }
             if 1 << bit == 0x40000 {
                 res += "SMTP_PLAIN ";
-                flag_added = 1
+                flag_added = true;
             }
-            if 0 == flag_added {
+            if flag_added {
                 res += &format!("{:#0x}", 1 << bit);
             }
         }
@@ -251,10 +258,8 @@ fn get_readable_flags(flags: i32) -> String {
     res
 }
 
-pub fn dc_build_tls(
-    certificate_checks: CertificateChecks,
-) -> Result<native_tls::TlsConnector, native_tls::Error> {
-    let mut tls_builder = native_tls::TlsConnector::builder();
+pub fn dc_build_tls(certificate_checks: CertificateChecks) -> async_native_tls::TlsConnector {
+    let tls_builder = async_native_tls::TlsConnector::new();
     match certificate_checks {
         CertificateChecks::Automatic => {
             // Same as AcceptInvalidCertificates for now.
@@ -263,15 +268,12 @@ pub fn dc_build_tls(
                 .danger_accept_invalid_hostnames(true)
                 .danger_accept_invalid_certs(true)
         }
-        CertificateChecks::Strict => &mut tls_builder,
-        CertificateChecks::AcceptInvalidHostnames => {
-            tls_builder.danger_accept_invalid_hostnames(true)
-        }
-        CertificateChecks::AcceptInvalidCertificates => tls_builder
+        CertificateChecks::Strict => tls_builder,
+        CertificateChecks::AcceptInvalidCertificates
+        | CertificateChecks::AcceptInvalidCertificates2 => tls_builder
             .danger_accept_invalid_hostnames(true)
             .danger_accept_invalid_certs(true),
     }
-    .build()
 }
 
 #[cfg(test)]
@@ -283,8 +285,8 @@ mod tests {
         use std::string::ToString;
 
         assert_eq!(
-            "accept_invalid_hostnames".to_string(),
-            CertificateChecks::AcceptInvalidHostnames.to_string()
+            "accept_invalid_certificates".to_string(),
+            CertificateChecks::AcceptInvalidCertificates.to_string()
         );
     }
 }

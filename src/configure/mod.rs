@@ -1,20 +1,26 @@
+//! Email accounts autoconfiguration process module
+
+mod auto_mozilla;
+mod auto_outlook;
+mod read_url;
+
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+
+use async_std::task;
 
 use crate::config::Config;
 use crate::constants::*;
 use crate::context::Context;
 use crate::dc_tools::*;
-use crate::e2ee;
-use crate::imap::*;
-use crate::job::*;
-use crate::login_param::LoginParam;
+use crate::job::{self, job_add, job_kill_action};
+use crate::login_param::{CertificateChecks, LoginParam};
 use crate::oauth2::*;
 use crate::param::Params;
+use crate::{chat, e2ee, provider};
 
-mod auto_outlook;
-use auto_outlook::outlk_autodiscover;
-mod auto_mozilla;
+use crate::message::Message;
 use auto_mozilla::moz_autoconfigure;
+use auto_outlook::outlk_autodiscover;
 
 macro_rules! progress {
     ($context:tt, $progress:expr) => {
@@ -27,13 +33,13 @@ macro_rules! progress {
 }
 
 // connect
-pub unsafe fn configure(context: &Context) {
+pub fn configure(context: &Context) {
     if context.has_ongoing() {
         warn!(context, "There is already another ongoing process running.",);
         return;
     }
-    job_kill_action(context, Action::ConfigureImap);
-    job_add(context, Action::ConfigureImap, 0, Params::new(), 0);
+    job_kill_action(context, job::Action::ConfigureImap);
+    job_add(context, job::Action::ConfigureImap, 0, Params::new(), 0);
 }
 
 /// Check if the context is already configured.
@@ -44,17 +50,16 @@ pub fn dc_is_configured(context: &Context) -> bool {
 /*******************************************************************************
  * Configure JOB
  ******************************************************************************/
-// the other dc_job_do_DC_JOB_*() functions are declared static in the c-file
-#[allow(non_snake_case, unused_must_use)]
-pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
+#[allow(non_snake_case, unused_must_use, clippy::cognitive_complexity)]
+pub fn JobConfigureImap(context: &Context) -> job::Status {
     if !context.sql.is_open() {
         error!(context, "Cannot configure, database not opened.",);
         progress!(context, 0);
-        return;
+        return job::Status::Finished(Err(format_err!("Database not opened")));
     }
     if !context.alloc_ongoing() {
         progress!(context, 0);
-        return;
+        return job::Status::Finished(Err(format_err!("Cannot allocated ongoing process")));
     }
     let mut success = false;
     let mut imap_connected_here = false;
@@ -62,7 +67,12 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
 
     let mut param_autoconfig: Option<LoginParam> = None;
 
-    context.inbox.read().unwrap().disconnect(context);
+    context
+        .inbox_thread
+        .read()
+        .unwrap()
+        .imap
+        .disconnect(context);
     context
         .sentbox_thread
         .read()
@@ -85,12 +95,14 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
     let mut param_domain = "undefined.undefined".to_owned();
     let mut param_addr_urlencoded: String =
         "Internal Error: this value should never be used".to_owned();
-    let mut keep_flags = std::i32::MAX;
+    let mut keep_flags = 0;
 
-    const STEP_3_INDEX: u8 = 13;
+    const STEP_12_USE_AUTOCONFIG: u8 = 12;
+    const STEP_13_AFTER_AUTOCONFIG: u8 = 13;
+
     let mut step_counter: u8 = 0;
     while !context.shall_stop_ongoing() {
-        step_counter = step_counter + 1;
+        step_counter += 1;
 
         let success = match step_counter {
             // Read login parameters from the database
@@ -103,7 +115,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
             }
             // Step 1: Load the parameters and check email-address and password
             2 => {
-                if 0 != param.server_flags & 0x2 {
+                if 0 != param.server_flags & DC_LP_AUTH_OAUTH2 {
                     // the used oauth2 addr may differ, check this.
                     // if dc_get_oauth2_addr() is not available in the oauth2 implementation,
                     // just use the given one.
@@ -112,6 +124,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                         dc_get_oauth2_addr(context, &param.addr, &param.mail_pw)
                             .and_then(|e| e.parse().ok())
                     {
+                        info!(context, "Authorized address is {}", oauth2_addr);
                         param.addr = oauth2_addr;
                         context
                             .sql
@@ -137,6 +150,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
             // Step 2: Autoconfig
             4 => {
                 progress!(context, 200);
+
                 if param.mail_server.is_empty()
                             && param.mail_port == 0
                             /*&&param.mail_user.is_empty() -- the user can enter a loginname which is used by autoconfig then */
@@ -144,12 +158,18 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                             && param.send_port == 0
                             && param.send_user.is_empty()
                             /*&&param.send_pw.is_empty() -- the password cannot be auto-configured and is no criterion for autoconfig or not */
-                            && param.server_flags & !0x2 == 0
+                            && (param.server_flags & !DC_LP_AUTH_OAUTH2) == 0
                 {
-                    keep_flags = param.server_flags & 0x2;
+                    // no advanced parameters entered by the user: query provider-database or do Autoconfig
+                    keep_flags = param.server_flags & DC_LP_AUTH_OAUTH2;
+                    if let Some(new_param) = get_offline_autoconfig(context, &param) {
+                        // got parameters from our provider-database, skip Autoconfig, preserve the OAuth2 setting
+                        param_autoconfig = Some(new_param);
+                        step_counter = STEP_12_USE_AUTOCONFIG - 1; // minus one as step_counter is increased on next loop
+                    }
                 } else {
-                    // Autoconfig is not needed so skip it.
-                    step_counter = STEP_3_INDEX - 1;
+                    // advanced parameters entered by the user: skip Autoconfig
+                    step_counter = STEP_13_AFTER_AUTOCONFIG - 1; // minus one as step_counter is increased on next loop
                 }
                 true
             }
@@ -160,7 +180,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                         "https://autoconfig.{}/mail/config-v1.1.xml?emailaddress={}",
                         param_domain, param_addr_urlencoded
                     );
-                    param_autoconfig = moz_autoconfigure(context, &url, &param);
+                    param_autoconfig = moz_autoconfigure(context, &url, &param).ok();
                 }
                 true
             }
@@ -172,7 +192,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                         "https://{}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={}",
                         param_domain, param_addr_urlencoded
                     );
-                    param_autoconfig = moz_autoconfigure(context, &url, &param);
+                    param_autoconfig = moz_autoconfigure(context, &url, &param).ok();
                 }
                 true
             }
@@ -181,11 +201,8 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
             7 => {
                 progress!(context, 310);
                 if param_autoconfig.is_none() {
-                    let url = format!(
-                        "https://{}{}/autodiscover/autodiscover.xml",
-                        "", param_domain
-                    );
-                    param_autoconfig = outlk_autodiscover(context, &url, &param);
+                    let url = format!("https://{}/autodiscover/autodiscover.xml", param_domain);
+                    param_autoconfig = outlk_autodiscover(context, &url, &param).ok();
                 }
                 true
             }
@@ -196,7 +213,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                         "https://{}{}/autodiscover/autodiscover.xml",
                         "autodiscover.", param_domain
                     );
-                    param_autoconfig = outlk_autodiscover(context, &url, &param);
+                    param_autoconfig = outlk_autodiscover(context, &url, &param).ok();
                 }
                 true
             }
@@ -208,7 +225,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                         "http://autoconfig.{}/mail/config-v1.1.xml?emailaddress={}",
                         param_domain, param_addr_urlencoded
                     );
-                    param_autoconfig = moz_autoconfigure(context, &url, &param);
+                    param_autoconfig = moz_autoconfigure(context, &url, &param).ok();
                 }
                 true
             }
@@ -220,7 +237,7 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                         "http://{}/.well-known/autoconfig/mail/config-v1.1.xml",
                         param_domain
                     );
-                    param_autoconfig = moz_autoconfigure(context, &url, &param);
+                    param_autoconfig = moz_autoconfigure(context, &url, &param).ok();
                 }
                 true
             }
@@ -230,12 +247,14 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                 if param_autoconfig.is_none() {
                     /* always SSL for Thunderbird's database */
                     let url = format!("https://autoconfig.thunderbird.net/v1.1/{}", param_domain);
-                    param_autoconfig = moz_autoconfigure(context, &url, &param);
+                    param_autoconfig = moz_autoconfigure(context, &url, &param).ok();
                 }
                 true
             }
-            /* C.  Do we have any result? */
-            12 => {
+            /* C.  Do we have any autoconfig result?
+               If you change the match-number here, also update STEP_12_COPY_AUTOCONFIG above
+            */
+            STEP_12_USE_AUTOCONFIG => {
                 progress!(context, 500);
                 if let Some(ref cfg) = param_autoconfig {
                     info!(context, "Got autoconfig: {}", &cfg);
@@ -248,15 +267,15 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                     param.send_port = cfg.send_port;
                     param.send_user = cfg.send_user.clone();
                     param.server_flags = cfg.server_flags;
-                    /* although param_autoconfig's data are no longer needed from, it is important to keep the object as
-                    we may enter "deep guessing" if we could not read a configuration */
+                    /* although param_autoconfig's data are no longer needed from,
+                    it is used to later to prevent trying variations of port/server/logins */
                 }
                 param.server_flags |= keep_flags;
                 true
             }
             // Step 3: Fill missing fields with defaults
-            13 => {
-                // if you move this, don't forget to update STEP_3_INDEX, too
+            // If you change the match-number here, also update STEP_13_AFTER_AUTOCONFIG above
+            STEP_13_AFTER_AUTOCONFIG => {
                 if param.mail_server.is_empty() {
                     param.mail_server = format!("imap.{}", param_domain,)
                 }
@@ -347,19 +366,21 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
             }
             16 => {
                 progress!(context, 900);
-                let flags: libc::c_int = if context.get_config_bool(Config::MvboxWatch)
-                    || context.get_config_bool(Config::MvboxMove)
-                {
-                    DC_CREATE_MVBOX as i32
+                let create_mvbox = context.get_config_bool(Config::MvboxWatch)
+                    || context.get_config_bool(Config::MvboxMove);
+                let imap = &context.inbox_thread.read().unwrap().imap;
+                if let Err(err) = imap.ensure_configured_folders(context, create_mvbox) {
+                    warn!(context, "configuring folders failed: {:?}", err);
+                    false
                 } else {
-                    0
-                };
-                context
-                    .inbox
-                    .read()
-                    .unwrap()
-                    .configure_folders(context, flags);
-                true
+                    let res = imap.select_with_uidvalidity(context, "INBOX");
+                    if let Err(err) = res {
+                        error!(context, "could not read INBOX status: {:?}", err);
+                        false
+                    } else {
+                        true
+                    }
+                }
             }
             17 => {
                 progress!(context, 910);
@@ -381,11 +402,10 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
                 // (~30 seconds on a Moto G4 play) and might looks as if message sending is always that slow.
                 e2ee::ensure_secret_key_exists(context);
                 success = true;
-                info!(context, "Configure completed.");
+                info!(context, "key generation completed");
                 progress!(context, 940);
                 break; // We are done here
             }
-
             _ => {
                 error!(context, "Internal error: step counter out of bound",);
                 break;
@@ -397,31 +417,97 @@ pub fn dc_job_do_DC_JOB_CONFIGURE_IMAP(context: &Context) {
         }
     }
     if imap_connected_here {
-        context.inbox.read().unwrap().disconnect(context);
+        context
+            .inbox_thread
+            .read()
+            .unwrap()
+            .imap
+            .disconnect(context);
     }
     if smtp_connected_here {
         context.smtp.clone().lock().unwrap().disconnect();
     }
 
-    /*
-    if !success {
-        // disconnect if configure did not succeed
-        if imap_connected_here {
-            // context.inbox.read().unwrap().disconnect(context);
-        }
-        if smtp_connected_here {
-            // context.smtp.clone().lock().unwrap().disconnect();
-        }
+    // remember the entered parameters on success
+    // and restore to last-entered on failure.
+    // this way, the parameters visible to the ui are always in-sync with the current configuration.
+    if success {
+        LoginParam::from_database(context, "").save_to_database(context, "configured_raw_");
     } else {
-        assert!(imap_connected_here && smtp_connected_here);
-        info!(
-            context,
-            0, "Keeping IMAP/SMTP connections open after successful configuration"
-        );
+        LoginParam::from_database(context, "configured_raw_").save_to_database(context, "");
     }
-    */
+
+    if let Some(provider) = provider::get_provider_info(&param.addr) {
+        if !provider.after_login_hint.is_empty() {
+            let mut msg = Message::new(Viewtype::Text);
+            msg.text = Some(provider.after_login_hint.to_string());
+            if chat::add_device_msg(context, Some("core-provider-info"), Some(&mut msg)).is_err() {
+                warn!(context, "cannot add after_login_hint as core-provider-info");
+            }
+        }
+    }
+
     context.free_ongoing();
     progress!(context, if success { 1000 } else { 0 });
+    job::Status::Finished(Ok(()))
+}
+
+#[allow(clippy::unnecessary_unwrap)]
+fn get_offline_autoconfig(context: &Context, param: &LoginParam) -> Option<LoginParam> {
+    info!(
+        context,
+        "checking internal provider-info for offline autoconfig"
+    );
+
+    if let Some(provider) = provider::get_provider_info(&param.addr) {
+        match provider.status {
+            provider::Status::OK | provider::Status::PREPARATION => {
+                let imap = provider.get_imap_server();
+                let smtp = provider.get_smtp_server();
+                // clippy complains about these is_some()/unwrap() settings,
+                // however, rewriting the code to "if let" would make things less obvious,
+                // esp. if we allow more combinations of servers (pop, jmap).
+                // therefore, #[allow(clippy::unnecessary_unwrap)] is added above.
+                if imap.is_some() && smtp.is_some() {
+                    let imap = imap.unwrap();
+                    let smtp = smtp.unwrap();
+
+                    let mut p = LoginParam::new();
+                    p.addr = param.addr.clone();
+
+                    p.mail_server = imap.hostname.to_string();
+                    p.mail_user = imap.apply_username_pattern(param.addr.clone());
+                    p.mail_port = imap.port as i32;
+                    p.imap_certificate_checks = CertificateChecks::AcceptInvalidCertificates;
+                    p.server_flags |= match imap.socket {
+                        provider::Socket::STARTTLS => DC_LP_IMAP_SOCKET_STARTTLS,
+                        provider::Socket::SSL => DC_LP_IMAP_SOCKET_SSL,
+                    };
+
+                    p.send_server = smtp.hostname.to_string();
+                    p.send_user = smtp.apply_username_pattern(param.addr.clone());
+                    p.send_port = smtp.port as i32;
+                    p.smtp_certificate_checks = CertificateChecks::AcceptInvalidCertificates;
+                    p.server_flags |= match smtp.socket {
+                        provider::Socket::STARTTLS => DC_LP_SMTP_SOCKET_STARTTLS as i32,
+                        provider::Socket::SSL => DC_LP_SMTP_SOCKET_SSL as i32,
+                    };
+
+                    info!(context, "offline autoconfig found: {}", p);
+                    return Some(p);
+                } else {
+                    info!(context, "offline autoconfig found, but no servers defined");
+                    return None;
+                }
+            }
+            provider::Status::BROKEN => {
+                info!(context, "offline autoconfig found, provider is broken");
+                return None;
+            }
+        }
+    }
+    info!(context, "no offline autoconfig found");
+    None
 }
 
 fn try_imap_connections(
@@ -479,11 +565,22 @@ fn try_imap_connection(
 
 fn try_imap_one_param(context: &Context, param: &LoginParam) -> Option<bool> {
     let inf = format!(
-        "imap: {}@{}:{} flags=0x{:x}",
-        param.mail_user, param.mail_server, param.mail_port, param.server_flags
+        "imap: {}@{}:{} flags=0x{:x} certificate_checks={}",
+        param.mail_user,
+        param.mail_server,
+        param.mail_port,
+        param.server_flags,
+        param.imap_certificate_checks
     );
     info!(context, "Trying: {}", inf);
-    if context.inbox.read().unwrap().connect(context, &param) {
+    if task::block_on(
+        context
+            .inbox_thread
+            .read()
+            .unwrap()
+            .imap
+            .connect(context, &param),
+    ) {
         info!(context, "success: {}", inf);
         return Some(true);
     }
@@ -530,62 +627,24 @@ fn try_smtp_one_param(context: &Context, param: &LoginParam) -> Option<bool> {
         param.send_user, param.send_server, param.send_port, param.server_flags
     );
     info!(context, "Trying: {}", inf);
-    if context
+    match context
         .smtp
         .clone()
         .lock()
         .unwrap()
         .connect(context, &param)
     {
-        info!(context, "success: {}", inf);
-        return Some(true);
-    }
-    if context.shall_stop_ongoing() {
-        return Some(false);
-    }
-    info!(context, "could not connect: {}", inf);
-    None
-}
-
-/*******************************************************************************
- * Connect to configured account
- ******************************************************************************/
-pub fn dc_connect_to_configured_imap(context: &Context, imap: &Imap) -> libc::c_int {
-    let mut ret_connected = 0;
-
-    if imap.is_connected() {
-        ret_connected = 1
-    } else if !context.sql.get_raw_config_bool(context, "configured") {
-        warn!(context, "Not configured, cannot connect.",);
-    } else {
-        let param = LoginParam::from_database(context, "configured_");
-        // the trailing underscore is correct
-
-        if imap.connect(context, &param) {
-            ret_connected = 2;
+        Ok(()) => {
+            info!(context, "success: {}", inf);
+            Some(true)
         }
-    }
-
-    ret_connected
-}
-
-/*******************************************************************************
- * Configure a Context
- ******************************************************************************/
-
-pub fn read_autoconf_file(context: &Context, url: &str) -> Option<String> {
-    info!(context, "Testing {} ...", url);
-
-    match reqwest::Client::new()
-        .get(url)
-        .send()
-        .and_then(|mut res| res.text())
-    {
-        Ok(res) => Some(res),
-        Err(_err) => {
-            info!(context, "Can\'t read file.",);
-
-            None
+        Err(err) => {
+            if context.shall_stop_ongoing() {
+                Some(false)
+            } else {
+                warn!(context, "could not connect: {}", err);
+                None
+            }
         }
     }
 }
@@ -593,8 +652,9 @@ pub fn read_autoconf_file(context: &Context, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
+    use super::*;
     use crate::config::*;
-    use crate::configure::dc_job_do_DC_JOB_CONFIGURE_IMAP;
+    use crate::configure::JobConfigureImap;
     use crate::test_utils::*;
 
     #[test]
@@ -604,6 +664,21 @@ mod tests {
             .set_config(Config::Addr, Some("probably@unexistant.addr"))
             .unwrap();
         t.ctx.set_config(Config::MailPw, Some("123456")).unwrap();
-        dc_job_do_DC_JOB_CONFIGURE_IMAP(&t.ctx);
+        JobConfigureImap(&t.ctx);
+    }
+
+    #[test]
+    fn test_get_offline_autoconfig() {
+        let context = dummy_context().ctx;
+
+        let mut params = LoginParam::new();
+        params.addr = "someone123@example.org".to_string();
+        assert!(get_offline_autoconfig(&context, &params).is_none());
+
+        let mut params = LoginParam::new();
+        params.addr = "someone123@nauta.cu".to_string();
+        let found_params = get_offline_autoconfig(&context, &params).unwrap();
+        assert_eq!(found_params.mail_server, "imap.nauta.cu".to_string());
+        assert_eq!(found_params.send_server, "smtp.nauta.cu".to_string());
     }
 }

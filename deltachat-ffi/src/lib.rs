@@ -4,12 +4,14 @@
     non_upper_case_globals,
     non_upper_case_globals,
     non_camel_case_types,
-    non_snake_case
+    clippy::missing_safety_doc,
+    clippy::expect_fun_call
 )]
 
 #[macro_use]
 extern crate human_panic;
 extern crate num_traits;
+extern crate serde_json;
 
 use num_traits::{FromPrimitive, ToPrimitive};
 use std::convert::{TryFrom, TryInto};
@@ -23,11 +25,19 @@ use std::sync::RwLock;
 use libc::uintptr_t;
 
 use deltachat::coi::CoiMessageFilter;
+use deltachat::chat::ChatId;
+use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
 use deltachat::contact::Contact;
 use deltachat::context::Context;
-use deltachat::dc_tools::{as_path, as_str, dc_strdup, to_string_lossy, OsStrExt, StrExt};
+use deltachat::message::MsgId;
+use deltachat::stock::StockMessage;
 use deltachat::webpush::WebPushConfig;
 use deltachat::*;
+
+mod dc_array;
+
+mod string;
+use self::string::*;
 
 // as C lacks a good and portable error handling,
 // in general, the C Interface is forgiving wrt to bad parameters.
@@ -116,73 +126,85 @@ impl ContextWrapper {
     }
 
     /// Translates the callback from the rust style to the C-style version.
-    unsafe fn translate_cb(&self, event: Event) -> uintptr_t {
-        match self.cb {
-            Some(ffi_cb) => {
-                let event_id = event.as_id();
-                match event {
-                    Event::Info(msg)
-                    | Event::SmtpConnected(msg)
-                    | Event::ImapConnected(msg)
-                    | Event::SmtpMessageSent(msg)
-                    | Event::ImapMessageDeleted(msg)
-                    | Event::ImapMessageMoved(msg)
-                    | Event::NewBlobFile(msg)
-                    | Event::DeletedBlobFile(msg)
-                    | Event::Warning(msg)
-                    | Event::Error(msg)
-                    | Event::ErrorNetwork(msg)
-                    | Event::MissingKey(msg)
-                    | Event::ErrorSelfNotInGroup(msg) => {
-                        let data2 = CString::new(msg).unwrap_or_default();
-                        ffi_cb(self, event_id, 0, data2.as_ptr() as uintptr_t)
-                    }
-                    Event::MsgsChanged { chat_id, msg_id }
-                    | Event::IncomingMsg { chat_id, msg_id }
-                    | Event::MsgDelivered { chat_id, msg_id }
-                    | Event::MsgFailed { chat_id, msg_id }
-                    | Event::MsgRead { chat_id, msg_id } => {
-                        ffi_cb(self, event_id, chat_id as uintptr_t, msg_id as uintptr_t)
-                    }
-                    Event::ChatModified(chat_id) => ffi_cb(self, event_id, chat_id as uintptr_t, 0),
-                    Event::ContactsChanged(id) | Event::LocationChanged(id) => {
-                        let id = id.unwrap_or_default();
-                        ffi_cb(self, event_id, id as uintptr_t, 0)
-                    }
-                    Event::ConfigureProgress(progress) | Event::ImexProgress(progress) => {
-                        ffi_cb(self, event_id, progress as uintptr_t, 0)
-                    }
-                    Event::ImexFileWritten(file) => {
-                        let data1 = file.to_c_string().unwrap_or_default();
-                        ffi_cb(self, event_id, data1.as_ptr() as uintptr_t, 0)
-                    }
-                    Event::SecurejoinInviterProgress {
-                        contact_id,
-                        progress,
-                    }
-                    | Event::SecurejoinJoinerProgress {
-                        contact_id,
-                        progress,
-                    } => ffi_cb(
+    unsafe fn translate_cb(&self, event: Event) {
+        if let Some(ffi_cb) = self.cb {
+            let event_id = event.as_id();
+            match event {
+                Event::Info(msg)
+                | Event::SmtpConnected(msg)
+                | Event::ImapConnected(msg)
+                | Event::SmtpMessageSent(msg)
+                | Event::ImapMessageDeleted(msg)
+                | Event::ImapMessageMoved(msg)
+                | Event::ImapFolderEmptied(msg)
+                | Event::NewBlobFile(msg)
+                | Event::DeletedBlobFile(msg)
+                | Event::Warning(msg)
+                | Event::Error(msg)
+                | Event::ErrorNetwork(msg)
+                | Event::MissingKey(msg)
+                | Event::ErrorSelfNotInGroup(msg) => {
+                    let data2 = CString::new(msg).unwrap_or_default();
+                    ffi_cb(self, event_id, 0, data2.as_ptr() as uintptr_t);
+                }
+                Event::MsgsChanged { chat_id, msg_id }
+                | Event::IncomingMsg { chat_id, msg_id }
+                | Event::MsgDelivered { chat_id, msg_id }
+                | Event::MsgFailed { chat_id, msg_id }
+                | Event::MsgRead { chat_id, msg_id } => {
+                    ffi_cb(
+                        self,
+                        event_id,
+                        chat_id.to_u32() as uintptr_t,
+                        msg_id.to_u32() as uintptr_t,
+                    );
+                }
+                Event::ChatModified(chat_id) => {
+                    ffi_cb(self, event_id, chat_id.to_u32() as uintptr_t, 0);
+                }
+                Event::ContactsChanged(id) | Event::LocationChanged(id) => {
+                    let id = id.unwrap_or_default();
+                    ffi_cb(self, event_id, id as uintptr_t, 0);
+                }
+                Event::ConfigureProgress(progress) | Event::ImexProgress(progress) => {
+                    ffi_cb(self, event_id, progress as uintptr_t, 0);
+                }
+                Event::ImexFileWritten(file) => {
+                    let data1 = file.to_c_string().unwrap_or_default();
+                    ffi_cb(self, event_id, data1.as_ptr() as uintptr_t, 0);
+                }
+                Event::SecurejoinInviterProgress {
+                    contact_id,
+                    progress,
+                }
+                | Event::SecurejoinJoinerProgress {
+                    contact_id,
+                    progress,
+                } => {
+                    ffi_cb(
                         self,
                         event_id,
                         contact_id as uintptr_t,
                         progress as uintptr_t,
-                    ),
-                    Event::GetString { id, count } => ffi_cb(
+                    );
+                }
+                Event::SecurejoinMemberAdded {
+                    chat_id,
+                    contact_id,
+                } => {
+                    ffi_cb(
                         self,
                         event_id,
-                        id.to_u32().unwrap_or_default() as uintptr_t,
-                        count as uintptr_t,
-                    ),
-                    Event::SetMetadataDone {foreign_id} => ffi_cb(self, event_id, foreign_id as usize, 0),
-                    Event::Metadata {foreign_id, json} => {
-                        let data = CString::new(json.unwrap_or(String::from(""))).unwrap_or_default();
-                        ffi_cb(self, event_id, foreign_id as usize, data.as_ptr() as uintptr_t)
-                    }
+                        chat_id.to_u32() as uintptr_t,
+                        contact_id as uintptr_t,
+                    );
+                }
+                Event::SetMetadataDone {foreign_id} => {ffi_cb(self, event_id, foreign_id as usize, 0);},
+                Event::Metadata {foreign_id, json} => {
+                    let data = CString::new(json.unwrap_or(String::from(""))).unwrap_or_default();
+                    ffi_cb(self, event_id, foreign_id as usize, data.as_ptr() as uintptr_t);
                 }
             }
-            None => 0,
         }
     }
 }
@@ -316,11 +338,14 @@ pub unsafe extern "C" fn dc_set_config(
         return 0;
     }
     let ffi_context = &*context;
-    match config::Config::from_str(as_str(key)) {
+    match config::Config::from_str(&to_string_lossy(key)) {
         // When ctx.set_config() fails it already logged the error.
         // TODO: Context::set_config() should not log this
         Ok(key) => ffi_context
-            .with_inner(|ctx| ctx.set_config(key, as_opt_str(value)).is_ok() as libc::c_int)
+            .with_inner(|ctx| {
+                ctx.set_config(key, to_opt_string_lossy(value).as_ref().map(|x| x.as_str()))
+                    .is_ok() as libc::c_int
+            })
             .unwrap_or(0),
         Err(_) => {
             ffi_context.error("dc_set_config(): invalid key");
@@ -339,7 +364,7 @@ pub unsafe extern "C" fn dc_get_config(
         return "".strdup();
     }
     let ffi_context = &*context;
-    match config::Config::from_str(as_str(key)) {
+    match config::Config::from_str(&to_string_lossy(key)) {
         Ok(key) => ffi_context
             .with_inner(|ctx| ctx.get_config(key).unwrap_or_default().strdup())
             .unwrap_or_else(|_| "".strdup()),
@@ -348,6 +373,35 @@ pub unsafe extern "C" fn dc_get_config(
             "".strdup()
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_set_stock_translation(
+    context: *mut dc_context_t,
+    stock_id: u32,
+    stock_msg: *mut libc::c_char,
+) -> libc::c_int {
+    if context.is_null() || stock_msg.is_null() {
+        eprintln!("ignoring careless call to dc_set_stock_string");
+        return 0;
+    }
+    let msg = to_string_lossy(stock_msg);
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| match StockMessage::from_u32(stock_id) {
+            Some(id) => match ctx.set_stock_translation(id, msg) {
+                Ok(()) => 1,
+                Err(err) => {
+                    warn!(ctx, "set_stock_translation failed: {}", err);
+                    0
+                }
+            },
+            None => {
+                warn!(ctx, "invalid stock message id {}", stock_id);
+                0
+            }
+        })
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -370,7 +424,7 @@ fn render_info(
 ) -> std::result::Result<String, std::fmt::Error> {
     let mut res = String::new();
     for (key, value) in &info {
-        write!(&mut res, "{}={}\n", key, value)?;
+        writeln!(&mut res, "{}={}", key, value)?;
     }
 
     Ok(res)
@@ -517,11 +571,16 @@ pub unsafe extern "C" fn dc_subscribe_webpush(
     assert!(!context.is_null());
     assert!(!uid.is_null());
 
-    let uid = dc_tools::as_str(uid);
-    let json = dc_tools::as_opt_str(json);
+    let uid = to_string_lossy(uid);
+    let json = to_opt_string_lossy(json);
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| {ctx.subscribe_webpush(uid, json, id);}).unwrap_or_default();
+        .with_inner(|ctx| {
+            ctx.subscribe_webpush(
+                uid.as_str(),
+                json.as_ref().map(|x| x.as_str()),
+                id);
+        }).unwrap_or_default();
 }
 
 #[no_mangle]
@@ -533,10 +592,10 @@ pub unsafe extern "C" fn dc_get_webpush_subscription(
     assert!(!context.is_null());
     assert!(!uid.is_null());
 
-    let uid = dc_tools::as_str(uid);
+    let uid = to_string_lossy(uid);
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| {ctx.get_webpush_subscription(uid, id);}).unwrap_or_default();
+        .with_inner(|ctx| {ctx.get_webpush_subscription(uid.as_str(), id);}).unwrap_or_default();
 }
 
 #[no_mangle]
@@ -550,11 +609,11 @@ pub unsafe extern "C" fn dc_validate_webpush(
     assert!(!uid.is_null());
     assert!(!msg.is_null());
 
-    let uid = dc_tools::as_str(uid);
-    let msg = dc_tools::as_str(msg);
+    let uid = to_string_lossy(uid);
+    let msg = to_string_lossy(msg);
     let ffi_context = &*context;
     ffi_context
-    .with_inner(|ctx| {ctx.validate_webpush(uid, msg, id);}).unwrap_or_default();
+    .with_inner(|ctx| {ctx.validate_webpush(uid.as_str(), msg.as_str(), id);}).unwrap_or_default();
 }
 
 #[no_mangle]
@@ -594,7 +653,7 @@ pub unsafe extern "C" fn dc_perform_imap_jobs(context: *mut dc_context_t) {
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| job::perform_imap_jobs(ctx))
+        .with_inner(|ctx| job::perform_inbox_jobs(ctx))
         .unwrap_or(())
 }
 
@@ -606,19 +665,20 @@ pub unsafe extern "C" fn dc_perform_imap_fetch(context: *mut dc_context_t) {
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| job::perform_imap_fetch(ctx))
+        .with_inner(|ctx| job::perform_inbox_fetch(ctx))
         .unwrap_or(())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_perform_imap_idle(context: *mut dc_context_t) {
+    // TODO rename function in co-ordination with UIs
     if context.is_null() {
         eprintln!("ignoring careless call to dc_perform_imap_idle()");
         return;
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| job::perform_imap_idle(ctx))
+        .with_inner(|ctx| job::perform_inbox_idle(ctx))
         .unwrap_or(())
 }
 
@@ -630,7 +690,7 @@ pub unsafe extern "C" fn dc_interrupt_imap_idle(context: *mut dc_context_t) {
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| job::interrupt_imap_idle(ctx))
+        .with_inner(|ctx| job::interrupt_inbox_idle(ctx))
         .unwrap_or(())
 }
 
@@ -790,22 +850,24 @@ pub unsafe extern "C" fn dc_get_chatlist(
         return ptr::null_mut();
     }
     let ffi_context = &*context;
-    let qs = if query_str.is_null() {
-        None
-    } else {
-        Some(as_str(query_str))
-    };
+    let qs = to_opt_string_lossy(query_str);
+
     let qi = if query_id == 0 { None } else { Some(query_id) };
     ffi_context
-        .with_inner(
-            |ctx| match chatlist::Chatlist::try_load(ctx, flags as usize, qs, qi) {
+        .with_inner(|ctx| {
+            match chatlist::Chatlist::try_load(
+                ctx,
+                flags as usize,
+                qs.as_ref().map(|x| x.as_str()),
+                qi,
+            ) {
                 Ok(list) => {
                     let ffi_list = ChatlistWrapper { context, list };
                     Box::into_raw(Box::new(ffi_list))
                 }
                 Err(_) => ptr::null_mut(),
-            },
-        )
+            }
+        })
         .unwrap_or_else(|_| ptr::null_mut())
 }
 
@@ -818,7 +880,10 @@ pub unsafe extern "C" fn dc_create_chat_by_msg_id(context: *mut dc_context_t, ms
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::create_by_msg_id(ctx, msg_id).unwrap_or_log_default(ctx, "Failed to create chat")
+            chat::create_by_msg_id(ctx, MsgId::new(msg_id))
+                .log_err(ctx, "Failed to create chat from msg_id")
+                .map(|id| id.to_u32())
+                .unwrap_or(0)
         })
         .unwrap_or(0)
 }
@@ -836,7 +901,9 @@ pub unsafe extern "C" fn dc_create_chat_by_contact_id(
     ffi_context
         .with_inner(|ctx| {
             chat::create_by_contact_id(ctx, contact_id)
-                .unwrap_or_log_default(ctx, "Failed to create chat")
+                .log_err(ctx, "Failed to create chat from contact_id")
+                .map(|id| id.to_u32())
+                .unwrap_or(0)
         })
         .unwrap_or(0)
 }
@@ -854,7 +921,9 @@ pub unsafe extern "C" fn dc_get_chat_id_by_contact_id(
     ffi_context
         .with_inner(|ctx| {
             chat::get_by_contact_id(ctx, contact_id)
-                .unwrap_or_log_default(ctx, "Failed to get chat")
+                .log_err(ctx, "Failed to get chat for contact_id")
+                .map(|id| id.to_u32())
+                .unwrap_or(0)
         })
         .unwrap_or(0)
 }
@@ -873,9 +942,10 @@ pub unsafe extern "C" fn dc_prepare_msg(
     let ffi_msg: &mut MessageWrapper = &mut *msg;
     ffi_context
         .with_inner(|ctx| {
-            chat::prepare_msg(ctx, chat_id, &mut ffi_msg.message)
+            chat::prepare_msg(ctx, ChatId::new(chat_id), &mut ffi_msg.message)
                 .unwrap_or_log_default(ctx, "Failed to prepare message")
         })
+        .map(|msg_id| msg_id.to_u32())
         .unwrap_or(0)
 }
 
@@ -893,9 +963,10 @@ pub unsafe extern "C" fn dc_send_msg(
     let ffi_msg = &mut *msg;
     ffi_context
         .with_inner(|ctx| {
-            chat::send_msg(ctx, chat_id, &mut ffi_msg.message)
+            chat::send_msg(ctx, ChatId::new(chat_id), &mut ffi_msg.message)
                 .unwrap_or_log_default(ctx, "Failed to send message")
         })
+        .map(|msg_id| msg_id.to_u32())
         .unwrap_or(0)
 }
 
@@ -913,7 +984,8 @@ pub unsafe extern "C" fn dc_send_text_msg(
     let text_to_send = to_string_lossy(text_to_send);
     ffi_context
         .with_inner(|ctx| {
-            chat::send_text_msg(ctx, chat_id, text_to_send)
+            chat::send_text_msg(ctx, ChatId::new(chat_id), text_to_send)
+                .map(|msg_id| msg_id.to_u32())
                 .unwrap_or_log_default(ctx, "Failed to send text message")
         })
         .unwrap_or(0)
@@ -937,8 +1009,71 @@ pub unsafe extern "C" fn dc_set_draft(
         Some(&mut ffi_msg.message)
     };
     ffi_context
-        .with_inner(|ctx| chat::set_draft(ctx, chat_id, msg))
+        .with_inner(|ctx| ChatId::new(chat_id).set_draft(ctx, msg))
         .unwrap_or(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_add_device_msg(
+    context: *mut dc_context_t,
+    label: *const libc::c_char,
+    msg: *mut dc_msg_t,
+) -> u32 {
+    if context.is_null() || (label.is_null() && msg.is_null()) {
+        eprintln!("ignoring careless call to dc_add_device_msg()");
+        return 0;
+    }
+    let ffi_context = &mut *context;
+    let msg = if msg.is_null() {
+        None
+    } else {
+        let ffi_msg: &mut MessageWrapper = &mut *msg;
+        Some(&mut ffi_msg.message)
+    };
+    ffi_context
+        .with_inner(|ctx| {
+            chat::add_device_msg(
+                ctx,
+                to_opt_string_lossy(label).as_ref().map(|x| x.as_str()),
+                msg,
+            )
+            .unwrap_or_log_default(ctx, "Failed to add device message")
+        })
+        .map(|msg_id| msg_id.to_u32())
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_update_device_chats(context: *mut dc_context_t) {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_update_device_chats()");
+        return;
+    }
+    let ffi_context = &mut *context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.update_device_chats()
+                .unwrap_or_log_default(ctx, "Failed to add device message")
+        })
+        .unwrap_or(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_was_device_msg_ever_added(
+    context: *mut dc_context_t,
+    label: *const libc::c_char,
+) -> libc::c_int {
+    if context.is_null() || label.is_null() {
+        eprintln!("ignoring careless call to dc_was_device_msg_ever_added()");
+        return 0;
+    }
+    let ffi_context = &mut *context;
+    ffi_context
+        .with_inner(|ctx| {
+            chat::was_device_msg_ever_added(ctx, &to_string_lossy(label)).unwrap_or(false)
+                as libc::c_int
+        })
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -949,7 +1084,7 @@ pub unsafe extern "C" fn dc_get_draft(context: *mut dc_context_t, chat_id: u32) 
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| match chat::get_draft(ctx, chat_id) {
+        .with_inner(|ctx| match ChatId::new(chat_id).get_draft(ctx) {
             Ok(Some(draft)) => {
                 let ffi_msg = MessageWrapper {
                     context,
@@ -978,9 +1113,19 @@ pub unsafe extern "C" fn dc_get_chat_msgs(
         return ptr::null_mut();
     }
     let ffi_context = &*context;
+    let marker_flag = if marker1before <= DC_MSG_ID_LAST_SPECIAL {
+        None
+    } else {
+        Some(MsgId::new(marker1before))
+    };
     ffi_context
         .with_inner(|ctx| {
-            let arr = dc_array_t::from(chat::get_chat_msgs(ctx, chat_id, flags, marker1before));
+            let arr = dc_array_t::from(
+                chat::get_chat_msgs(ctx, ChatId::new(chat_id), flags, marker_flag)
+                    .iter()
+                    .map(|msg_id| msg_id.to_u32())
+                    .collect::<Vec<u32>>(),
+            );
             Box::into_raw(Box::new(arr))
         })
         .unwrap_or_else(|_| ptr::null_mut())
@@ -994,7 +1139,7 @@ pub unsafe extern "C" fn dc_get_msg_cnt(context: *mut dc_context_t, chat_id: u32
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| chat::get_msg_cnt(ctx, chat_id) as libc::c_int)
+        .with_inner(|ctx| ChatId::new(chat_id).get_msg_cnt(ctx) as libc::c_int)
         .unwrap_or(0)
 }
 
@@ -1009,7 +1154,7 @@ pub unsafe extern "C" fn dc_get_fresh_msg_cnt(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| chat::get_fresh_msg_cnt(ctx, chat_id) as libc::c_int)
+        .with_inner(|ctx| ChatId::new(chat_id).get_fresh_msg_cnt(ctx) as libc::c_int)
         .unwrap_or(0)
 }
 
@@ -1024,7 +1169,12 @@ pub unsafe extern "C" fn dc_get_fresh_msgs(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            let arr = dc_array_t::from(ctx.get_fresh_msgs());
+            let arr = dc_array_t::from(
+                ctx.get_fresh_msgs()
+                    .iter()
+                    .map(|msg_id| msg_id.to_u32())
+                    .collect::<Vec<u32>>(),
+            );
             Box::into_raw(Box::new(arr))
         })
         .unwrap_or_else(|_| ptr::null_mut())
@@ -1039,7 +1189,9 @@ pub unsafe extern "C" fn dc_marknoticed_chat(context: *mut dc_context_t, chat_id
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::marknoticed_chat(ctx, chat_id).log_err(ctx, "Failed marknoticed chat")
+            chat::marknoticed_chat(ctx, ChatId::new(chat_id))
+                .log_err(ctx, "Failed marknoticed chat")
+                .unwrap_or(())
         })
         .unwrap_or(())
 }
@@ -1053,7 +1205,9 @@ pub unsafe extern "C" fn dc_marknoticed_all_chats(context: *mut dc_context_t) {
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::marknoticed_all_chats(ctx).log_err(ctx, "Failed marknoticed all chats")
+            chat::marknoticed_all_chats(ctx)
+                .log_err(ctx, "Failed marknoticed all chats")
+                .unwrap_or(())
         })
         .unwrap_or(())
 }
@@ -1086,13 +1240,18 @@ pub unsafe extern "C" fn dc_get_chat_media(
         from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {}", or_msg_type3));
     ffi_context
         .with_inner(|ctx| {
-            let arr = dc_array_t::from(chat::get_chat_media(
-                ctx,
-                chat_id,
-                msg_type,
-                or_msg_type2,
-                or_msg_type3,
-            ));
+            let arr = dc_array_t::from(
+                chat::get_chat_media(
+                    ctx,
+                    ChatId::new(chat_id),
+                    msg_type,
+                    or_msg_type2,
+                    or_msg_type3,
+                )
+                .iter()
+                .map(|msg_id| msg_id.to_u32())
+                .collect::<Vec<u32>>(),
+            );
             Box::into_raw(Box::new(arr))
         })
         .unwrap_or_else(|_| ptr::null_mut())
@@ -1125,7 +1284,16 @@ pub unsafe extern "C" fn dc_get_next_media(
         from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {}", or_msg_type3));
     ffi_context
         .with_inner(|ctx| {
-            chat::get_next_media(ctx, msg_id, direction, msg_type, or_msg_type2, or_msg_type3)
+            chat::get_next_media(
+                ctx,
+                MsgId::new(msg_id),
+                direction,
+                msg_type,
+                or_msg_type2,
+                or_msg_type3,
+            )
+            .map(|msg_id| msg_id.to_u32())
+            .unwrap_or(0)
         })
         .unwrap_or(0)
 }
@@ -1149,7 +1317,12 @@ pub unsafe extern "C" fn dc_archive_chat(
         return;
     };
     ffi_context
-        .with_inner(|ctx| chat::archive(ctx, chat_id, archive).log_err(ctx, "Failed archive chat"))
+        .with_inner(|ctx| {
+            ChatId::new(chat_id)
+                .set_archived(ctx, archive)
+                .log_err(ctx, "Failed archive chat")
+                .unwrap_or(())
+        })
         .unwrap_or(())
 }
 
@@ -1161,7 +1334,12 @@ pub unsafe extern "C" fn dc_delete_chat(context: *mut dc_context_t, chat_id: u32
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| chat::delete(ctx, chat_id).log_err(ctx, "Failed chat delete"))
+        .with_inner(|ctx| {
+            ChatId::new(chat_id)
+                .delete(ctx)
+                .log_err(ctx, "Failed chat delete")
+                .unwrap_or(())
+        })
         .unwrap_or(())
 }
 
@@ -1177,7 +1355,7 @@ pub unsafe extern "C" fn dc_get_chat_contacts(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            let arr = dc_array_t::from(chat::get_chat_contacts(ctx, chat_id));
+            let arr = dc_array_t::from(chat::get_chat_contacts(ctx, ChatId::new(chat_id)));
             Box::into_raw(Box::new(arr))
         })
         .unwrap_or_else(|_| ptr::null_mut())
@@ -1196,7 +1374,12 @@ pub unsafe extern "C" fn dc_search_msgs(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            let arr = dc_array_t::from(ctx.search_msgs(chat_id, as_str(query)));
+            let arr = dc_array_t::from(
+                ctx.search_msgs(ChatId::new(chat_id), to_string_lossy(query))
+                    .iter()
+                    .map(|msg_id| msg_id.to_u32())
+                    .collect::<Vec<u32>>(),
+            );
             Box::into_raw(Box::new(arr))
         })
         .unwrap_or_else(|_| ptr::null_mut())
@@ -1210,13 +1393,15 @@ pub unsafe extern "C" fn dc_get_chat(context: *mut dc_context_t, chat_id: u32) -
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| match chat::Chat::load_from_db(ctx, chat_id) {
-            Ok(chat) => {
-                let ffi_chat = ChatWrapper { context, chat };
-                Box::into_raw(Box::new(ffi_chat))
-            }
-            Err(_) => ptr::null_mut(),
-        })
+        .with_inner(
+            |ctx| match chat::Chat::load_from_db(ctx, ChatId::new(chat_id)) {
+                Ok(chat) => {
+                    let ffi_chat = ChatWrapper { context, chat };
+                    Box::into_raw(Box::new(ffi_chat))
+                }
+                Err(_) => ptr::null_mut(),
+            },
+        )
         .unwrap_or_else(|_| ptr::null_mut())
 }
 
@@ -1238,8 +1423,10 @@ pub unsafe extern "C" fn dc_create_group_chat(
     };
     ffi_context
         .with_inner(|ctx| {
-            chat::create_group_chat(ctx, verified, as_str(name))
-                .unwrap_or_log_default(ctx, "Failed to create group chat")
+            chat::create_group_chat(ctx, verified, to_string_lossy(name))
+                .log_err(ctx, "Failed to create group chat")
+                .map(|id| id.to_u32())
+                .unwrap_or(0)
         })
         .unwrap_or(0)
 }
@@ -1256,7 +1443,7 @@ pub unsafe extern "C" fn dc_is_contact_in_chat(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| chat::is_contact_in_chat(ctx, chat_id, contact_id))
+        .with_inner(|ctx| chat::is_contact_in_chat(ctx, ChatId::new(chat_id), contact_id))
         .unwrap_or_default()
         .into()
 }
@@ -1273,7 +1460,9 @@ pub unsafe extern "C" fn dc_add_contact_to_chat(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| chat::add_contact_to_chat(ctx, chat_id, contact_id) as libc::c_int)
+        .with_inner(|ctx| {
+            chat::add_contact_to_chat(ctx, ChatId::new(chat_id), contact_id) as libc::c_int
+        })
         .unwrap_or(0)
 }
 
@@ -1290,7 +1479,7 @@ pub unsafe extern "C" fn dc_remove_contact_from_chat(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::remove_contact_from_chat(ctx, chat_id, contact_id)
+            chat::remove_contact_from_chat(ctx, ChatId::new(chat_id), contact_id)
                 .map(|_| 1)
                 .unwrap_or_log_default(ctx, "Failed to remove contact")
         })
@@ -1310,7 +1499,7 @@ pub unsafe extern "C" fn dc_set_chat_name(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::set_chat_name(ctx, chat_id, as_str(name))
+            chat::set_chat_name(ctx, ChatId::new(chat_id), to_string_lossy(name))
                 .map(|_| 1)
                 .unwrap_or_log_default(ctx, "Failed to set chat name")
         })
@@ -1330,15 +1519,9 @@ pub unsafe extern "C" fn dc_set_chat_profile_image(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::set_chat_profile_image(ctx, chat_id, {
-                if image.is_null() {
-                    ""
-                } else {
-                    as_str(image)
-                }
-            })
-            .map(|_| 1)
-            .unwrap_or_log_default(ctx, "Failed to set profile image")
+            chat::set_chat_profile_image(ctx, ChatId::new(chat_id), to_string_lossy(image))
+                .map(|_| 1)
+                .unwrap_or_log_default(ctx, "Failed to set profile image")
         })
         .unwrap_or(0)
 }
@@ -1354,7 +1537,7 @@ pub unsafe extern "C" fn dc_get_msg_info(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| message::get_msg_info(ctx, msg_id).strdup())
+        .with_inner(|ctx| message::get_msg_info(ctx, MsgId::new(msg_id)).strdup())
         .unwrap_or_else(|_| ptr::null_mut())
 }
 
@@ -1370,9 +1553,9 @@ pub unsafe extern "C" fn dc_get_mime_headers(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            message::get_mime_headers(ctx, msg_id)
+            message::get_mime_headers(ctx, MsgId::new(msg_id))
                 .map(|s| s.strdup())
-                .unwrap_or_else(|| ptr::null_mut())
+                .unwrap_or_else(ptr::null_mut)
         })
         .unwrap_or_else(|_| ptr::null_mut())
 }
@@ -1388,11 +1571,21 @@ pub unsafe extern "C" fn dc_delete_msgs(
         return;
     }
     let ffi_context = &*context;
-
-    let ids = std::slice::from_raw_parts(msg_ids, msg_cnt as usize);
-
+    let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
     ffi_context
-        .with_inner(|ctx| message::delete_msgs(ctx, ids))
+        .with_inner(|ctx| message::delete_msgs(ctx, &msg_ids[..]))
+        .unwrap_or(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_empty_server(context: *mut dc_context_t, flags: u32) {
+    if context.is_null() || flags == 0 {
+        eprintln!("ignoring careless call to dc_empty_server()");
+        return;
+    }
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| message::dc_empty_server(ctx, flags))
         .unwrap_or(())
 }
 
@@ -1411,12 +1604,11 @@ pub unsafe extern "C" fn dc_forward_msgs(
         eprintln!("ignoring careless call to dc_forward_msgs()");
         return;
     }
-    let ids = std::slice::from_raw_parts(msg_ids, msg_cnt as usize);
-
+    let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            chat::forward_msgs(ctx, ids, chat_id)
+            chat::forward_msgs(ctx, &msg_ids[..], ChatId::new(chat_id))
                 .unwrap_or_log_default(ctx, "Failed to forward message")
         })
         .unwrap_or_default()
@@ -1444,11 +1636,10 @@ pub unsafe extern "C" fn dc_markseen_msgs(
         eprintln!("ignoring careless call to dc_markseen_msgs()");
         return;
     }
-    let ids = std::slice::from_raw_parts(msg_ids, msg_cnt as usize);
-
+    let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| message::markseen_msgs(ctx, ids))
+        .with_inner(|ctx| message::markseen_msgs(ctx, &msg_ids[..]))
         .ok();
 }
 
@@ -1463,12 +1654,10 @@ pub unsafe extern "C" fn dc_star_msgs(
         eprintln!("ignoring careless call to dc_star_msgs()");
         return;
     }
-
-    let ids = std::slice::from_raw_parts(msg_ids, msg_cnt as usize);
-
+    let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| message::star_msgs(ctx, ids, star == 1))
+        .with_inner(|ctx| message::star_msgs(ctx, &msg_ids[..], star == 1))
         .ok();
 }
 
@@ -1481,11 +1670,23 @@ pub unsafe extern "C" fn dc_get_msg(context: *mut dc_context_t, msg_id: u32) -> 
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            let message = match message::Message::load_from_db(ctx, msg_id) {
+            let message = match message::Message::load_from_db(ctx, MsgId::new(msg_id)) {
                 Ok(msg) => msg,
                 Err(e) => {
-                    error!(ctx, "Error getting msg #{}: {}", msg_id, e);
-                    return ptr::null_mut();
+                    if msg_id <= constants::DC_MSG_ID_LAST_SPECIAL {
+                        // C-core API returns empty messages, do the same
+                        warn!(
+                            ctx,
+                            "dc_get_msg called with special msg_id={}, returning empty msg", msg_id
+                        );
+                        message::Message::default()
+                    } else {
+                        error!(
+                            ctx,
+                            "dc_get_msg could not retrieve msg_id {}: {}", msg_id, e
+                        );
+                        return ptr::null_mut();
+                    }
                 }
             };
             let ffi_msg = MessageWrapper { context, message };
@@ -1501,7 +1702,7 @@ pub unsafe extern "C" fn dc_may_be_valid_addr(addr: *const libc::c_char) -> libc
         return 0;
     }
 
-    contact::may_be_valid_addr(as_str(addr)) as libc::c_int
+    contact::may_be_valid_addr(&to_string_lossy(addr)) as libc::c_int
 }
 
 #[no_mangle]
@@ -1515,7 +1716,7 @@ pub unsafe extern "C" fn dc_lookup_contact_id_by_addr(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| Contact::lookup_id_by_addr(ctx, as_str(addr)))
+        .with_inner(|ctx| Contact::lookup_id_by_addr(ctx, to_string_lossy(addr)))
         .unwrap_or(0)
 }
 
@@ -1530,12 +1731,14 @@ pub unsafe extern "C" fn dc_create_contact(
         return 0;
     }
     let ffi_context = &*context;
-    let name = if name.is_null() { "" } else { as_str(name) };
+    let name = to_string_lossy(name);
     ffi_context
-        .with_inner(|ctx| match Contact::create(ctx, name, as_str(addr)) {
-            Ok(id) => id,
-            Err(_) => 0,
-        })
+        .with_inner(
+            |ctx| match Contact::create(ctx, name, to_string_lossy(addr)) {
+                Ok(id) => id,
+                Err(_) => 0,
+            },
+        )
         .unwrap_or(0)
 }
 
@@ -1551,7 +1754,7 @@ pub unsafe extern "C" fn dc_add_address_book(
     let ffi_context = &*context;
     ffi_context
         .with_inner(
-            |ctx| match Contact::add_address_book(ctx, as_str(addr_book)) {
+            |ctx| match Contact::add_address_book(ctx, to_string_lossy(addr_book)) {
                 Ok(cnt) => cnt as libc::c_int,
                 Err(_) => 0,
             },
@@ -1570,11 +1773,7 @@ pub unsafe extern "C" fn dc_get_contacts(
         return ptr::null_mut();
     }
     let ffi_context = &*context;
-    let query = if query.is_null() {
-        None
-    } else {
-        Some(as_str(query))
-    };
+    let query = to_opt_string_lossy(query);
     ffi_context
         .with_inner(|ctx| match Contact::get_all(ctx, flags, query) {
             Ok(contacts) => Box::into_raw(Box::new(dc_array_t::from(contacts))),
@@ -1711,7 +1910,7 @@ pub unsafe extern "C" fn dc_imex(
 
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| imex::imex(ctx, what, as_opt_str(param1)))
+        .with_inner(|ctx| imex::imex(ctx, what, to_opt_string_lossy(param1)))
         .ok();
 }
 
@@ -1726,10 +1925,12 @@ pub unsafe extern "C" fn dc_imex_has_backup(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| match imex::has_backup(ctx, as_str(dir)) {
+        .with_inner(|ctx| match imex::has_backup(ctx, to_string_lossy(dir)) {
             Ok(res) => res.strdup(),
             Err(err) => {
-                error!(ctx, "dc_imex_has_backup: {}", err);
+                // do not bubble up error to the user,
+                // the ui will expect that the file does not exist or cannot be accessed
+                warn!(ctx, "dc_imex_has_backup: {}", err);
                 ptr::null_mut()
             }
         })
@@ -1769,15 +1970,16 @@ pub unsafe extern "C" fn dc_continue_key_transfer(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(
-            |ctx| match imex::continue_key_transfer(ctx, msg_id, as_str(setup_code)) {
+        .with_inner(|ctx| {
+            match imex::continue_key_transfer(ctx, MsgId::new(msg_id), &to_string_lossy(setup_code))
+            {
                 Ok(()) => 1,
                 Err(err) => {
                     error!(ctx, "dc_continue_key_transfer: {}", err);
                     0
                 }
-            },
-        )
+            }
+        })
         .unwrap_or(0)
 }
 
@@ -1803,7 +2005,7 @@ pub unsafe extern "C" fn dc_check_qr(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            let lot = qr::check_qr(ctx, as_str(qr));
+            let lot = qr::check_qr(ctx, to_string_lossy(qr));
             Box::into_raw(Box::new(lot))
         })
         .unwrap_or_else(|_| ptr::null_mut())
@@ -1821,8 +2023,8 @@ pub unsafe extern "C" fn dc_get_securejoin_qr(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| {
-            securejoin::dc_get_securejoin_qr(ctx, chat_id)
-                .unwrap_or("".to_string())
+            securejoin::dc_get_securejoin_qr(ctx, ChatId::new(chat_id))
+                .unwrap_or_else(|| "".to_string())
                 .strdup()
         })
         .unwrap_or_else(|_| "".strdup())
@@ -1839,7 +2041,7 @@ pub unsafe extern "C" fn dc_join_securejoin(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| securejoin::dc_join_securejoin(ctx, as_str(qr)))
+        .with_inner(|ctx| securejoin::dc_join_securejoin(ctx, &to_string_lossy(qr)).to_u32())
         .unwrap_or(0)
 }
 
@@ -1855,7 +2057,9 @@ pub unsafe extern "C" fn dc_send_locations_to_chat(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| location::send_locations_to_chat(ctx, chat_id, seconds as i64))
+        .with_inner(|ctx| {
+            location::send_locations_to_chat(ctx, ChatId::new(chat_id), seconds as i64)
+        })
         .ok();
 }
 
@@ -1870,7 +2074,9 @@ pub unsafe extern "C" fn dc_is_sending_locations_to_chat(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| location::is_sending_locations_to_chat(ctx, chat_id) as libc::c_int)
+        .with_inner(|ctx| {
+            location::is_sending_locations_to_chat(ctx, ChatId::new(chat_id)) as libc::c_int
+        })
         .unwrap_or(0)
 }
 
@@ -1888,7 +2094,7 @@ pub unsafe extern "C" fn dc_set_location(
     let ffi_context = &*context;
     ffi_context
         .with_inner(|ctx| location::set(ctx, latitude, longitude, accuracy))
-        .unwrap_or(0)
+        .unwrap_or(false) as _
 }
 
 #[no_mangle]
@@ -1908,7 +2114,7 @@ pub unsafe extern "C" fn dc_get_locations(
         .with_inner(|ctx| {
             let res = location::get_range(
                 ctx,
-                chat_id,
+                ChatId::new(chat_id),
                 contact_id,
                 timestamp_begin as i64,
                 timestamp_end as i64,
@@ -2030,8 +2236,7 @@ pub unsafe extern "C" fn dc_array_get_chat_id(
         eprintln!("ignoring careless call to dc_array_get_chat_id()");
         return 0;
     }
-
-    (*array).get_location(index).chat_id
+    (*array).get_location(index).chat_id.to_u32()
 }
 #[no_mangle]
 pub unsafe extern "C" fn dc_array_get_contact_id(
@@ -2168,7 +2373,7 @@ pub unsafe extern "C" fn dc_chatlist_get_chat_id(
         return 0;
     }
     let ffi_list = &*chatlist;
-    ffi_list.list.get_chat_id(index as usize)
+    ffi_list.list.get_chat_id(index as usize).to_u32()
 }
 
 #[no_mangle]
@@ -2181,7 +2386,11 @@ pub unsafe extern "C" fn dc_chatlist_get_msg_id(
         return 0;
     }
     let ffi_list = &*chatlist;
-    ffi_list.list.get_msg_id(index as usize)
+    ffi_list
+        .list
+        .get_msg_id(index as usize)
+        .map(|msg_id| msg_id.to_u32())
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -2256,7 +2465,7 @@ pub unsafe extern "C" fn dc_chat_get_id(chat: *mut dc_chat_t) -> u32 {
         return 0;
     }
     let ffi_chat = &*chat;
-    ffi_chat.chat.get_id()
+    ffi_chat.chat.get_id().to_u32()
 }
 
 #[no_mangle]
@@ -2352,6 +2561,26 @@ pub unsafe extern "C" fn dc_chat_is_self_talk(chat: *mut dc_chat_t) -> libc::c_i
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_chat_is_device_talk(chat: *mut dc_chat_t) -> libc::c_int {
+    if chat.is_null() {
+        eprintln!("ignoring careless call to dc_chat_is_device_talk()");
+        return 0;
+    }
+    let ffi_chat = &*chat;
+    ffi_chat.chat.is_device_talk() as libc::c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_chat_can_send(chat: *mut dc_chat_t) -> libc::c_int {
+    if chat.is_null() {
+        eprintln!("ignoring careless call to dc_chat_can_send()");
+        return 0;
+    }
+    let ffi_chat = &*chat;
+    ffi_chat.chat.can_send() as libc::c_int
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_chat_is_verified(chat: *mut dc_chat_t) -> libc::c_int {
     if chat.is_null() {
         eprintln!("ignoring careless call to dc_chat_is_verified()");
@@ -2369,6 +2598,42 @@ pub unsafe extern "C" fn dc_chat_is_sending_locations(chat: *mut dc_chat_t) -> l
     }
     let ffi_chat = &*chat;
     ffi_chat.chat.is_sending_locations() as libc::c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_chat_get_info_json(
+    context: *mut dc_context_t,
+    chat_id: u32,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_chat_get_info_json()");
+        return "".strdup();
+    }
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            let chat = match chat::Chat::load_from_db(ctx, ChatId::new(chat_id)) {
+                Ok(chat) => chat,
+                Err(err) => {
+                    error!(ctx, "dc_get_chat_info_json() failed to load chat: {}", err);
+                    return "".strdup();
+                }
+            };
+            let info = match chat.get_info(ctx) {
+                Ok(info) => info,
+                Err(err) => {
+                    error!(
+                        ctx,
+                        "dc_get_chat_info_json() failed to get chat info: {}", err
+                    );
+                    return "".strdup();
+                }
+            };
+            serde_json::to_string(&info)
+                .unwrap_or_log_default(ctx, "dc_get_chat_info_json() failed to serialise to json")
+                .strdup()
+        })
+        .unwrap_or_else(|_| "".strdup())
 }
 
 // dc_msg_t
@@ -2423,7 +2688,7 @@ pub unsafe extern "C" fn dc_msg_get_id(msg: *mut dc_msg_t) -> u32 {
         return 0;
     }
     let ffi_msg = &*msg;
-    ffi_msg.message.get_id()
+    ffi_msg.message.get_id().to_u32()
 }
 
 #[no_mangle]
@@ -2443,7 +2708,7 @@ pub unsafe extern "C" fn dc_msg_get_chat_id(msg: *mut dc_msg_t) -> u32 {
         return 0;
     }
     let ffi_msg = &*msg;
-    ffi_msg.message.get_chat_id()
+    ffi_msg.message.get_chat_id().to_u32()
 }
 
 #[no_mangle]
@@ -2550,7 +2815,7 @@ pub unsafe extern "C" fn dc_msg_get_filemime(msg: *mut dc_msg_t) -> *mut libc::c
     if let Some(x) = ffi_msg.message.get_filemime() {
         x.strdup()
     } else {
-        return dc_strdup(ptr::null());
+        dc_strdup(ptr::null())
     }
 }
 
@@ -2754,8 +3019,7 @@ pub unsafe extern "C" fn dc_msg_set_text(msg: *mut dc_msg_t, text: *const libc::
         return;
     }
     let ffi_msg = &mut *msg;
-    // TODO: {text} equal to NULL is treated as "", which is strange. Does anyone rely on it?
-    ffi_msg.message.set_text(as_opt_str(text).map(Into::into))
+    ffi_msg.message.set_text(to_opt_string_lossy(text))
 }
 
 #[no_mangle]
@@ -2769,7 +3033,10 @@ pub unsafe extern "C" fn dc_msg_set_file(
         return;
     }
     let ffi_msg = &mut *msg;
-    ffi_msg.message.set_file(as_str(file), as_opt_str(filemime))
+    ffi_msg.message.set_file(
+        to_string_lossy(file),
+        to_opt_string_lossy(filemime).as_ref().map(|x| x.as_str()),
+    )
 }
 
 #[no_mangle]
@@ -2940,7 +3207,7 @@ pub unsafe extern "C" fn dc_contact_get_profile_image(
                 .contact
                 .get_profile_image(ctx)
                 .map(|p| p.to_string_lossy().strdup())
-                .unwrap_or_else(|| std::ptr::null_mut())
+                .unwrap_or_else(std::ptr::null_mut)
         })
         .unwrap_or_else(|_| ptr::null_mut())
 }
@@ -3077,9 +3344,9 @@ pub unsafe extern "C" fn dc_decrypt_message_in_memory(
     if let Ok(Ok(msg_parts)) = ffi_context.with_inner(|ctx| {
         e2ee::decrypt_message_in_memory(
             ctx,
-            as_str(content_type),
-            as_str(content),
-            as_str(sender_addr),
+            to_string_lossy(content_type).as_str(),
+            to_string_lossy(content).as_str(),
+            to_string_lossy(sender_addr).as_str(),
         )
     }) {
         if out_total_number_of_parts.is_null() {
@@ -3103,22 +3370,12 @@ pub unsafe extern "C" fn dc_str_unref(s: *mut libc::c_char) {
     libc::free(s as *mut _)
 }
 
-fn as_opt_str<'a>(s: *const libc::c_char) -> Option<&'a str> {
-    if s.is_null() {
-        return None;
-    }
-
-    Some(as_str(s))
-}
-
-pub mod providers;
-
-pub trait ResultExt<T> {
+pub trait ResultExt<T, E> {
     fn unwrap_or_log_default(self, context: &context::Context, message: &str) -> T;
-    fn log_err(&self, context: &context::Context, message: &str);
+    fn log_err(self, context: &context::Context, message: &str) -> Result<T, E>;
 }
 
-impl<T: Default, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
+impl<T: Default, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
     fn unwrap_or_log_default(self, context: &context::Context, message: &str) -> T {
         match self {
             Ok(t) => t,
@@ -3129,10 +3386,11 @@ impl<T: Default, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
         }
     }
 
-    fn log_err(&self, context: &context::Context, message: &str) {
-        if let Err(err) = self {
-            error!(context, "{}: {}", message, err);
-        }
+    fn log_err(self, context: &context::Context, message: &str) -> Result<T, E> {
+        self.map_err(|err| {
+            warn!(context, "{}: {}", message, err);
+            err
+        })
     }
 }
 
@@ -3154,4 +3412,80 @@ impl<T, E> ResultNullableExt<T> for Result<T, E> {
             Err(_) => ptr::null_mut(),
         }
     }
+}
+
+fn convert_and_prune_message_ids(msg_ids: *const u32, msg_cnt: libc::c_int) -> Vec<MsgId> {
+    let ids = unsafe { std::slice::from_raw_parts(msg_ids, msg_cnt as usize) };
+    let msg_ids: Vec<MsgId> = ids
+        .iter()
+        .filter(|id| **id > DC_MSG_ID_LAST_SPECIAL)
+        .map(|id| MsgId::new(*id))
+        .collect();
+
+    msg_ids
+}
+
+// dc_provider_t
+
+#[no_mangle]
+pub type dc_provider_t = provider::Provider;
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_new_from_email(
+    context: *const dc_context_t,
+    addr: *const libc::c_char,
+) -> *const dc_provider_t {
+    if context.is_null() || addr.is_null() {
+        eprintln!("ignoring careless call to dc_provider_new_from_email()");
+        return ptr::null();
+    }
+    let addr = to_string_lossy(addr);
+    match provider::get_provider_info(addr.as_str()) {
+        Some(provider) => provider,
+        None => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_get_overview_page(
+    provider: *const dc_provider_t,
+) -> *mut libc::c_char {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_get_overview_page()");
+        return "".strdup();
+    }
+    let provider = &*provider;
+    provider.overview_page.strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_get_before_login_hint(
+    provider: *const dc_provider_t,
+) -> *mut libc::c_char {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_get_before_login_hint()");
+        return "".strdup();
+    }
+    let provider = &*provider;
+    provider.before_login_hint.strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_get_status(provider: *const dc_provider_t) -> libc::c_int {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_get_status()");
+        return 0;
+    }
+    let provider = &*provider;
+    provider.status as libc::c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_unref(provider: *mut dc_provider_t) {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_unref()");
+        return;
+    }
+    // currently, there is nothing to free, the provider info is a static object.
+    // this may change once we start localizing string.
 }

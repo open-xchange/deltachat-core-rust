@@ -1,33 +1,28 @@
+//! Context module
+
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-
-use libc::uintptr_t;
 
 use crate::chat::*;
 use crate::config::Config;
 use crate::constants::*;
 use crate::contact::*;
-use crate::dc_tools::{dc_copy_file, dc_derive_safe_stem_ext};
 use crate::error::*;
 use crate::events::Event;
 use crate::imap::*;
 use crate::job::*;
-use crate::job_thread::{JobThread, JobThreadKind};
+use crate::job_thread::JobThread;
 use crate::key::*;
 use crate::login_param::LoginParam;
 use crate::lot::Lot;
-use crate::message::{self, Message};
+use crate::message::{self, Message, MessengerMessage, MsgId};
 use crate::param::Params;
-use crate::smtp::*;
+use crate::smtp::Smtp;
 use crate::sql::Sql;
 use crate::webpush::WebPushConfig;
 use crate::coi::CoiDeltachatMode;
-
-use rand::{thread_rng, Rng};
 
 /// Callback function type for [Context]
 ///
@@ -37,21 +32,18 @@ use rand::{thread_rng, Rng};
 /// * `event` - One of the [Event] items.
 /// * `data1` - Depends on the event parameter, see [Event].
 /// * `data2` - Depends on the event parameter, see [Event].
-///
-/// # Returns
-///
-/// This callback must return 0 unless stated otherwise in the event
-/// description at [Event].
-pub type ContextCallback = dyn Fn(&Context, Event) -> uintptr_t + Send + Sync;
+pub type ContextCallback = dyn Fn(&Context, Event) -> () + Send + Sync;
 
 #[derive(DebugStub)]
 pub struct Context {
+    /// Database file path
     dbfile: PathBuf,
+    /// Blob directory path
     blobdir: PathBuf,
     pub sql: Sql,
-    pub inbox: Arc<RwLock<Imap>>,
     pub perform_inbox_jobs_needed: Arc<RwLock<bool>>,
     pub probe_imap_network: Arc<RwLock<bool>>,
+    pub inbox_thread: Arc<RwLock<JobThread>>,
     pub sentbox_thread: Arc<RwLock<JobThread>>,
     pub mvbox_thread: Arc<RwLock<JobThread>>,
     pub smtp: Arc<Mutex<Smtp>>,
@@ -60,14 +52,15 @@ pub struct Context {
     #[debug_stub = "Callback"]
     cb: Box<ContextCallback>,
     pub os_name: Option<String>,
-    pub cmdline_sel_chat_id: Arc<RwLock<u32>>,
+    pub cmdline_sel_chat_id: Arc<RwLock<ChatId>>,
     pub bob: Arc<RwLock<BobStatus>>,
-    pub last_smeared_timestamp: Arc<RwLock<i64>>,
+    pub last_smeared_timestamp: RwLock<i64>,
     pub running_state: Arc<RwLock<RunningState>>,
     /// Mutex to avoid generating the key for the user more than once.
     pub generating_key_mutex: Mutex<()>,
     pub webpush_config: Option<WebPushConfig>,
     pub coi_deltachat_mode: Arc<Mutex<CoiDeltachatMode>>,
+    pub translated_stockstrings: RwLock<HashMap<usize, String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -86,22 +79,16 @@ pub fn get_info() -> HashMap<&'static str, String> {
     let mut res = HashMap::new();
     res.insert("deltachat_core_version", format!("v{}", &*DC_VERSION_STR));
     res.insert("sqlite_version", rusqlite::version().to_string());
-    res.insert(
-        "sqlite_thread_safe",
-        unsafe { rusqlite::ffi::sqlite3_threadsafe() }.to_string(),
-    );
-    res.insert(
-        "arch",
-        (::std::mem::size_of::<*mut libc::c_void>())
-            .wrapping_mul(8)
-            .to_string(),
-    );
+    res.insert("arch", (std::mem::size_of::<usize>() * 8).to_string());
     res.insert("level", "awesome".into());
     res
 }
 
 impl Context {
+    /// Creates new context.
     pub fn new(cb: Box<ContextCallback>, os_name: String, dbfile: PathBuf) -> Result<Context> {
+        pretty_env_logger::try_init_timed().ok();
+
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
         blob_fname.push("-blobs");
@@ -126,7 +113,6 @@ impl Context {
         let ctx = Context {
             blobdir,
             dbfile,
-            inbox: Arc::new(RwLock::new(Imap::new())),
             cb,
             os_name: Some(os_name),
             running_state: Arc::new(RwLock::new(Default::default())),
@@ -135,14 +121,21 @@ impl Context {
             smtp_state: Arc::new((Mutex::new(Default::default()), Condvar::new())),
             oauth2_critical: Arc::new(Mutex::new(())),
             bob: Arc::new(RwLock::new(Default::default())),
-            last_smeared_timestamp: Arc::new(RwLock::new(0)),
-            cmdline_sel_chat_id: Arc::new(RwLock::new(0)),
+            last_smeared_timestamp: RwLock::new(0),
+            cmdline_sel_chat_id: Arc::new(RwLock::new(ChatId::new(0))),
+            inbox_thread: Arc::new(RwLock::new(JobThread::new(
+                "INBOX",
+                "configured_inbox_folder",
+                Imap::new(),
+            ))),
             sentbox_thread: Arc::new(RwLock::new(JobThread::new(
-                JobThreadKind::SentBox,
+                "SENTBOX",
+                "configured_inbox_folder",
                 Imap::new(),
             ))),
             mvbox_thread: Arc::new(RwLock::new(JobThread::new(
-                JobThreadKind::MoveBox,
+                "MVBOX",
+                "configured_inbox_folder",
                 Imap::new(),
             ))),
             probe_imap_network: Arc::new(RwLock::new(false)),
@@ -150,79 +143,29 @@ impl Context {
             generating_key_mutex: Mutex::new(()),
             webpush_config: None,
             coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
+            translated_stockstrings: RwLock::new(HashMap::new()),
         };
 
         ensure!(
-            ctx.sql.open(&ctx, &ctx.dbfile, 0),
+            ctx.sql.open(&ctx, &ctx.dbfile, false),
             "Failed opening sqlite database"
         );
 
         Ok(ctx)
     }
 
+    /// Returns database file path.
     pub fn get_dbfile(&self) -> &Path {
         self.dbfile.as_path()
     }
 
+    /// Returns blob directory path.
     pub fn get_blobdir(&self) -> &Path {
         self.blobdir.as_path()
     }
 
-    pub fn copy_to_blobdir(&self, orig_filename: impl AsRef<str>) -> Result<String> {
-        // return a $BLOBDIR/<filename> with the content of orig_filename
-        // copied into it. The <filename> will be safely derived from
-        // orig_filename, and will not clash with existing filenames.
-        let dest = self.new_blob_file(&orig_filename, b"")?;
-        if dc_copy_file(
-            &self,
-            PathBuf::from(orig_filename.as_ref()),
-            PathBuf::from(&dest),
-        ) {
-            Ok(dest)
-        } else {
-            bail!("could not copy {} to {}", orig_filename.as_ref(), dest);
-        }
-    }
-
-    pub fn new_blob_file(&self, orig_filename: impl AsRef<str>, data: &[u8]) -> Result<String> {
-        // return a $BLOBDIR/<FILENAME> string which corresponds to the
-        // respective file in the blobdir, and which contains the data.
-        // FILENAME is computed by looking and possibly mangling the
-        // basename of orig_filename. The resulting filenames are meant
-        // to be human-readable.
-        let (stem, ext) = dc_derive_safe_stem_ext(orig_filename.as_ref());
-
-        // ext starts with "." or is empty string, so we can always resconstruct
-
-        for i in 0..3 {
-            let candidate_basename = match i {
-                // first a try to just use the (possibly mangled) original basename
-                0 => format!("{}{}", stem, ext),
-
-                // otherwise extend stem with random numbers
-                _ => {
-                    let mut rng = thread_rng();
-                    let random_id: u32 = rng.gen();
-                    format!("{}-{}{}", stem, random_id, ext)
-                }
-            };
-            let path = self.get_blobdir().join(&candidate_basename);
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                file.write_all(data)?;
-                let db_entry = format!("$BLOBDIR/{}", candidate_basename);
-                self.call_cb(Event::NewBlobFile(db_entry.clone()));
-                return Ok(db_entry);
-            }
-        }
-        bail!("out of luck to create new blob file");
-    }
-
-    pub fn call_cb(&self, event: Event) -> uintptr_t {
-        (*self.cb)(self, event)
+    pub fn call_cb(&self, event: Event) {
+        (*self.cb)(self, event);
     }
 
     /*******************************************************************************
@@ -347,6 +290,11 @@ impl Context {
         res.insert("database_version", dbversion.to_string());
         res.insert("blobdir", self.get_blobdir().display().to_string());
         res.insert("display_name", displayname.unwrap_or_else(|| unset.into()));
+        res.insert(
+            "selfavatar",
+            self.get_config(Config::Selfavatar)
+                .unwrap_or_else(|| "<unset>".to_string()),
+        );
         res.insert("is_configured", is_configured.to_string());
         res.insert("entered_account_settings", l.to_string());
         res.insert("used_account_settings", l2.to_string());
@@ -373,24 +321,30 @@ impl Context {
         res
     }
 
-    pub fn get_fresh_msgs(&self) -> Vec<u32> {
+    pub fn get_fresh_msgs(&self) -> Vec<MsgId> {
         let show_deaddrop = 0;
-
         self.sql
             .query_map(
-                "SELECT m.id FROM msgs m LEFT JOIN contacts ct \
-                 ON m.from_id=ct.id LEFT JOIN chats c ON m.chat_id=c.id WHERE m.state=?   \
-                 AND m.hidden=0   \
-                 AND m.chat_id>?   \
-                 AND ct.blocked=0   \
-                 AND (c.blocked=0 OR c.blocked=?) ORDER BY m.timestamp DESC,m.id DESC;",
+                concat!(
+                    "SELECT m.id",
+                    " FROM msgs m",
+                    " LEFT JOIN contacts ct",
+                    "        ON m.from_id=ct.id",
+                    " LEFT JOIN chats c",
+                    "        ON m.chat_id=c.id",
+                    " WHERE m.state=?",
+                    "   AND m.hidden=0",
+                    "   AND m.chat_id>?",
+                    "   AND ct.blocked=0",
+                    "   AND (c.blocked=0 OR c.blocked=?)",
+                    " ORDER BY m.timestamp DESC,m.id DESC;"
+                ),
                 &[10, 9, if 0 != show_deaddrop { 2 } else { 0 }],
-                |row| row.get(0),
+                |row| row.get::<_, MsgId>(0),
                 |rows| {
                     let mut ret = Vec::new();
                     for row in rows {
-                        let id: u32 = row?;
-                        ret.push(id);
+                        ret.push(row?);
                     }
                     Ok(ret)
                 },
@@ -399,7 +353,7 @@ impl Context {
     }
 
     #[allow(non_snake_case)]
-    pub fn search_msgs(&self, chat_id: u32, query: impl AsRef<str>) -> Vec<u32> {
+    pub fn search_msgs(&self, chat_id: ChatId, query: impl AsRef<str>) -> Vec<MsgId> {
         let real_query = query.as_ref().trim();
         if real_query.is_empty() {
             return Vec::new();
@@ -407,26 +361,44 @@ impl Context {
         let strLikeInText = format!("%{}%", real_query);
         let strLikeBeg = format!("{}%", real_query);
 
-        let query = if 0 != chat_id {
-            "SELECT m.id, m.timestamp FROM msgs m LEFT JOIN contacts ct ON m.from_id=ct.id WHERE m.chat_id=?  \
-         AND m.hidden=0  \
-         AND ct.blocked=0 AND (txt LIKE ? OR ct.name LIKE ?) ORDER BY m.timestamp,m.id;"
+        let query = if !chat_id.is_unset() {
+            concat!(
+                "SELECT m.id AS id, m.timestamp AS timestamp",
+                " FROM msgs m",
+                " LEFT JOIN contacts ct",
+                "        ON m.from_id=ct.id",
+                " WHERE m.chat_id=?",
+                "   AND m.hidden=0",
+                "   AND ct.blocked=0",
+                "   AND (txt LIKE ? OR ct.name LIKE ?)",
+                " ORDER BY m.timestamp,m.id;"
+            )
         } else {
-            "SELECT m.id, m.timestamp FROM msgs m LEFT JOIN contacts ct ON m.from_id=ct.id \
-         LEFT JOIN chats c ON m.chat_id=c.id WHERE m.chat_id>9 AND m.hidden=0  \
-         AND (c.blocked=0 OR c.blocked=?) \
-         AND ct.blocked=0 AND (m.txt LIKE ? OR ct.name LIKE ?) ORDER BY m.timestamp DESC,m.id DESC;"
+            concat!(
+                "SELECT m.id AS id, m.timestamp AS timestamp",
+                " FROM msgs m",
+                " LEFT JOIN contacts ct",
+                "        ON m.from_id=ct.id",
+                " LEFT JOIN chats c",
+                "        ON m.chat_id=c.id",
+                " WHERE m.chat_id>9",
+                "   AND m.hidden=0",
+                "   AND (c.blocked=0 OR c.blocked=?)",
+                "   AND ct.blocked=0",
+                "   AND (m.txt LIKE ? OR ct.name LIKE ?)",
+                " ORDER BY m.timestamp DESC,m.id DESC;"
+            )
         };
 
         self.sql
             .query_map(
                 query,
-                params![chat_id as i32, &strLikeInText, &strLikeBeg],
-                |row| row.get::<_, i32>(0),
+                params![chat_id, &strLikeInText, &strLikeBeg],
+                |row| row.get::<_, MsgId>("id"),
                 |rows| {
                     let mut ret = Vec::new();
                     for id in rows {
-                        ret.push(id? as u32);
+                        ret.push(id?);
                     }
                     Ok(ret)
                 },
@@ -457,15 +429,14 @@ impl Context {
         }
     }
 
-    pub fn do_heuristics_moves(&self, folder: &str, msg_id: u32) {
+    pub fn do_heuristics_moves(&self, folder: &str, msg_id: MsgId) {
         if !self.get_config_bool(Config::MvboxMove) {
             return;
         }
 
-        if !self.is_inbox(folder) && !self.is_sentbox(folder) {
+        if self.is_mvbox(folder) {
             return;
         }
-
         if let Ok(msg) = Message::load_from_db(self, msg_id) {
             if msg.is_setupmessage() {
                 // do not move setup messages;
@@ -473,20 +444,17 @@ impl Context {
                 return;
             }
 
-            if self.is_mvbox(folder) {
-                message::update_msg_move_state(self, &msg.rfc724_mid, MoveState::Stay);
-            }
-
-            // 1 = dc message, 2 = reply to dc message
-            if 0 != msg.is_dc_message {
-                job_add(
-                    self,
-                    Action::MoveMsg,
-                    msg.id as libc::c_int,
-                    Params::new(),
-                    0,
-                );
-                message::update_msg_move_state(self, &msg.rfc724_mid, MoveState::Moving);
+            match msg.is_dc_message {
+                MessengerMessage::No => {}
+                MessengerMessage::Yes | MessengerMessage::Reply => {
+                    job_add(
+                        self,
+                        Action::MoveMsg,
+                        msg.id.to_u32() as i32,
+                        Params::new(),
+                        0,
+                    );
+                }
             }
         }
     }
@@ -494,8 +462,8 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        info!(self, "disconnecting INBOX-watch",);
-        self.inbox.read().unwrap().disconnect(self);
+        info!(self, "disconnecting inbox-thread",);
+        self.inbox_thread.read().unwrap().imap.disconnect(self);
         info!(self, "disconnecting sentbox-thread",);
         self.sentbox_thread.read().unwrap().imap.disconnect(self);
         info!(self, "disconnecting mvbox-thread",);
@@ -522,12 +490,25 @@ pub struct BobStatus {
     pub qr_scan: Option<Lot>,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum PerformJobsNeeded {
+    Not,
+    AtOnce,
+    AvoidDos,
+}
+
+impl Default for PerformJobsNeeded {
+    fn default() -> Self {
+        Self::Not
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct SmtpState {
     pub idle: bool,
     pub suspended: bool,
     pub doing_jobs: bool,
-    pub perform_jobs_needed: i32,
+    pub perform_jobs_needed: PerformJobsNeeded,
     pub probe_network: bool,
 }
 
@@ -539,7 +520,6 @@ pub fn get_version_str() -> &'static str {
 mod tests {
     use super::*;
 
-    use crate::dc_tools::*;
     use crate::test_utils::*;
 
     #[test]
@@ -547,7 +527,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         std::fs::write(&dbfile, b"123").unwrap();
-        let res = Context::new(Box::new(|_, _| 0), "FakeOs".into(), dbfile);
+        let res = Context::new(Box::new(|_, _| ()), "FakeOs".into(), dbfile);
         assert!(res.is_err());
     }
 
@@ -562,7 +542,7 @@ mod tests {
     fn test_blobdir_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
-        Context::new(Box::new(|_, _| 0), "FakeOS".into(), dbfile).unwrap();
+        Context::new(Box::new(|_, _| ()), "FakeOS".into(), dbfile).unwrap();
         let blobdir = tmp.path().join("db.sqlite-blobs");
         assert!(blobdir.is_dir());
     }
@@ -573,53 +553,8 @@ mod tests {
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("db.sqlite-blobs");
         std::fs::write(&blobdir, b"123").unwrap();
-        let res = Context::new(Box::new(|_, _| 0), "FakeOS".into(), dbfile);
+        let res = Context::new(Box::new(|_, _| ()), "FakeOS".into(), dbfile);
         assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_new_blob_file() {
-        let t = dummy_context();
-        let context = t.ctx;
-        let x = &context.new_blob_file("hello", b"data").unwrap();
-        assert!(dc_file_exist(&context, x));
-        assert!(x.starts_with("$BLOBDIR"));
-        assert!(dc_read_file(&context, x).unwrap() == b"data");
-
-        let y = &context.new_blob_file("hello", b"data").unwrap();
-        assert!(dc_file_exist(&context, y));
-        assert!(y.starts_with("$BLOBDIR/hello-"));
-
-        let x = &context.new_blob_file("xyz/hello.png", b"data").unwrap();
-        assert!(dc_file_exist(&context, x));
-        assert_eq!(x, "$BLOBDIR/hello.png");
-
-        let y = &context.new_blob_file("hello\\world.png", b"data").unwrap();
-        assert!(dc_file_exist(&context, y));
-        assert_eq!(y, "$BLOBDIR/world.png");
-    }
-
-    #[test]
-    fn test_new_blob_file_long_names() {
-        let t = dummy_context();
-        let context = t.ctx;
-        let s = "12312312039182039182039812039810293810293810293810293801293801293123123";
-        let x = &context.new_blob_file(s, b"data").unwrap();
-        println!("blobfilename '{}'", x);
-        println!("xxxxfilename '{}'", s);
-        assert!(x.len() < s.len());
-        assert!(dc_file_exist(&context, x));
-        assert!(x.starts_with("$BLOBDIR"));
-    }
-
-    #[test]
-    fn test_new_blob_file_unicode() {
-        let t = dummy_context();
-        let context = t.ctx;
-        let s = "helloäworld.qwe";
-        let x = &context.new_blob_file(s, b"data").unwrap();
-        assert_eq!(x, "$BLOBDIR/hello-world.qwe");
-        assert_eq!(dc_read_file(&context, x).unwrap(), b"data");
     }
 
     #[test]
@@ -628,7 +563,7 @@ mod tests {
         let subdir = tmp.path().join("subdir");
         let dbfile = subdir.join("db.sqlite");
         let dbfile2 = dbfile.clone();
-        Context::new(Box::new(|_, _| 0), "FakeOS".into(), dbfile).unwrap();
+        Context::new(Box::new(|_, _| ()), "FakeOS".into(), dbfile).unwrap();
         assert!(subdir.is_dir());
         assert!(dbfile2.is_file());
     }
@@ -638,7 +573,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = PathBuf::new();
-        let res = Context::with_blobdir(Box::new(|_, _| 0), "FakeOS".into(), dbfile, blobdir);
+        let res = Context::with_blobdir(Box::new(|_, _| ()), "FakeOS".into(), dbfile, blobdir);
         assert!(res.is_err());
     }
 
@@ -647,7 +582,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("blobs");
-        let res = Context::with_blobdir(Box::new(|_, _| 0), "FakeOS".into(), dbfile, blobdir);
+        let res = Context::with_blobdir(Box::new(|_, _| ()), "FakeOS".into(), dbfile, blobdir);
         assert!(res.is_err());
     }
 

@@ -1,6 +1,7 @@
 use std::convert::{From, TryFrom};
 use strum_macros::{AsRefStr, Display, EnumString};
 
+// #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CoiMessageFilter {

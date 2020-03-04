@@ -1,3 +1,5 @@
+//! Cryptographic key module
+
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
@@ -11,6 +13,7 @@ use crate::context::Context;
 use crate::dc_tools::*;
 use crate::sql::{self, Sql};
 
+/// Cryptographic key
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Key {
     Public(SignedPublicKey),
@@ -29,44 +32,44 @@ impl From<SignedSecretKey> for Key {
     }
 }
 
-impl std::convert::TryInto<SignedSecretKey> for Key {
+impl std::convert::TryFrom<Key> for SignedSecretKey {
     type Error = ();
 
-    fn try_into(self) -> Result<SignedSecretKey, Self::Error> {
-        match self {
+    fn try_from(value: Key) -> Result<Self, Self::Error> {
+        match value {
             Key::Public(_) => Err(()),
             Key::Secret(key) => Ok(key),
         }
     }
 }
 
-impl<'a> std::convert::TryInto<&'a SignedSecretKey> for &'a Key {
+impl<'a> std::convert::TryFrom<&'a Key> for &'a SignedSecretKey {
     type Error = ();
 
-    fn try_into(self) -> Result<&'a SignedSecretKey, Self::Error> {
-        match self {
+    fn try_from(value: &'a Key) -> Result<Self, Self::Error> {
+        match value {
             Key::Public(_) => Err(()),
             Key::Secret(key) => Ok(key),
         }
     }
 }
 
-impl std::convert::TryInto<SignedPublicKey> for Key {
+impl std::convert::TryFrom<Key> for SignedPublicKey {
     type Error = ();
 
-    fn try_into(self) -> Result<SignedPublicKey, Self::Error> {
-        match self {
+    fn try_from(value: Key) -> Result<Self, Self::Error> {
+        match value {
             Key::Public(key) => Ok(key),
             Key::Secret(_) => Err(()),
         }
     }
 }
 
-impl<'a> std::convert::TryInto<&'a SignedPublicKey> for &'a Key {
+impl<'a> std::convert::TryFrom<&'a Key> for &'a SignedPublicKey {
     type Error = ();
 
-    fn try_into(self) -> Result<&'a SignedPublicKey, Self::Error> {
-        match self {
+    fn try_from(value: &'a Key) -> Result<Self, Self::Error> {
+        match value {
             Key::Public(key) => Ok(key),
             Key::Secret(_) => Err(()),
         }
@@ -175,21 +178,9 @@ impl Key {
         }
     }
 
-    pub fn to_base64(&self, break_every: usize) -> String {
+    pub fn to_base64(&self) -> String {
         let buf = self.to_bytes();
-
-        let encoded = base64::encode(&buf);
-        encoded
-            .as_bytes()
-            .chunks(break_every)
-            .fold(String::new(), |mut res, buf| {
-                // safe because we are using a base64 encoded string
-                res += unsafe { std::str::from_utf8_unchecked(buf) };
-                res += " ";
-                res
-            })
-            .trim()
-            .to_string()
+        base64::encode(&buf)
     }
 
     pub fn to_armored_string(
@@ -214,15 +205,18 @@ impl Key {
             .expect("failed to serialize key")
     }
 
-    pub fn write_asc_to_file(&self, file: impl AsRef<Path>, context: &Context) -> bool {
+    pub fn write_asc_to_file(
+        &self,
+        file: impl AsRef<Path>,
+        context: &Context,
+    ) -> std::io::Result<()> {
         let file_content = self.to_asc(None).into_bytes();
 
-        if dc_write_file(context, &file, &file_content) {
-            true
-        } else {
+        let res = dc_write_file(context, &file, &file_content);
+        if res.is_err() {
             error!(context, "Cannot write key to {}", file.as_ref().display());
-            false
         }
+        res
     }
 
     pub fn fingerprint(&self) -> String {
@@ -381,7 +375,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     #[test]
     #[ignore] // is too expensive
     fn test_from_slice_roundtrip() {
-        let (public_key, private_key) = crate::pgp::dc_pgp_create_keypair("hello").unwrap();
+        let (public_key, private_key) = crate::pgp::create_keypair("hello").unwrap();
 
         let binary = public_key.to_bytes();
         let public_key2 = Key::from_slice(&binary, KeyType::Public).expect("invalid public key");
@@ -416,7 +410,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     #[test]
     #[ignore] // is too expensive
     fn test_ascii_roundtrip() {
-        let (public_key, private_key) = crate::pgp::dc_pgp_create_keypair("hello").unwrap();
+        let (public_key, private_key) = crate::pgp::create_keypair("hello").unwrap();
 
         let s = public_key.to_armored_string(None).unwrap();
         let (public_key2, _) =

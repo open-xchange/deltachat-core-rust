@@ -4,6 +4,7 @@ import pytest
 import requests
 import time
 from deltachat import Account
+from deltachat import const
 from deltachat.capi import lib
 import tempfile
 
@@ -84,16 +85,21 @@ class SessionLiveConfigFromFile:
 class SessionLiveConfigFromURL:
     def __init__(self, url, create_token):
         self.configlist = []
-        for i in range(2):
-            res = requests.post(url, json={"token_create_user": int(create_token)})
+        self.url = url
+        self.create_token = create_token
+
+    def get(self, index):
+        try:
+            return self.configlist[index]
+        except IndexError:
+            assert index == len(self.configlist), index
+            res = requests.post(self.url, json={"token_create_user": int(self.create_token)})
             if res.status_code != 200:
                 pytest.skip("creating newtmpuser failed {!r}".format(res))
             d = res.json()
             config = dict(addr=d["email"], mail_pw=d["password"])
             self.configlist.append(config)
-
-    def get(self, index):
-        return self.configlist[index]
+            return config
 
     def exists(self):
         return bool(self.configlist)
@@ -164,8 +170,8 @@ def acfactory(pytestconfig, tmpdir, request, session_liveconfig):
                 configdict["e2ee_enabled"] = "1"
 
             # Enable strict certificate checks for online accounts
-            configdict["imap_certificate_checks"] = "1"
-            configdict["smtp_certificate_checks"] = "1"
+            configdict["imap_certificate_checks"] = str(const.DC_CERTCK_STRICT)
+            configdict["smtp_certificate_checks"] = str(const.DC_CERTCK_STRICT)
 
             tmpdb = tmpdir.join("livedb%d" % self.live_count)
             ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.live_count))
@@ -178,6 +184,12 @@ def acfactory(pytestconfig, tmpdir, request, session_liveconfig):
             ac.configure(**configdict)
             ac.start_threads(mvbox=mvbox, sentbox=sentbox)
             return ac
+
+        def get_one_online_account(self):
+            ac1 = self.get_online_configuring_account()
+            wait_successful_IMAP_SMTP_connection(ac1)
+            wait_configuration_progress(ac1, 1000)
+            return ac1
 
         def get_two_online_accounts(self):
             ac1 = self.get_online_configuring_account()
@@ -194,7 +206,7 @@ def acfactory(pytestconfig, tmpdir, request, session_liveconfig):
             ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.live_count))
             ac._evlogger.init_time = self.init_time
             ac._evlogger.set_timeout(30)
-            ac.configure(addr=account.get_config("addr"), mail_pw=account.get_config("mail_pw"))
+            ac.configure(addr=account.get_config("addr"), mail_pw=account.get_config("mail_pw"), mail_server=account.get_config("mail_server"), mail_user=account.get_config("mail_user"), send_server=account.get_config("send_server"), mail_port=account.get_config("mail_port"), send_port=account.get_config("send_port"), send_user=account.get_config("send_user"), server_flags=account.get_config("server_flags"))
             ac.start_threads()
             return ac
 

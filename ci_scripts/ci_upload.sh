@@ -7,9 +7,9 @@ fi
 
 set -xe
 
-#DOXYDOCDIR=${1:?directory where doxygen docs to be found}
 PYDOCDIR=${1:?directory with python docs}
 WHEELHOUSEDIR=${2:?directory with pre-built wheels}
+DOXYDOCDIR=${3:?directory where doxygen docs to be found}
 
 export BRANCH=${CIRCLE_BRANCH:?specify branch for uploading purposes}
 
@@ -17,15 +17,18 @@ export BRANCH=${CIRCLE_BRANCH:?specify branch for uploading purposes}
 # python docs to py.delta.chat
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null delta@py.delta.chat mkdir -p build/${BRANCH}
 rsync -avz \
+  --delete \
   -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   "$PYDOCDIR/html/" \
   delta@py.delta.chat:build/${BRANCH}
 
 # C docs to c.delta.chat
-#rsync -avz \
-#  -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-#  "$DOXYDOCDIR/html/" \
-#  delta@py.delta.chat:build-c/${BRANCH}
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null delta@c.delta.chat mkdir -p build-c/${BRANCH}
+rsync -avz \
+  --delete \
+  -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+  "$DOXYDOCDIR/html/" \
+  delta@c.delta.chat:build-c/${BRANCH}
 
 echo -----------------------
 echo upload wheels 
@@ -34,6 +37,7 @@ echo -----------------------
 # Bundle external shared libraries into the wheels
 pushd $WHEELHOUSEDIR
 
+pip3 install -U pip
 pip3 install devpi-client
 devpi use https://m.devpi.net
 devpi login dc --password $DEVPI_LOGIN
@@ -45,6 +49,9 @@ devpi use dc/$N_BRANCH || {
     devpi use dc/$N_BRANCH
 }
 devpi index $N_BRANCH bases=/root/pypi
-devpi upload deltachat*.whl
+devpi upload deltachat*
 
 popd
+
+# remove devpi non-master dc indices if thy are too old
+python ci_scripts/cleanup_devpi_indices.py

@@ -20,6 +20,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use deltachat::chat::ChatId;
 use deltachat::config;
 use deltachat::configure::*;
 use deltachat::context::*;
@@ -41,9 +42,8 @@ use self::cmdline::*;
 
 // Event Handler
 
-fn receive_event(_context: &Context, event: Event) -> libc::uintptr_t {
+fn receive_event(_context: &Context, event: Event) {
     match event {
-        Event::GetString { .. } => {}
         Event::Info(msg) => {
             /* do not show the event as this would fill the screen */
             println!("{}", msg);
@@ -112,8 +112,6 @@ fn receive_event(_context: &Context, event: Event) -> libc::uintptr_t {
             print!("\x1b[33m{{Received {:?}}}\n\x1b[0m", event);
         }
     }
-
-    0
 }
 
 // Threads for waiting for messages and for jobs
@@ -151,11 +149,11 @@ fn start_threads(c: Arc<RwLock<Context>>) {
     let ctx = c.clone();
     let handle_imap = std::thread::spawn(move || loop {
         while_running!({
-            perform_imap_jobs(&ctx.read().unwrap());
-            perform_imap_fetch(&ctx.read().unwrap());
+            perform_inbox_jobs(&ctx.read().unwrap());
+            perform_inbox_fetch(&ctx.read().unwrap());
             while_running!({
                 let context = ctx.read().unwrap();
-                perform_imap_idle(&context);
+                perform_inbox_idle(&context);
             });
         });
     });
@@ -203,7 +201,7 @@ fn stop_threads(context: &Context) {
         println!("Stopping threads");
         IS_RUNNING.store(false, Ordering::Relaxed);
 
-        interrupt_imap_idle(context);
+        interrupt_inbox_idle(context);
         interrupt_mvbox_idle(context);
         interrupt_sentbox_idle(context);
         interrupt_smtp_idle(context);
@@ -236,7 +234,7 @@ impl Completer for DcHelper {
     }
 }
 
-const IMEX_COMMANDS: [&'static str; 12] = [
+const IMEX_COMMANDS: [&str; 12] = [
     "initiate-key-transfer",
     "get-setupcodebegin",
     "continue-key-transfer",
@@ -251,7 +249,7 @@ const IMEX_COMMANDS: [&'static str; 12] = [
     "stop",
 ];
 
-const DB_COMMANDS: [&'static str; 11] = [
+const DB_COMMANDS: [&str; 11] = [
     "info",
     "open",
     "close",
@@ -265,7 +263,7 @@ const DB_COMMANDS: [&'static str; 11] = [
     "housekeeping",
 ];
 
-const CHAT_COMMANDS: [&'static str; 24] = [
+const CHAT_COMMANDS: [&str; 24] = [
     "listchats",
     "listarchived",
     "chat",
@@ -291,7 +289,7 @@ const CHAT_COMMANDS: [&'static str; 24] = [
     "unarchive",
     "delchat",
 ];
-const MESSAGE_COMMANDS: [&'static str; 8] = [
+const MESSAGE_COMMANDS: [&str; 8] = [
     "listmsgs",
     "msginfo",
     "listfresh",
@@ -301,7 +299,7 @@ const MESSAGE_COMMANDS: [&'static str; 8] = [
     "unstar",
     "delmsg",
 ];
-const CONTACT_COMMANDS: [&'static str; 6] = [
+const CONTACT_COMMANDS: [&str; 6] = [
     "listcontacts",
     "listverified",
     "addcontact",
@@ -309,7 +307,7 @@ const CONTACT_COMMANDS: [&'static str; 6] = [
     "delcontact",
     "cleanupcontacts",
 ];
-const MISC_COMMANDS: [&'static str; 9] = [
+const MISC_COMMANDS: [&str; 9] = [
     "getqr", "getbadqr", "checkqr", "event", "fileinfo", "clear", "exit", "quit", "help",
 ];
 
@@ -335,8 +333,8 @@ impl Hinter for DcHelper {
     }
 }
 
-static COLORED_PROMPT: &'static str = "\x1b[1;32m> \x1b[0m";
-static PROMPT: &'static str = "> ";
+static COLORED_PROMPT: &str = "\x1b[1;32m> \x1b[0m";
+static PROMPT: &str = "> ";
 
 impl Highlighter for DcHelper {
     fn highlight_prompt<'p>(&self, prompt: &'p str) -> Cow<'p, str> {
@@ -404,7 +402,7 @@ fn main_0(args: Vec<String>) -> Result<(), failure::Error> {
                 // TODO: ignore "set mail_pw"
                 rl.add_history_entry(line.as_str());
                 let ctx = ctx.clone();
-                match unsafe { handle_cmd(line.trim(), ctx) } {
+                match handle_cmd(line.trim(), ctx) {
                     Ok(ExitResult::Continue) => {}
                     Ok(ExitResult::Exit) => break,
                     Err(err) => println!("Error: {}", err),
@@ -435,7 +433,7 @@ enum ExitResult {
     Exit,
 }
 
-unsafe fn handle_cmd(line: &str, ctx: Arc<RwLock<Context>>) -> Result<ExitResult, failure::Error> {
+fn handle_cmd(line: &str, ctx: Arc<RwLock<Context>>) -> Result<ExitResult, failure::Error> {
     let mut args = line.splitn(2, ' ');
     let arg0 = args.next().unwrap_or_default();
     let arg1 = args.next().unwrap_or_default();
@@ -456,9 +454,9 @@ unsafe fn handle_cmd(line: &str, ctx: Arc<RwLock<Context>>) -> Result<ExitResult
         }
         "imap-jobs" => {
             if HANDLE.clone().lock().unwrap().is_some() {
-                println!("imap-jobs are already running in a thread.");
+                println!("inbox-jobs are already running in a thread.");
             } else {
-                perform_imap_jobs(&ctx.read().unwrap());
+                perform_inbox_jobs(&ctx.read().unwrap());
             }
         }
         "configure" => {
@@ -487,9 +485,10 @@ unsafe fn handle_cmd(line: &str, ctx: Arc<RwLock<Context>>) -> Result<ExitResult
         }
         "getqr" | "getbadqr" => {
             start_threads(ctx.clone());
-            if let Some(mut qr) =
-                dc_get_securejoin_qr(&ctx.read().unwrap(), arg1.parse().unwrap_or_default())
-            {
+            if let Some(mut qr) = dc_get_securejoin_qr(
+                &ctx.read().unwrap(),
+                ChatId::new(arg1.parse().unwrap_or_default()),
+            ) {
                 if !qr.is_empty() {
                     if arg0 == "getbadqr" && qr.len() > 40 {
                         qr.replace_range(12..22, "0000000000")

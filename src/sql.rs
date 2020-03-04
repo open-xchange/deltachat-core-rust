@@ -1,3 +1,5 @@
+//! # SQLite wrapper
+
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -5,13 +7,56 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, Statement, NO_PARAMS};
 use thread_local_object::ThreadLocal;
 
+use crate::chat::{update_device_icon, update_saved_messages_icon};
+use crate::constants::ShowEmails;
 use crate::context::Context;
 use crate::dc_tools::*;
-use crate::error::{Error, Result};
 use crate::param::*;
 use crate::peerstate::*;
 
-const DC_OPEN_READONLY: usize = 0x01;
+#[derive(Debug, Fail)]
+pub enum Error {
+    #[fail(display = "Sqlite Error: {:?}", _0)]
+    Sql(#[cause] rusqlite::Error),
+    #[fail(display = "Sqlite Connection Pool Error: {:?}", _0)]
+    ConnectionPool(#[cause] r2d2::Error),
+    #[fail(display = "Sqlite: Connection closed")]
+    SqlNoConnection,
+    #[fail(display = "Sqlite: Already open")]
+    SqlAlreadyOpen,
+    #[fail(display = "Sqlite: Failed to open")]
+    SqlFailedToOpen,
+    #[fail(display = "{:?}", _0)]
+    Io(#[cause] std::io::Error),
+    #[fail(display = "{:?}", _0)]
+    BlobError(#[cause] crate::blob::BlobError),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Error {
+        Error::Sql(err)
+    }
+}
+
+impl From<r2d2::Error> for Error {
+    fn from(err: r2d2::Error) -> Error {
+        Error::ConnectionPool(err)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Error::Io(err)
+    }
+}
+
+impl From<crate::blob::BlobError> for Error {
+    fn from(err: crate::blob::BlobError) -> Error {
+        Error::BlobError(err)
+    }
+}
 
 /// A wrapper around the underlying Sqlite3 object.
 #[derive(DebugStub)]
@@ -21,12 +66,18 @@ pub struct Sql {
     in_use: Arc<ThreadLocal<String>>,
 }
 
-impl Sql {
-    pub fn new() -> Sql {
-        Sql {
+impl Default for Sql {
+    fn default() -> Self {
+        Self {
             pool: RwLock::new(None),
             in_use: Arc::new(ThreadLocal::new()),
         }
+    }
+}
+
+impl Sql {
+    pub fn new() -> Sql {
+        Self::default()
     }
 
     pub fn is_open(&self) -> bool {
@@ -42,10 +93,10 @@ impl Sql {
     }
 
     // return true on success, false on failure
-    pub fn open(&self, context: &Context, dbfile: &std::path::Path, flags: libc::c_int) -> bool {
-        match open(context, self, dbfile, flags) {
+    pub fn open(&self, context: &Context, dbfile: &std::path::Path, readonly: bool) -> bool {
+        match open(context, self, dbfile, readonly) {
             Ok(_) => true,
-            Err(Error::SqlAlreadyOpen) => false,
+            Err(crate::error::Error::SqlError(Error::SqlAlreadyOpen)) => false,
             Err(_) => {
                 self.close(context);
                 false
@@ -94,8 +145,7 @@ impl Sql {
         self.start_stmt(sql.to_string());
         self.with_conn(|conn| {
             let stmt = conn.prepare(sql)?;
-            let res = g(stmt, conn)?;
-            Ok(res)
+            g(stmt, conn)
         })
     }
 
@@ -108,8 +158,7 @@ impl Sql {
             let stmt1 = conn.prepare(sql1)?;
             let stmt2 = conn.prepare(sql2)?;
 
-            let res = g(stmt1, stmt2, conn)?;
-            Ok(res)
+            g(stmt1, stmt2, conn)
         })
     }
 
@@ -168,20 +217,37 @@ impl Sql {
             .unwrap_or_default()
     }
 
-    pub fn query_get_value<P, T>(&self, context: &Context, query: &str, params: P) -> Option<T>
+    /// Executes a query which is expected to return one row and one
+    /// column. If the query does not return a value or returns SQL
+    /// `NULL`, returns `Ok(None)`.
+    pub fn query_get_value_result<P, T>(&self, query: &str, params: P) -> Result<Option<T>>
     where
         P: IntoIterator,
         P::Item: rusqlite::ToSql,
         T: rusqlite::types::FromSql,
     {
         match self.query_row(query, params, |row| row.get::<_, T>(0)) {
-            Ok(res) => Some(res),
-            Err(Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => None,
+            Ok(res) => Ok(Some(res)),
+            Err(Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
             Err(Error::Sql(rusqlite::Error::InvalidColumnType(
                 _,
                 _,
                 rusqlite::types::Type::Null,
-            ))) => None,
+            ))) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Not resultified version of `query_get_value_result`. Returns
+    /// `None` on error.
+    pub fn query_get_value<P, T>(&self, context: &Context, query: &str, params: P) -> Option<T>
+    where
+        P: IntoIterator,
+        P::Item: rusqlite::ToSql,
+        T: rusqlite::types::FromSql,
+    {
+        match self.query_get_value_result(query, params) {
+            Ok(res) => res,
             Err(err) => {
                 error!(context, "sql: Failed query_row: {}", err);
                 None
@@ -316,23 +382,24 @@ fn table_exists(conn: &Connection, name: impl AsRef<str>) -> Result<bool> {
     Ok(exists)
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn open(
     context: &Context,
     sql: &Sql,
     dbfile: impl AsRef<std::path::Path>,
-    flags: libc::c_int,
-) -> Result<()> {
+    readonly: bool,
+) -> crate::error::Result<()> {
     if sql.is_open() {
         error!(
             context,
             "Cannot open, database \"{:?}\" already opened.",
             dbfile.as_ref(),
         );
-        return Err(Error::SqlAlreadyOpen);
+        return Err(Error::SqlAlreadyOpen.into());
     }
 
     let mut open_flags = OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    if 0 != (flags & DC_OPEN_READONLY as i32) {
+    if readonly {
         open_flags.insert(OpenFlags::SQLITE_OPEN_READ_ONLY);
     } else {
         open_flags.insert(OpenFlags::SQLITE_OPEN_READ_WRITE);
@@ -345,14 +412,15 @@ fn open(
         .min_idle(Some(2))
         .max_size(10)
         .connection_timeout(std::time::Duration::new(60, 0))
-        .build(mgr)?;
+        .build(mgr)
+        .map_err(Error::ConnectionPool)?;
 
     {
         *sql.pool.write().unwrap() = Some(pool);
     }
 
-    if 0 == flags & DC_OPEN_READONLY as i32 {
-        let mut exists_before_update = 0;
+    if !readonly {
+        let mut exists_before_update = false;
         let mut dbversion_before_update = 0;
         /* Init tables to dbversion=0 */
         if !sql.table_exists("config") {
@@ -387,8 +455,8 @@ fn open(
             )?;
             sql.execute(
                 "INSERT INTO contacts (id,name,origin) VALUES \
-                 (1,'self',262144), (2,'device',262144), (3,'rsvd',262144), \
-                 (4,'rsvd',262144), (5,'rsvd',262144), (6,'rsvd',262144), \
+                 (1,'self',262144), (2,'info',262144), (3,'rsvd',262144), \
+                 (4,'rsvd',262144), (5,'device',262144), (6,'rsvd',262144), \
                  (7,'rsvd',262144), (8,'rsvd',262144), (9,'rsvd',262144);",
                 params![],
             )?;
@@ -477,12 +545,12 @@ fn open(
                     dbfile.as_ref(),
                 );
                 // cannot create the tables - maybe we cannot write?
-                return Err(Error::SqlFailedToOpen);
+                return Err(Error::SqlFailedToOpen.into());
             } else {
                 sql.set_raw_config_int(context, "dbversion", 0)?;
             }
         } else {
-            exists_before_update = 1;
+            exists_before_update = true;
             dbversion_before_update = sql
                 .get_raw_config_int(context, "dbversion")
                 .unwrap_or_default();
@@ -492,9 +560,10 @@ fn open(
         // this should be done before updates that use high-level objects that
         // rely themselves on the low-level structure.
         // --------------------------------------------------------------------
+
         let mut dbversion = dbversion_before_update;
-        let mut recalc_fingerprints = 0;
-        let mut update_file_paths = 0;
+        let mut recalc_fingerprints = false;
+        let mut update_icons = false;
 
         if dbversion < 1 {
             info!(context, "[migration] v1");
@@ -592,6 +661,8 @@ fn open(
         }
         if dbversion < 27 {
             info!(context, "[migration] v27");
+            // chat.id=1 and chat.id=2 are the old deaddrops,
+            // the current ones are defined by chats.blocked=2
             sql.execute("DELETE FROM msgs WHERE chat_id=1 OR chat_id=2;", params![])?;
             sql.execute(
                 "CREATE INDEX chats_contacts_index2 ON chats_contacts (contact_id);",
@@ -634,7 +705,7 @@ fn open(
                 "CREATE INDEX acpeerstates_index4 ON acpeerstates (gossip_key_fingerprint);",
                 params![],
             )?;
-            recalc_fingerprints = 1;
+            recalc_fingerprints = true;
             dbversion = 34;
             sql.set_raw_config_int(context, "dbversion", 34)?;
         }
@@ -656,16 +727,6 @@ fn open(
                 "CREATE INDEX acpeerstates_index5 ON acpeerstates (verified_key_fingerprint);",
                 params![],
             )?;
-            if dbversion_before_update == 34 {
-                sql.execute(
-                    "UPDATE acpeerstates SET verified_key=gossip_key, verified_key_fingerprint=gossip_key_fingerprint WHERE gossip_key_verified=2;",
-                    params![]
-                )?;
-                sql.execute(
-                    "UPDATE acpeerstates SET verified_key=public_key, verified_key_fingerprint=public_key_fingerprint WHERE public_key_verified=2;",
-                    params![]
-                )?;
-            }
             dbversion = 39;
             sql.set_raw_config_int(context, "dbversion", 39)?;
         }
@@ -677,18 +738,6 @@ fn open(
             )?;
             dbversion = 40;
             sql.set_raw_config_int(context, "dbversion", 40)?;
-        }
-        if dbversion < 41 {
-            info!(context, "[migration] v41");
-            update_file_paths = 1;
-            dbversion = 41;
-            sql.set_raw_config_int(context, "dbversion", 41)?;
-        }
-        if dbversion < 42 {
-            info!(context, "[migration] v42");
-            sql.execute("UPDATE msgs SET txt='' WHERE type!=10", params![])?;
-            dbversion = 42;
-            sql.set_raw_config_int(context, "dbversion", 42)?;
         }
         if dbversion < 44 {
             info!(context, "[migration] v44");
@@ -720,6 +769,7 @@ fn open(
         }
         if dbversion < 48 {
             info!(context, "[migration] v48");
+            // NOTE: move_state is not used anymore
             sql.execute(
                 "ALTER TABLE msgs ADD COLUMN move_state INTEGER DEFAULT 1;",
                 params![],
@@ -739,14 +789,19 @@ fn open(
         }
         if dbversion < 50 {
             info!(context, "[migration] v50");
-            if 0 != exists_before_update {
-                sql.set_raw_config_int(context, "show_emails", 2)?;
+            // installations <= 0.100.1 used DC_SHOW_EMAILS_ALL implicitly;
+            // keep this default and use DC_SHOW_EMAILS_NO
+            // only for new installations
+            if exists_before_update {
+                sql.set_raw_config_int(context, "show_emails", ShowEmails::All as i32)?;
             }
             dbversion = 50;
             sql.set_raw_config_int(context, "dbversion", 50)?;
         }
         if dbversion < 53 {
             info!(context, "[migration] v53");
+            // the messages containing _only_ locations
+            // are also added to the database as _hidden_.
             sql.execute(
                 "CREATE TABLE locations ( id INTEGER PRIMARY KEY AUTOINCREMENT, latitude REAL DEFAULT 0.0, longitude REAL DEFAULT 0.0, accuracy REAL DEFAULT 0.0, timestamp INTEGER DEFAULT 0, chat_id INTEGER DEFAULT 0, from_id INTEGER DEFAULT 0);",
                 params![]
@@ -794,11 +849,48 @@ fn open(
                 "ALTER TABLE locations ADD COLUMN independent INTEGER DEFAULT 0;",
                 params![],
             )?;
-
             sql.set_raw_config_int(context, "dbversion", 55)?;
         }
+        if dbversion < 59 {
+            info!(context, "[migration] v59");
+            // records in the devmsglabels are kept when the message is deleted.
+            // so, msg_id may or may not exist.
+            sql.execute(
+                "CREATE TABLE devmsglabels (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, msg_id INTEGER DEFAULT 0);",
+                NO_PARAMS,
+            )?;
+            sql.execute(
+                "CREATE INDEX devmsglabels_index1 ON devmsglabels (label);",
+                NO_PARAMS,
+            )?;
+            if exists_before_update && sql.get_raw_config_int(context, "bcc_self").is_none() {
+                sql.set_raw_config_int(context, "bcc_self", 1)?;
+            }
+            sql.set_raw_config_int(context, "dbversion", 59)?;
+        }
+        if dbversion < 60 {
+            info!(context, "[migration] v60");
+            sql.execute(
+                "ALTER TABLE chats ADD COLUMN created_timestamp INTEGER DEFAULT 0;",
+                NO_PARAMS,
+            )?;
+            sql.set_raw_config_int(context, "dbversion", 60)?;
+        }
+        if dbversion < 61 {
+            info!(context, "[migration] v61");
+            sql.execute(
+                "ALTER TABLE contacts ADD COLUMN selfavatar_sent INTEGER DEFAULT 0;",
+                NO_PARAMS,
+            )?;
+            update_icons = true;
+            sql.set_raw_config_int(context, "dbversion", 61)?;
+        }
 
-        if 0 != recalc_fingerprints {
+        // (2) updates that require high-level objects
+        // (the structure is complete now and all objects are usable)
+        // --------------------------------------------------------------------
+
+        if recalc_fingerprints {
             info!(context, "[migration] recalc fingerprints");
             sql.query_map(
                 "SELECT addr FROM acpeerstates;",
@@ -816,33 +908,9 @@ fn open(
                 },
             )?;
         }
-        if 0 != update_file_paths {
-            // versions before 2018-08 save the absolute paths in the database files at "param.f=";
-            // for newer versions, we copy files always to the blob directory and store relative paths.
-            // this snippet converts older databases and can be removed after some time.
-            info!(context, "[migration] update file paths");
-            let repl_from = sql
-                .get_raw_config(context, "backup_for")
-                .unwrap_or_else(|| context.get_blobdir().to_string_lossy().into());
-
-            let repl_from = dc_ensure_no_slash_safe(&repl_from);
-            sql.execute(
-                &format!(
-                    "UPDATE msgs SET param=replace(param, 'f={}/', 'f=$BLOBDIR/')",
-                    repl_from
-                ),
-                NO_PARAMS,
-            )?;
-
-            sql.execute(
-                &format!(
-                    "UPDATE chats SET param=replace(param, 'i={}/', 'i=$BLOBDIR/');",
-                    repl_from
-                ),
-                NO_PARAMS,
-            )?;
-
-            sql.set_raw_config(context, "backup_for", None)?;
+        if update_icons {
+            update_saved_messages_icon(context)?;
+            update_device_icon(context)?;
         }
     }
 
@@ -909,13 +977,12 @@ pub fn get_rowid_with_conn(
     // the ORDER BY ensures, this function always returns the most recent id,
     // eg. if a Message-ID is split into different messages.
     let query = format!(
-        "SELECT id FROM {} WHERE {}='{}' ORDER BY id DESC",
+        "SELECT id FROM {} WHERE {}=? ORDER BY id DESC",
         table.as_ref(),
         field.as_ref(),
-        value.as_ref()
     );
 
-    match conn.query_row(&query, NO_PARAMS, |row| row.get::<_, u32>(0)) {
+    match conn.query_row(&query, params![value.as_ref()], |row| row.get::<_, u32>(0)) {
         Ok(id) => id,
         Err(err) => {
             error!(
@@ -1047,26 +1114,23 @@ pub fn housekeeping(context: &Context) {
 
                 unreferenced_count += 1;
 
-                match std::fs::metadata(entry.path()) {
-                    Ok(stats) => {
-                        let recently_created = stats.created().is_ok()
-                            && stats.created().unwrap() > keep_files_newer_than;
-                        let recently_modified = stats.modified().is_ok()
-                            && stats.modified().unwrap() > keep_files_newer_than;
-                        let recently_accessed = stats.accessed().is_ok()
-                            && stats.accessed().unwrap() > keep_files_newer_than;
+                if let Ok(stats) = std::fs::metadata(entry.path()) {
+                    let recently_created =
+                        stats.created().is_ok() && stats.created().unwrap() > keep_files_newer_than;
+                    let recently_modified = stats.modified().is_ok()
+                        && stats.modified().unwrap() > keep_files_newer_than;
+                    let recently_accessed = stats.accessed().is_ok()
+                        && stats.accessed().unwrap() > keep_files_newer_than;
 
-                        if recently_created || recently_modified || recently_accessed {
-                            info!(
-                                context,
-                                "Housekeeping: Keeping new unreferenced file #{}: {:?}",
-                                unreferenced_count,
-                                entry.file_name(),
-                            );
-                            continue;
-                        }
+                    if recently_created || recently_modified || recently_accessed {
+                        info!(
+                            context,
+                            "Housekeeping: Keeping new unreferenced file #{}: {:?}",
+                            unreferenced_count,
+                            entry.file_name(),
+                        );
+                        continue;
                     }
-                    Err(_) => {}
                 }
                 info!(
                     context,

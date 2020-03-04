@@ -4,6 +4,9 @@ executors:
     docker:
       - image: filecoin/rust:latest
     working_directory: /mnt/crate
+  doxygen:
+    docker:
+      - image: hrektts/doxygen
 
 restore-workspace: &restore-workspace
   attach_workspace:
@@ -12,7 +15,7 @@ restore-workspace: &restore-workspace
 restore-cache: &restore-cache
   restore_cache:
     keys:
-      - cargo-v2-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
+      - cargo-v3-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
       - repo-source-{{ .Branch }}-{{ .Revision }}
 
 commands:
@@ -33,20 +36,13 @@ jobs:
     executor: default
     steps:
       - checkout
-      - run:
-          name: Update submodules
-          command: git submodule update --init --recursive
-      - run:
-          name: Calculate dependencies
-          command: cargo generate-lockfile
       - restore_cache:
           keys:
-            - cargo-v2-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
+            - cargo-v3-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
       - run: rustup install $(cat rust-toolchain)
       - run: rustup default $(cat rust-toolchain)
       - run: rustup component add --toolchain $(cat rust-toolchain) rustfmt
       - run: rustup component add --toolchain $(cat rust-toolchain) clippy-preview
-      - run: cargo update
       - run: cargo fetch
       - run: rustc +stable --version
       - run: rustc +$(cat rust-toolchain) --version
@@ -57,7 +53,7 @@ jobs:
           paths:
             - crate
       - save_cache:
-          key: cargo-v2-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
+          key: cargo-v3-{{ checksum "rust-toolchain" }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
           paths:
             - "~/.cargo"
             - "~/.rustup"
@@ -88,7 +84,6 @@ jobs:
             curl https://sh.rustup.rs -sSf | sh -s -- -y
       - run: rustup install $(cat rust-toolchain)
       - run: rustup default $(cat rust-toolchain)
-      - run: cargo update
       - run: cargo fetch
       - run:
           name: Test
@@ -113,26 +108,25 @@ jobs:
           target: "aarch64-linux-android"
 
 
-  build_test_docs_wheel:
-    docker:
-      - image: deltachat/coredeps
-        environment:
-            TESTS: 1
-            DOCS: 1
-    working_directory: /mnt/crate
+  build_doxygen:
+    executor: doxygen
     steps:
-      - *restore-workspace
-      - *restore-cache
-      - run:
-          name: build docs, run tests and build wheels
-          command: ci_scripts/run-python.sh
-      - run:
-           name: copying docs and wheels to workspace
-           command: |
-             mkdir -p workspace/python
-             # cp -av docs workspace/c-docs
-             cp -av python/.docker-tox/wheelhouse workspace/
-             cp -av python/doc/_build/ workspace/py-docs
+      - checkout
+      - run: bash ci_scripts/run-doxygen.sh
+      - run: mkdir -p workspace/c-docs
+      - run: cp -av deltachat-ffi/{html,xml} workspace/c-docs/
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - c-docs
+
+  remote_python_packaging:
+    machine: true
+    steps:
+      - checkout
+      # the following commands on success produces
+      # workspace/{wheelhouse,py-docs} as artefact directories
+      - run: bash ci_scripts/remote_python_packaging.sh 
       - persist_to_workspace:
           root: workspace
           paths:
@@ -140,15 +134,28 @@ jobs:
             - py-docs
             - wheelhouse
 
+  remote_tests_rust:
+    machine: true
+    steps:
+      - checkout
+      - run: ci_scripts/remote_tests_rust.sh
+    
+  remote_tests_python:
+    machine: true
+    steps:
+      - checkout
+      - run: ci_scripts/remote_tests_python.sh
+
   upload_docs_wheels:
     machine: true
     steps:
       - checkout
       - attach_workspace:
           at: workspace
+      - run: pyenv versions
       - run: pyenv global 3.5.2
       - run: ls -laR workspace
-      - run: ci_scripts/ci_upload.sh workspace/py-docs workspace/wheelhouse
+      - run: ci_scripts/ci_upload.sh workspace/py-docs workspace/wheelhouse workspace/c-docs
 
   clippy:
     executor: default
@@ -157,7 +164,7 @@ jobs:
       - *restore-cache
       - run:
           name: Run cargo clippy
-          command: cargo clippy --all
+          command: cargo clippy 
 
 
 workflows:
@@ -165,24 +172,49 @@ workflows:
 
   test:
     jobs:
-      - cargo_fetch
-      - build_test_docs_wheel:
-          requires:
-            - cargo_fetch
+      # - cargo_fetch
+
+      - remote_tests_rust:
+          filters:
+            tags:
+              only: /.*/
+
+      - remote_tests_python:
+          filters:
+            tags:
+              only: /.*/
+
+      - remote_python_packaging:
+          requires: 
+             - remote_tests_python
+             - remote_tests_rust 
+          filters:
+            tags:
+              only: /.*/
+
       - upload_docs_wheels:
           requires:
-            - build_test_docs_wheel
-      - rustfmt:
-          requires:
-            - cargo_fetch
-      - clippy:
-          requires:
-            - cargo_fetch
+             - remote_python_packaging
+             - build_doxygen
+          filters:
+            tags:
+              only: /.*/
+      # - rustfmt:
+      #     requires:
+      #       - cargo_fetch
+      # - clippy:
+      #     requires:
+      #      - cargo_fetch
+
+      - build_doxygen:
+          filters:
+            tags:
+              only: /.*/
 
       # Linux Desktop 64bit
-      - test_x86_64-unknown-linux-gnu:
-          requires:
-            - cargo_fetch
+      # - test_x86_64-unknown-linux-gnu:
+      #     requires:
+      #       - cargo_fetch
 
       # Linux Desktop 32bit
       # - test_i686-unknown-linux-gnu:
