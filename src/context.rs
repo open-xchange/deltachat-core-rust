@@ -130,12 +130,12 @@ impl Context {
             ))),
             sentbox_thread: Arc::new(RwLock::new(JobThread::new(
                 "SENTBOX",
-                "configured_inbox_folder",
+                "configured_sentbox_folder",
                 Imap::new(),
             ))),
             mvbox_thread: Arc::new(RwLock::new(JobThread::new(
                 "MVBOX",
-                "configured_inbox_folder",
+                "configured_mvbox_folder",
                 Imap::new(),
             ))),
             probe_imap_network: Arc::new(RwLock::new(false)),

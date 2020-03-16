@@ -31,7 +31,6 @@ use crate::message::{self, Message, MessageState};
 use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::param::*;
 use crate::sql;
-use crate::coi::CoiDeltachatMode;
 
 // results in ~3 weeks for the last backoff timespan
 const JOB_RETRIES: u32 = 17;
@@ -553,19 +552,23 @@ impl Job {
                         return Status::Finished(Err(err));
                     }
                 }
-                self.maybe_move(context, msg.server_uid, folder, imap_inbox)
-                // Status::Finished(Ok(()))
+                Status::Finished(Ok(()))
             }
         }
     }
 
-    fn maybe_move(
-        &mut self,
-        context: &Context,
-        uid: u32,
-        folder: &str,
-        imap_inbox: &Imap,
-    ) -> Status {
+    #[allow(non_snake_case)]
+    fn MarkseenMdnOnImap(&mut self, context: &Context) -> Status {
+        let folder = self
+            .param
+            .get(Param::ServerFolder)
+            .unwrap_or_default()
+            .to_string();
+        let uid = self.param.get_int(Param::ServerUid).unwrap_or_default() as u32;
+        let imap_inbox = &context.inbox_thread.read().unwrap().imap;
+        if imap_inbox.set_seen(context, &folder, uid) == ImapActionResult::RetryLater {
+            return Status::RetryLater;
+        }
         if self.param.get_bool(Param::AlsoMove).unwrap_or_default() {
             if let Err(err) = imap_inbox.ensure_configured_folders(context, true) {
                 warn!(context, "configuring folders failed: {:?}", err);
@@ -590,23 +593,8 @@ impl Job {
             Status::Finished(Ok(()))
         }
     }
-
-    #[allow(non_snake_case)]
-    fn MarkseenMdnOnImap(&mut self, context: &Context) -> Status {
-        let folder = self
-            .param
-            .get(Param::ServerFolder)
-            .unwrap_or_default()
-            .to_string();
-        let uid = self.param.get_int(Param::ServerUid).unwrap_or_default() as u32;
-        let imap_inbox = &context.inbox_thread.read().unwrap().imap;
-        if imap_inbox.set_seen(context, &folder, uid) == ImapActionResult::RetryLater {
-            return Status::RetryLater;
-        }
-        self.maybe_move(context, uid, &folder, imap_inbox)
-    }
 }
-    
+
 /* delete all pending jobs with the given action */
 pub fn job_kill_action(context: &Context, action: Action) -> bool {
     sql::execute(
