@@ -31,7 +31,7 @@ use crate::message::{self, Message, MessageState};
 use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::param::*;
 use crate::sql;
-// use crate::coi::deltachat_mode::CoiDeltachatMode;
+use crate::coi::CoiDeltachatMode;
 
 // results in ~3 weeks for the last backoff timespan
 const JOB_RETRIES: u32 = 17;

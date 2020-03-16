@@ -28,7 +28,7 @@ impl CoiConfig {
                 },
                 CoiMessageFilter::Active => CoiDeltachatMode::Enabled {
                     inbox_folder_override: self.coi_chats_folder.to_string(),
-                    mvbox_folder_override: "INBOX".to_string(),
+                    mvbox_folder_override: self.coi_chats_folder.to_string(),
                 },
             }
         } else {

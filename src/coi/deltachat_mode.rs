@@ -1,5 +1,5 @@
 /// COI-related overrides for Deltachat.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CoiDeltachatMode {
     /// "Old" Deltachat behavior. No COI server, COI disabled, or COI message filter set to "none".
     Disabled,

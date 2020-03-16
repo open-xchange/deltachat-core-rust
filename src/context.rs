@@ -420,7 +420,7 @@ impl Context {
     }
 
     pub fn is_mvbox(&self, folder_name: impl AsRef<str>) -> bool {
-        let mvbox_name = self.sql.get_raw_config(self, "configured_mvbox_folder");
+        let mvbox_name = self.get_mvbox_folder_override();
 
         if let Some(name) = mvbox_name {
             name == folder_name.as_ref()
