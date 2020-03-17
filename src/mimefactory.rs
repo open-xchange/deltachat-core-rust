@@ -470,7 +470,16 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             render_rfc724_mid(&rfc724_mid),
         ));
 
-        unprotected_headers.push(Header::new_with_value("To".into(), to).unwrap());
+        unprotected_headers.push(
+            Header::new_with_value("To".into(), {
+                if to.len() > 0 {
+                    to
+                } else {
+                    vec![Address::new_mailbox("".into())]
+                }
+            })
+            .unwrap(),
+        );
         unprotected_headers.push(Header::new_with_value("From".into(), vec![from]).unwrap());
 
         let mut is_gossiped = false;
