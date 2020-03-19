@@ -82,9 +82,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         let mut recipients = Vec::with_capacity(5);
         let mut req_mdn = false;
 
-        if chat.is_self_talk() {
+        if chat.is_self_talk() || context.get_config_bool(Config::BccSelf) {
             recipients.push((from_displayname.to_string(), from_addr.to_string()));
-        } else {
+        } else if !chat.is_self_talk() {
             context.sql.query_map(
                 "SELECT c.authname, c.addr  \
                  FROM chats_contacts cc  \
@@ -349,6 +349,13 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         }
     }
 
+    pub fn recipients(&self) -> Vec<String> {
+        self.recipients
+            .iter()
+            .map(|(_, addr)| addr.clone())
+            .collect()
+    }
+
     pub fn render(mut self) -> Result<RenderedEmail, Error> {
         // Headers that are encrypted
         // - Chat-*, except Chat-Version
@@ -470,16 +477,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             render_rfc724_mid(&rfc724_mid),
         ));
 
-        unprotected_headers.push(
-            Header::new_with_value("To".into(), {
-                if to.len() > 0 {
-                    to
-                } else {
-                    vec![Address::new_mailbox("".into())]
-                }
-            })
-            .unwrap(),
-        );
+        unprotected_headers.push(Header::new_with_value("To".into(), to).unwrap());
         unprotected_headers.push(Header::new_with_value("From".into(), vec![from]).unwrap());
 
         let mut is_gossiped = false;

@@ -858,7 +858,19 @@ pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
     };
 
     let mimefactory = MimeFactory::from_msg(context, &msg, attach_selfavatar)?;
-    let mut rendered_msg = mimefactory.render().map_err(|err| {
+
+    let recipients = mimefactory.recipients();
+    if recipients.is_empty() {
+        // may happen eg. for groups with only SELF and bcc_self disabled
+        info!(
+            context,
+            "message {} has no recipient, skipping smtp-send", msg_id
+        );
+        set_delivered(context, msg_id);
+        return Ok(());
+    }
+
+    let rendered_msg = mimefactory.render().map_err(|err| {
         message::set_msg_failed(context, msg_id, Some(err.to_string()));
         err
     })?;
@@ -875,26 +887,6 @@ pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
             msg_id,
             needs_encryption
         );
-    }
-
-    let lowercase_from = rendered_msg.from.to_lowercase();
-    if context.get_config_bool(Config::BccSelf)
-        && !rendered_msg
-            .recipients
-            .iter()
-            .any(|x| x.to_lowercase() == lowercase_from)
-    {
-        rendered_msg.recipients.push(rendered_msg.from.clone());
-    }
-
-    if rendered_msg.recipients.is_empty() {
-        // may happen eg. for groups with only SELF and bcc_self disabled
-        info!(
-            context,
-            "message {} has no recipient, skipping smtp-send", msg_id
-        );
-        set_delivered(context, msg_id);
-        return Ok(());
     }
 
     if rendered_msg.is_gossiped {
