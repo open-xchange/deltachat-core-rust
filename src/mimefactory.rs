@@ -85,6 +85,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         if chat.is_self_talk() || context.get_config_bool(Config::BccSelf) {
             recipients.push((from_displayname.to_string(), from_addr.to_string()));
         } else if !chat.is_self_talk() {
+            info!(context, "factory from msg {:?}, bcc_self: {}", msg.rfc724_mid, context.get_config_bool(Config::BccSelf));
             context.sql.query_map(
                 "SELECT c.authname, c.addr  \
                  FROM chats_contacts cc  \

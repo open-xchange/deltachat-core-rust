@@ -289,7 +289,7 @@ fn add_parts(
         if old_server_folder != server_folder.as_ref() || old_server_uid != server_uid {
             message::update_server_uid(context, &rfc724_mid, server_folder.as_ref(), server_uid);
         }
-
+        info!(context, "already in DB: {:?}", &rfc724_mid);
         bail!("Message already in DB");
     }
 
@@ -560,6 +560,7 @@ fn add_parts(
 
     let mut txt_raw = None;
 
+    info!(context, "dc_recv insert msg to DB, rfc724_mid: {:?}", rfc724_mid);
     context.sql.prepare(
         "INSERT INTO msgs \
          (rfc724_mid, server_folder, server_uid, chat_id, from_id, to_id, timestamp, \

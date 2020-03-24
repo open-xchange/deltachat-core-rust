@@ -872,6 +872,7 @@ impl Chat {
 
             // add message to the database
 
+            info!(context, "Prepare raw msg, insert to table, midrfc74 = {}", new_rfc724_mid);
             if sql::execute(
                         context,
                         &context.sql,
