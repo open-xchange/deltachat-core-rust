@@ -24,7 +24,7 @@ use crate::stock::StockMessage;
 pub const RECOMMENDED_FILE_SIZE: u64 = 24 * 1024 * 1024 / 4 * 3;
 const UPPER_LIMIT_FILE_SIZE: u64 = 49 * 1024 * 1024 / 4 * 3;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub enum Loaded {
     Message { chat: Chat },
     MDN { additional_msg_ids: Vec<String> },
@@ -79,9 +79,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         let mut recipients = Vec::with_capacity(5);
         let mut req_mdn = false;
 
-        if chat.is_self_talk() {
+        if chat.is_self_talk() || context.get_config_bool(Config::BccSelf) {
             recipients.push((from_displayname.to_string(), from_addr.to_string()));
-        } else {
+        } else if !chat.is_self_talk() {
             context.sql.query_map(
                 "SELECT c.authname, c.addr  \
                  FROM chats_contacts cc  \
@@ -464,7 +464,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
         let rfc724_mid = match self.loaded {
             Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
-            Loaded::MDN { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
+            Loaded::MDN { .. } => dc_create_outgoing_rfc724_mid(self.context, None, &self.from_addr),
         };
 
         // we could also store the message-id in the protected headers

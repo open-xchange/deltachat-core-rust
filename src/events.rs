@@ -132,6 +132,13 @@ pub enum Event {
     #[strum(props(id = "2015"))]
     MsgRead { chat_id: ChatId, msg_id: MsgId },
 
+    /// Message could not be decrypted due to a missing key
+    ///
+    /// @param address of the message sender
+    /// @return 0
+    #[strum(props(id = "2016"))]
+    MissingKey(String),
+
     /// Chat changed.  The name or the image of a chat group was changed or members were added or removed.
     /// Or the verify state of a chat has changed.
     /// See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
@@ -201,6 +208,21 @@ pub enum Event {
     ///     (Bob has verified alice and waits until Alice does the same for him)
     #[strum(props(id = "2061"))]
     SecurejoinJoinerProgress { contact_id: u32, progress: usize },
+
+    /// Status of a SETMETADATA command triggered by COI or WebPush functions.
+    /// In case of errors, the ERROR event with the request ID in data1 is sent instead.
+    /// @param data1 (int) ID of the request, can be used to match responses to requests.
+    /// @param data2 (int) 0
+    #[strum(props(id = "2070"))]
+    SetMetadataDone { foreign_id: u32 },
+
+    /// Result of a GETMETADATA command triggered by COI or WebPush functions.
+    /// In case of errors, the ERROR event with the request ID in data1 is sent instead.
+    /// @param data1 (int) ID of the request, can be used to match responses to requests.
+    /// @param data2 (const char*) JSON string returned by the server, or NULL if no subscription found.
+    ///     Must not be free()'d or modified and is valid only until the callback returns.
+    #[strum(props(id = "2071"))]
+    Metadata { foreign_id: u32, json: Option<String> },
 
     /// This event is sent out to the inviter when a joiner successfully joined a group.
     /// @param data1 (int) chat_id

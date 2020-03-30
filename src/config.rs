@@ -89,6 +89,9 @@ pub enum Config {
     #[strum(serialize = "sys.msgsize_max_recommended")]
     SysMsgsizeMaxRecommended,
 
+    #[strum(serialize = "rfc724_msg_id_prefix")]
+    Rfc724MsgIdPrefix,   // To be removed when chat$ prefix has become the sole convention
+
     #[strum(serialize = "sys.config_keys")]
     SysConfigKeys,
 }

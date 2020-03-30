@@ -1170,6 +1170,7 @@ mod tests {
         assert_eq!(may_be_valid_addr("u@d.tt"), true);
         assert_eq!(may_be_valid_addr("u@.tt"), false);
         assert_eq!(may_be_valid_addr("@d.tt"), false);
+        assert_eq!(may_be_valid_addr("u.u@d.tt"), true);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use deltachat::message::{self, Message, MessageState, MsgId};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::sql;
+use deltachat::coi::CoiMessageFilter;
 use deltachat::Event;
 use deltachat::{config, provider};
 
@@ -390,6 +391,11 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
                  contactinfo <contact-id>\n\
                  delcontact <contact-id>\n\
                  cleanupcontacts\n\
+                 ======================================Coi====\n\
+                 coi-enable\n\
+                 coi-disable\n\
+                 coi-set-message-filter [none | active | seen]\n\
+                 coi-get-message-filter\n\
                  ======================================Misc.==\n\
                  getqr [<chat-id>]\n\
                  getbadqr\n\
@@ -1028,6 +1034,32 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
                 bail!("Command failed.");
             }
         }
+        "coi-enable" => {
+            let id = 1; // XXX
+            context.set_coi_enabled(true, id);
+            println!("coi-enable command queued with id: {}", id);
+        }
+        "coi-disable" => {
+            let id = 1; // XXX
+            context.set_coi_enabled(false, id);
+            println!("coi-disable command queued with id: {}", id);
+        }
+        "coi-set-message-filter" => {
+            ensure!(!arg1.is_empty(), "Argument <message-filter> missing.");
+            if let Ok(message_filter) = CoiMessageFilter::from_str(&arg1) {
+                let id = 1; // XXX
+                context.set_coi_message_filter(message_filter, id);
+                println!("coi-set-message-filter command queued with id: {}", id);
+            }
+            else {
+                bail!("Invalid message-filter argument. Requires: none, active or seen");
+            }
+        }
+        "coi-get-message-filter" => {
+            let id = 1; // XXX
+            context.get_coi_message_filter(id);
+            println!("coi-get-message-filter command queued with id: {}", id);
+        }
         "emptyserver" => {
             ensure!(!arg1.is_empty(), "Argument <flags> missing");
 
@@ -1035,7 +1067,7 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
         }
         "" => (),
         _ => bail!("Unknown command: \"{}\" type ? for help.", arg0),
-    }
 
+    }
     Ok(())
 }

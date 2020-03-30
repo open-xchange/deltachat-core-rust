@@ -13,7 +13,10 @@ use async_imap::{
 };
 use async_std::sync::{Mutex, RwLock};
 use async_std::task;
+pub use imap_proto::types::Address;
+// use imap_proto::Metadata;
 
+use crate::coi::CoiConfig;
 use crate::config::*;
 use crate::constants::*;
 use crate::context::Context;
@@ -28,9 +31,11 @@ use crate::message::{self, update_server_uid};
 use crate::oauth2::dc_get_oauth2_access_token;
 use crate::param::Params;
 use crate::stock::StockMessage;
+use crate::webpush::WebPushConfig;
 
 mod client;
 mod idle;
+pub mod metadata;
 pub mod select_folder;
 mod session;
 
@@ -188,6 +193,8 @@ struct ImapConfig {
     /// True if the server has MOVE capability as defined in
     /// https://tools.ietf.org/html/rfc6851
     pub can_move: bool,
+    pub coi: Option<CoiConfig>,
+    pub webpush: Option<WebPushConfig>,
 }
 
 impl Default for ImapConfig {
@@ -205,6 +212,8 @@ impl Default for ImapConfig {
             selected_folder_needs_expunge: false,
             can_idle: false,
             can_move: false,
+            coi: None,
+            webpush: None,
         }
     }
 }
@@ -410,6 +419,8 @@ impl Imap {
             return false;
         }
 
+        let mut has_coi = false;
+        let mut has_webpush = false;
         let teardown = match &mut *self.session.lock().await {
             Some(ref mut session) => match session.capabilities().await {
                 Ok(caps) => {
@@ -419,6 +430,8 @@ impl Imap {
                     } else {
                         let can_idle = caps.has_str("IDLE");
                         let can_move = caps.has_str("MOVE");
+                        has_coi = caps.has(&Capability::Atom(String::from("COI")));
+                        has_webpush = caps.has(&Capability::Atom(String::from("WEBPUSH")));
                         let caps_list = caps.iter().fold(String::new(), |s, c| {
                             if let Capability::Atom(x) = c {
                                 s + &format!(" {}", x)
@@ -450,9 +463,10 @@ impl Imap {
 
         if teardown {
             self.disconnect(context);
-
             false
         } else {
+            self.update_metadata(context, Some(has_coi), Some(has_webpush))
+                .await;
             true
         }
     }
@@ -659,7 +673,17 @@ impl Imap {
                     );
                 } else {
                     // check passed, go fetch the rest
-                    if let Err(err) = self.fetch_single_msg(context, &folder, cur_uid).await {
+                    if let Err(err) = self
+                        .fetch_single_msg(
+                            context,
+                            &folder,
+                            cur_uid,
+                            headers
+                                .get_header_value(HeaderDef::From_)?
+                                .unwrap_or(String::from("")),
+                        )
+                        .await
+                    {
                         info!(
                             context,
                             "Read error for message {} from \"{}\", trying over later: {}.",
@@ -723,6 +747,7 @@ impl Imap {
         context: &Context,
         folder: S,
         server_uid: u32,
+        from: String,
     ) -> Result<()> {
         if !self.is_connected().await {
             return Err(Error::Other("Not connected".to_string()));
@@ -763,13 +788,20 @@ impl Imap {
                 if let Err(err) =
                     dc_receive_imf(context, &body, folder.as_ref(), server_uid, is_seen)
                 {
-                    warn!(
-                        context,
-                        "dc_receive_imf failed for imap-message {}/{}: {:?}",
-                        folder.as_ref(),
-                        server_uid,
-                        err
-                    );
+                    match err {
+                        crate::error::Error::Pgp(pgp::errors::Error::MissingKey) => {
+                            context.call_cb(Event::MissingKey(from));
+                        }
+                        _ => {
+                            warn!(
+                                context,
+                                "dc_receive_imf failed for imap-message {}/{}: {:?}",
+                                folder.as_ref(),
+                                server_uid,
+                                err
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -1257,6 +1289,14 @@ impl Imap {
                 );
             }
         });
+    }
+
+    pub async fn get_coi_config(&self) -> Option<CoiConfig> {
+        self.config.read().await.coi.clone()
+    }
+
+    pub async fn get_webpush_config(&self) -> Option<WebPushConfig> {
+        self.config.read().await.webpush.clone()
     }
 }
 

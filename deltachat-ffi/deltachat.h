@@ -489,6 +489,17 @@ char*           dc_get_info                  (dc_context_t* context);
 char*           dc_get_oauth2_url            (dc_context_t* context, const char* addr, const char* redirect_uri);
 
 
+int             dc_is_coi_supported          (dc_context_t*);
+int             dc_is_coi_enabled            (dc_context_t*);
+void            dc_set_coi_enabled           (dc_context_t*, int enable, int id);
+void            dc_set_coi_message_filter    (dc_context_t*, int mode, int id);
+int             dc_get_coi_message_filter    (dc_context_t*);
+int             dc_is_webpush_supported      (dc_context_t*);
+char*           dc_get_webpush_vapid_key     (dc_context_t*);
+void            dc_subscribe_webpush         (dc_context_t*, const char* uid, const char* json, int id);
+void            dc_get_webpush_subscription  (dc_context_t*, const char* uid, int id);
+void            dc_validate_webpush          (dc_context_t*, const char* uid, const char* msg, int id);
+
 // connect
 
 /**
@@ -3922,6 +3933,27 @@ uint32_t        dc_lot_get_id            (const dc_lot_t* lot);
 int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 
+
+/**
+ * Decrypt a message in memory and return the decrypted message as a string.
+ *
+ * @param context The context object.
+ * @param content_type The content type.
+ * @param content The message content.
+ * @param sender_addr The sender address of the message.
+ * @param extract_part The part to extract. Counting starts with 0.
+ * @param out_total_number_of_parts Returns the total number of parts of this message.
+ * @return The decrypted message or NULL in case of error.
+ */
+char*           dc_decrypt_message_in_memory(
+    dc_context_t* context,
+    const char *content_type,
+    const char *content,
+    const char *sender_addr,
+    int extract_part,
+    int *out_total_number_of_parts);
+
+
 /**
  * @defgroup DC_MSG DC_MSG
  *
@@ -4501,6 +4533,30 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 
 /**
+ * Status of a SETMETADATA command triggered by COI or WebPush functions.
+ * In case of errors, the ERROR event with the request ID in data1 is sent instead.
+ * @param data1 (int) ID of the request, can be used to match responses to requests.
+ * @param data2 (int) 0
+ * @return 0
+ */
+#define DC_EVENT_SET_METADATA_DONE                2070
+
+
+/**
+ * Result of a GETMETADATA command triggered by COI or WebPush functions.
+ * In case of errors, the ERROR event with the request ID in data1 is sent instead.
+ * @param data1 (int) ID of the request, can be used to match responses to requests.
+ * @param data2 (const char*) JSON string returned by the server, or NULL if no subscription found.
+ *     Must not be free()'d or modified and is valid only until the callback returns.
+ * @return 0
+ */
+#define DC_EVENT_METADATA                         2071
+
+
+// the following events are functions that should be provided by the frontends
+
+
+/**
  * This event is sent out to the inviter when a joiner successfully joined a group.
  *
  * @param data1 (int) chat_id
@@ -4522,7 +4578,7 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
 #define DC_ERROR_SELF_NOT_IN_GROUP   1    // not used anymore
 #define DC_STR_SELFNOTINGRP          21   // not used anymore
 #define DC_EVENT_DATA1_IS_STRING(e)  ((e)==DC_EVENT_IMEX_FILE_WRITTEN || (e)==DC_EVENT_FILE_COPIED)
-#define DC_EVENT_DATA2_IS_STRING(e)  ((e)>=100 && (e)<=499)
+#define DC_EVENT_DATA2_IS_STRING(e)  ((e)>=100 && (e)<=499 || (e)==DC_EVENT_METADATA)
 #define DC_EVENT_RETURNS_INT(e)      ((e)==DC_EVENT_IS_OFFLINE) // not used anymore
 #define DC_EVENT_RETURNS_STRING(e)   ((e)==DC_EVENT_GET_STRING) // not used anymore
 char*           dc_get_version_str           (void); // deprecated
@@ -4641,6 +4697,14 @@ void            dc_array_add_id              (dc_array_t*, uint32_t); // depreca
 /**
  * @}
  */
+
+
+/*
+ * Values for dc_get|set_coi_message_filter()
+ */
+#define DC_COI_FILTER_NONE      0
+#define DC_COI_FILTER_ACTIVE    1
+#define DC_COI_FILTER_SEEN      2
 
 
 /*

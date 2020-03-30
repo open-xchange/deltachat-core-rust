@@ -13,8 +13,9 @@ extern crate human_panic;
 extern crate num_traits;
 extern crate serde_json;
 
+use num_traits::{FromPrimitive, ToPrimitive};
+use std::convert::{TryFrom, TryInto};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::ffi::CString;
 use std::fmt::Write;
 use std::ptr;
@@ -23,15 +24,16 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use libc::uintptr_t;
-use num_traits::{FromPrimitive, ToPrimitive};
 
 use deltachat::chat::{ChatId, ChatVisibility, MuteDuration};
+use deltachat::coi::CoiMessageFilter;
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
 use deltachat::contact::Contact;
 use deltachat::context::Context;
 use deltachat::key::DcKey;
 use deltachat::message::MsgId;
 use deltachat::stock::StockMessage;
+use deltachat::webpush::WebPushConfig;
 use deltachat::*;
 
 mod dc_array;
@@ -151,6 +153,7 @@ impl ContextWrapper {
                 | Event::Warning(msg)
                 | Event::Error(msg)
                 | Event::ErrorNetwork(msg)
+                | Event::MissingKey(msg)
                 | Event::ErrorSelfNotInGroup(msg) => {
                     let data2 = CString::new(msg).unwrap_or_default();
                     ffi_cb(self, event_id, 0, data2.as_ptr() as uintptr_t);
@@ -206,6 +209,11 @@ impl ContextWrapper {
                         chat_id.to_u32() as uintptr_t,
                         contact_id as uintptr_t,
                     );
+                }
+                Event::SetMetadataDone {foreign_id} => {ffi_cb(self, event_id, foreign_id as usize, 0);},
+                Event::Metadata {foreign_id, json} => {
+                    let data = CString::new(json.unwrap_or(String::from(""))).unwrap_or_default();
+                    ffi_cb(self, event_id, foreign_id as usize, data.as_ptr() as uintptr_t);
                 }
             }
         }
@@ -474,6 +482,171 @@ pub unsafe extern "C" fn dc_get_oauth2_url(
             None => ptr::null_mut(),
         })
         .unwrap_or_else(|_| ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_is_coi_supported(context: *mut dc_context_t) -> libc::c_int {
+    assert!(!context.is_null());
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.get_coi_config().is_some() as libc::c_int
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_is_coi_enabled(context: *mut dc_context_t) -> libc::c_int {
+    assert!(!context.is_null());
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx
+                .get_coi_config()
+                .map(|c| c.enabled)
+                .unwrap_or(false) as libc::c_int
+        })
+        .unwrap_or(0)
+}
+
+/// Returns one of the DC_COI_FILTER_* values depending on the setting of the message filter.
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_coi_message_filter(
+    context: *mut dc_context_t,
+) -> libc::c_int {
+    assert!(!context.is_null());
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.get_coi_config()
+                .map(|c| c.message_filter)
+                .unwrap_or(CoiMessageFilter::None) as libc::c_int
+        })
+        .unwrap_or(0)
+}
+
+/// Enable (enable != 0) or disable (enable == 0) COI.
+///
+/// The caller should reconnect after calling this method!
+#[no_mangle]
+pub unsafe extern "C" fn dc_set_coi_enabled(
+    context: *mut dc_context_t,
+    enable: libc::c_int,
+    id: libc::c_int,
+) {
+    assert!(!context.is_null());
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.set_coi_enabled(enable != 0, id);
+        }).unwrap_or_default();
+}
+
+/// mode: one of the DC_COI_FILTER_* constants
+/// returns: 1 if a job was queued successfully,
+///          0 if an invalid mode value was specified.
+#[no_mangle]
+pub unsafe extern "C" fn dc_set_coi_message_filter(
+    context: *mut dc_context_t,
+    mode: libc::c_int,
+    id: libc::c_int,
+) -> libc::c_int {
+    assert!(!context.is_null());
+
+    if let Ok(message_filter) = CoiMessageFilter::try_from(mode) {
+        let ffi_context = &*context;
+        ffi_context.with_inner(|ctx| {
+            ctx.set_coi_message_filter(message_filter, id);
+        }).unwrap_or_default();
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_is_webpush_supported(context: *mut dc_context_t) -> libc::c_int {
+    assert!(!context.is_null());
+
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.get_webpush_config().is_some() as libc::c_int
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_webpush_vapid_key(
+    context: *mut dc_context_t,
+) -> *mut libc::c_char {
+    assert!(!context.is_null());
+
+    if let Some(WebPushConfig { vapid: Some(v) }) = {
+        let ffi_context = &*context;
+        ffi_context
+            .with_inner(|ctx| {ctx.get_webpush_config()})
+            .unwrap_or(None)
+    } {
+        v.strdup()
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_subscribe_webpush(
+    context: *mut dc_context_t,
+    uid: *const libc::c_char,
+    json: *const libc::c_char,
+    id: libc::c_int,
+) {
+    assert!(!context.is_null());
+    assert!(!uid.is_null());
+
+    let uid = to_string_lossy(uid);
+    let json = to_opt_string_lossy(json);
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            ctx.subscribe_webpush(
+                uid.as_str(),
+                json.as_ref().map(|x| x.as_str()),
+                id);
+        }).unwrap_or_default();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_webpush_subscription(
+    context: *mut dc_context_t,
+    uid: *const libc::c_char,
+    id: libc::c_int,
+) {
+    assert!(!context.is_null());
+    assert!(!uid.is_null());
+
+    let uid = to_string_lossy(uid);
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {ctx.get_webpush_subscription(uid.as_str(), id);}).unwrap_or_default();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_validate_webpush(
+    context: *mut dc_context_t,
+    uid: *const libc::c_char,
+    msg: *const libc::c_char,
+    id: libc::c_int,
+) {
+    assert!(!context.is_null());
+    assert!(!uid.is_null());
+    assert!(!msg.is_null());
+
+    let uid = to_string_lossy(uid);
+    let msg = to_string_lossy(msg);
+    let ffi_context = &*context;
+    ffi_context
+    .with_inner(|ctx| {ctx.validate_webpush(uid.as_str(), msg.as_str(), id);}).unwrap_or_default();
 }
 
 #[no_mangle]
@@ -3283,6 +3456,45 @@ pub unsafe extern "C" fn dc_lot_get_timestamp(lot: *mut dc_lot_t) -> i64 {
 
     let lot = &*lot;
     lot.get_timestamp()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_decrypt_message_in_memory(
+    context: *mut dc_context_t,
+    content_type: *const libc::c_char,
+    content: *const libc::c_char,
+    sender_addr: *const libc::c_char,
+    extract_part: libc::c_int,
+    out_total_number_of_parts: *mut libc::c_int,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_decrypt_msg_in_memory()");
+        return ptr::null_mut();
+    }
+    let ffi_context = &*context;
+
+    if let Ok(Ok(msg_parts)) = ffi_context.with_inner(|ctx| {
+        e2ee::decrypt_message_in_memory(
+            ctx,
+            to_string_lossy(content_type).as_str(),
+            to_string_lossy(content).as_str(),
+            to_string_lossy(sender_addr).as_str(),
+        )
+    }) {
+        if out_total_number_of_parts.is_null() {
+            eprintln!("ignoring careless call to dc_decrypt_msg_in_memory()");
+            return ptr::null_mut();
+        }
+        *out_total_number_of_parts = msg_parts.len() as libc::c_int;
+
+        if let Some(Some(msg)) = msg_parts.get(extract_part as usize) {
+            msg.strdup()
+        } else {
+            ptr::null_mut()
+        }
+    } else {
+        ptr::null_mut()
+    }
 }
 
 #[no_mangle]

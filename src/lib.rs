@@ -30,12 +30,13 @@ mod aheader;
 mod blob;
 pub mod chat;
 pub mod chatlist;
+pub mod coi;
 pub mod config;
 mod configure;
 pub mod constants;
 pub mod contact;
 pub mod context;
-mod e2ee;
+pub mod e2ee;
 mod imap;
 pub mod imex;
 #[macro_use]
@@ -59,6 +60,7 @@ pub mod securejoin;
 mod simplify;
 mod smtp;
 pub mod sql;
+pub mod webpush;
 pub mod stock;
 mod token;
 #[macro_use]

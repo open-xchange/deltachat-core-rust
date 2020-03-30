@@ -25,6 +25,9 @@ pub enum Error {
     #[fail(display = "{:?}", _0)]
     Utf8(std::str::Utf8Error),
 
+    #[fail(display = "{:?}", _0)]
+    Imap(async_imap::error::Error),
+
     #[fail(display = "PGP: {:?}", _0)]
     Pgp(pgp::errors::Error),
 
@@ -112,6 +115,12 @@ impl From<std::string::FromUtf8Error> for Error {
 impl From<crate::blob::BlobError> for Error {
     fn from(err: crate::blob::BlobError) -> Error {
         Error::BlobError(err)
+    }
+}
+
+impl From<async_imap::error::Error> for Error {
+    fn from(err: async_imap::error::Error) -> Error {
+        Error::Imap(err)
     }
 }
 

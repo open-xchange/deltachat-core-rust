@@ -250,7 +250,7 @@ def acfactory(pytestconfig, tmpdir, request, session_liveconfig, datadir):
                 self._preconfigure_key(ac, account.get_config("addr"))
             ac._evlogger.init_time = self.init_time
             ac._evlogger.set_timeout(30)
-            ac.configure(addr=account.get_config("addr"), mail_pw=account.get_config("mail_pw"))
+            ac.configure(addr=account.get_config("addr"), mail_pw=account.get_config("mail_pw"), mail_server=account.get_config("mail_server"), mail_user=account.get_config("mail_user"), send_server=account.get_config("send_server"), mail_port=account.get_config("mail_port"), send_port=account.get_config("send_port"), send_user=account.get_config("send_user"), server_flags=account.get_config("server_flags"))
             ac.start_threads()
             return ac
 

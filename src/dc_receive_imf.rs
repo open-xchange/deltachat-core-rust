@@ -20,6 +20,7 @@ use crate::peerstate::*;
 use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on_other_device};
 use crate::sql;
 use crate::stock::StockMessage;
+// use crate::error::Error;
 use crate::{contact, location};
 
 // IndexSet is like HashSet but maintains order of insertion

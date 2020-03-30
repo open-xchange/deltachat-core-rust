@@ -170,6 +170,80 @@ class Account(object):
         if not self.is_configured():
             raise ValueError("need to configure first")
 
+    def is_coi_supported(self):
+        """ determine whether connected to a COI-compliant server
+        :return: True if COI is supported by the server, False otherwise
+        """
+        return lib.dc_is_coi_supported(self._dc_context) == 1
+
+    def is_coi_enabled(self):
+        """ determine whether COI is supported and enabled on the server
+        :return: True if COI is supported and enabled, False otherwise
+        """
+        return lib.dc_is_coi_enabled(self._dc_context) == 1
+
+    def set_coi_enabled(self, enable, id):
+        """ enable or disable COI on the server
+        :param enable: True to enable COI, False to disable COI
+        :param id: request number which can be used to associate the status event with this call
+        """
+        lib.dc_set_coi_enabled(self._dc_context, enable, id)
+
+    def set_coi_message_filter(self, mode, id):
+        """ configure server-side filtering of chat messages
+        :param mode: one of const.DC_COI_FILTER_{NONE|ACTIVE|SEEN}
+        :param id: request number which can be used to associate the status event with this call
+        """
+        assert mode == const.DC_COI_FILTER_NONE or\
+               mode == const.DC_COI_FILTER_ACTIVE or\
+               mode == const.DC_COI_FILTER_SEEN
+        lib.dc_set_coi_message_filter(self._dc_context, mode, id)
+
+    def get_coi_message_filter(self):
+        """ return the current mode of server-side filtering
+        :return: One of const.DC_COI_FILTER_{NONE|ACTIVE|SEEN}
+        """
+        return lib.dc_get_coi_message_filter(self._dc_context)
+
+    def is_webpush_supported(self):
+        """ determine whether connected to a WebPush-compliant server
+        :return: True if WebPush is supported by the server
+        """
+        return lib.dc_is_webpush_supported(self._dc_context) == 1
+
+    def get_webpush_vapid_key(self):
+        """ get the server's VAPID key for authentication with push services
+        :return: The VAPID key of the server as a string
+        """
+        res = lib.dc_get_webpush_vapid_key(self._dc_context)
+        return None if res == ffi.NULL else from_dc_charpointer(res)
+
+    def subscribe_webpush(self, uid, data, id):
+        """ subscribe for or unsubscribe from WebPush
+        :param uid: unique subscription ID, between 10 and 36 alphanumeric characters
+        :param data: subscription data as a dict to subscribe or None to unsubscribe
+        :param id: request number which can be used to associate the status event with this call
+        """
+        js = None if data is None else json.dumps(data, ensure_ascii=False,
+                                                  allow_nan=False)
+        lib.dc_subscribe_webpush(self._dc_context, uid.encode("utf8"),
+                                 js.encode("utf8"), id)
+
+    def get_webpush_subscription(self, uid, id):
+        """ returns the data of an existing WebPush subscription
+        :param uid: unique ID of the subscription to retrieve
+        :param id: request number which can be used to associate the status event with this call
+        """
+        lib.dc_get_webpush_subscription(self._dc_context, uid.encode("utf8"), id)
+
+    def validate_webpush(self, uid, msg, id):
+        """ subscribe for or unsubscribe from WebPush
+        :param uid: unique subscription ID, between 10 and 36 alphanumeric characters
+        :param msg: payload of the validation message as a string
+        :param id: request number which can be used to associate the status event with this call
+        """
+        lib.dc_validate_webpush(self._dc_context, uid.encode("utf8"),
+                                msg.encode("utf8"), id)
     def empty_server_folders(self, inbox=False, mvbox=False):
         """ empty server folders. """
         flags = 0

@@ -1,3 +1,5 @@
+use lazy_static::lazy_static;
+use regex::*;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -121,6 +123,10 @@ pub enum Param {
     /// For QR
     GroupName = b'g',
 
+    // For Jobs: space-separated list of keys or key=value pairs
+    // CR, LF, ' ', '=' and '\' are escaped as '\r', '\n', '\s', '\e' and '\\', respectively
+    Metadata = b'q',
+
     /// For MDN-sending job
     MsgId = b'I',
 }
@@ -188,6 +194,30 @@ impl str::FromStr for Params {
     }
 }
 
+pub fn escape_param(s: &str) -> String {
+    lazy_static! { static ref RE: Regex = Regex::new(r"[\n\r =\\]").unwrap(); }
+    RE.replace_all(s, |c: &Captures| match &c[0] {
+        "\n" => "\\n",
+        "\r" => "\\r",
+        " " => "\\s",
+        "=" => "\\e",
+        "\\" => "\\\\",
+        _ => "",
+    }).to_string()
+}
+
+pub fn unescape_param(s: &str) -> String {
+    lazy_static! { static ref RE: Regex = Regex::new(r"\\[nrse\\]").unwrap(); }
+    RE.replace_all(s, |c: &Captures| match &c[0] {
+        "\\n" => "\n",
+        "\\r" => "\r",
+        "\\s" => " ",
+        "\\e" => "=",
+        "\\\\" => "\\",
+        _ => unreachable!(),
+    }).to_string()
+}
+
 impl Params {
     /// Create new empty params.
     pub fn new() -> Self {
@@ -251,6 +281,21 @@ impl Params {
     /// Get the given parameter and parse as `f64`.
     pub fn get_float(&self, key: Param) -> Option<f64> {
         self.get(key).and_then(|s| s.parse().ok())
+    }
+
+    /// Get the given parameter and parse as a space-separated list
+    /// of escaped strings.
+    pub fn get_list(&self, key: Param) -> Option<Vec<String>> {
+        self.get(key).map(|s| s.split(' ').map(unescape_param).collect())
+    }
+
+    /// Get the given parameter and parse as a space-separated list
+    /// of escaped `key=value` pairs.
+    pub fn get_map(&self, key: Param) -> Option<Vec<(String, String)>> {
+        Some(self.get(key)?.split(' ').filter_map(|s| {
+            let mut pair = s.splitn(2, '=').map(unescape_param);
+            Some((pair.next()?, pair.next()?))
+        }).collect())
     }
 
     /// Gets the given parameter and parse as [ParamsFile].
@@ -336,6 +381,18 @@ impl Params {
         self.set(key, format!("{}", value));
         self
     }
+
+    /// Set the given parameter to the passed in list of strings
+    pub fn set_list(&mut self, key: Param, value: &[&str]) -> &mut Self {
+        self.set(key, value.iter().map(|s| escape_param(s)).collect::<Vec<_>>().join(" "));
+        self
+    }
+
+    /// Set the given parameter to the passed in list of `(key, value)` pairs
+    pub fn set_map<'a>(&mut self, key: Param, value: &[(&str, &str)]) -> &mut Self {
+        self.set(key, value.iter().map(|(k, v)| format!("{}={}", escape_param(k), escape_param(v))).collect::<Vec<_>>().join(" "));
+        self
+    }
 }
 
 /// The value contained in [Param::File].
@@ -418,6 +475,19 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_param() {
+        assert_eq!(escape_param("test key=value\\s"), "test\\skey\\evalue\\\\s");
+    }
+
+    #[test]
+    fn test_unescape_param() {
+        assert_eq!(unescape_param("\\n"), "\n");
+        assert_eq!(unescape_param("\\\\"), "\\");
+        assert_eq!(unescape_param("\\a\\"), "\\a\\");
+        assert_eq!(unescape_param("test\\skey\\evalue\\\\s"), "test key=value\\s");
+        assert_eq!(unescape_param("test key=value\\x"), "test key=value\\x");
+    }
+        
     fn test_params_file_fs_path() {
         let t = dummy_context();
         if let ParamsFile::FsPath(p) = ParamsFile::from_param(&t.ctx, "/foo/bar/baz").unwrap() {

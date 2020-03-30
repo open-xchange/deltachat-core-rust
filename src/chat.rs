@@ -713,6 +713,7 @@ impl Chat {
         let mut msg_id = 0;
         let mut to_id = 0;
         let mut location_id = 0;
+        let new_rfc724_mid;
 
         if !(self.typ == Chattype::Single
             || self.typ == Chattype::Group
@@ -733,12 +734,12 @@ impl Chat {
         }
 
         if let Some(from) = context.get_config(Config::ConfiguredAddr) {
-            let new_rfc724_mid = {
+            new_rfc724_mid = {
                 let grpid = match self.typ {
                     Chattype::Group | Chattype::VerifiedGroup => Some(self.grpid.as_str()),
                     _ => None,
                 };
-                dc_create_outgoing_rfc724_mid(grpid, &from)
+                dc_create_outgoing_rfc724_mid(context, grpid, from.as_ref())
             };
 
             if self.typ == Chattype::Single {
@@ -2415,7 +2416,11 @@ pub fn add_device_msg(
     if let Some(msg) = msg {
         chat_id = create_or_lookup_by_contact_id(context, DC_CONTACT_ID_DEVICE, Blocked::Not)?.0;
 
-        let rfc724_mid = dc_create_outgoing_rfc724_mid(None, "@device");
+        let rfc724_mid = dc_create_outgoing_rfc724_mid(
+            context,
+            None,
+            "@device"
+        );
         msg.try_calc_and_set_dimensions(context).ok();
         prepare_msg_blob(context, msg)?;
         chat_id.unarchive(context)?;
@@ -2487,7 +2492,7 @@ pub(crate) fn delete_and_reset_all_device_msgs(context: &Context) -> Result<(), 
 ///
 /// For example, it can be a message showing that a member was added to a group.
 pub(crate) fn add_info_msg(context: &Context, chat_id: ChatId, text: impl AsRef<str>) {
-    let rfc724_mid = dc_create_outgoing_rfc724_mid(None, "@device");
+    let rfc724_mid = dc_create_outgoing_rfc724_mid(context, None, "@device");
 
     if context.sql.execute(
         "INSERT INTO msgs (chat_id,from_id,to_id, timestamp,type,state, txt,rfc724_mid) VALUES (?,?,?, ?,?,?, ?,?);",
@@ -2499,7 +2504,7 @@ pub(crate) fn add_info_msg(context: &Context, chat_id: ChatId, text: impl AsRef<
             Viewtype::Text,
             MessageState::InNoticed,
             text.as_ref(),
-            rfc724_mid,
+            rfc724_mid.as_str(),
         ]
     ).is_err() {
         return;

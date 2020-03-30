@@ -3,13 +3,20 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::imap::Imap;
+use crate::coi::CoiDeltachatMode;
+
+// #[derive(Debug, Copy, Clone)]
+// pub enum JobThreadKind {
+//     SentBox,
+//     MoveBox,
+// }
 
 #[derive(Debug)]
 pub struct JobThread {
-    pub name: &'static str,
+    name: &'static str,
     pub folder_config_name: &'static str,
     pub imap: Imap,
-    pub state: Arc<(Mutex<JobState>, Condvar)>,
+    state: Arc<(Mutex<JobState>, Condvar)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -22,6 +29,7 @@ pub struct JobState {
 
 impl JobThread {
     pub fn new(name: &'static str, folder_config_name: &'static str, imap: Imap) -> Self {
+    // pub fn new(job_thread_kind: JobThreadKind, imap: Imap) -> Self {
         JobThread {
             name,
             folder_config_name,
@@ -101,6 +109,13 @@ impl JobThread {
         let prefix = format!("{}-fetch", self.name);
         match self.imap.connect_configured(context) {
             Ok(()) => {
+                let coi_deltachat_mode =
+                    self.imap
+                    .get_coi_config().await
+                    .map(|config| config.get_coi_deltachat_mode())
+                    .unwrap_or(CoiDeltachatMode::Disabled);
+                context.set_coi_deltachat_mode(coi_deltachat_mode);
+                
                 if let Some(watch_folder) = self.get_watch_folder(context) {
                     let start = std::time::Instant::now();
                     info!(context, "{} started...", prefix);
@@ -122,6 +137,15 @@ impl JobThread {
     }
 
     fn get_watch_folder(&self, context: &Context) -> Option<String> {
+        let mut folder_override = None;
+        if self.folder_config_name == "configured_inbox_folder" {
+            folder_override = context.get_inbox_folder_override();
+        } else if self.folder_config_name == "configured_mvbox_folder" {
+            folder_override = context.get_mvbox_folder_override();
+        }
+        if folder_override.is_some() {
+            return folder_override;
+        }
         match context.sql.get_raw_config(context, self.folder_config_name) {
             Some(name) => Some(name),
             None => {

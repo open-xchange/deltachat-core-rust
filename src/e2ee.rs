@@ -358,11 +358,93 @@ pub fn ensure_secret_key_exists(context: &Context) -> Result<String> {
     Ok(self_addr)
 }
 
+pub fn decrypt_message_in_memory(
+    context: &Context,
+    content_type: &str,
+    content: &str,
+    sender_addr: &str,
+) -> Result<Vec<Option<String>>> {
+    use crate::mimeparser::MimeMessage;
+    use crate::constants::Viewtype;
+
+    let self_addr = context
+        .get_config(Config::ConfiguredAddr)
+        .unwrap_or_default();
+
+    let full_mime_msg = format!(
+        "To: {}\r\nFrom: {}\r\nContent-Type: {}\r\n\r\n{}",
+        self_addr, sender_addr, content_type, content
+    );
+
+   let mime_parser = MimeMessage::from_bytes(context, full_mime_msg.as_bytes())?;
+
+    ensure!(mime_parser.has_headers(), "No Headers Found");
+
+    Ok(mime_parser
+        .parts
+        .iter()
+        .map(|part| {
+            if part.typ == Viewtype::Text {
+                part.msg_raw.clone()
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::test_utils::*;
+
+    mod decryption {
+        use super::*;
+
+        #[test]
+        #[ignore = "see line 591 starting with XXX: in fn decrypt_part()"] 
+        fn test_decrypt_message_in_memory() {
+            let content_type = r###"multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted"###;
+            let content = r###"--5d8b0f2e_f8f75182_bb0c
+Content-Type: application/pgp-encrypted
+Content-Transfer-Encoding: 7bit
+
+Version: 1
+
+--5d8b0f2e_f8f75182_bb0c
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: 7bit
+
+-----BEGIN PGP MESSAGE-----
+
+wcBMA5Og3DZG63HoAQf/V375OzDFEbvqaO19mPWnB4rc+jA2E0b4NaxIWnLVQZpL
+/kb4MH0tbh8EDHhFs3IL8LD6o7Y/pkwZnHZ9va5zm+75vRMXKCSsaqCXhu4yYQL7
+JdwSua1byr0pYXGU4Trz6Yrga1sv49I1PAlj1StEYCOaK+vYaYG/EAPwrU/szgIL
+Iq0oIf3wySlAgRXfbYwgcuem7JbOUJZtqlwNxekkO2g2A5M0geOuufIw9dvevBqx
+gULxeS72mLkJkpgOzckaDV9K/6F3lhO7z7qOdb/c2K3FOmQPF7OCFTLqaCMFGiEv
+mCDjB2u7+JHfBeH3sXNu55d3qlltseG2cAEbnS3j69JCAVq0UzMidVWwiX+0Z/Li
+Ju7oJPGwXBqe/XPDD9NojzYmHG3uVgyFALTgXRkSOk8y/wKVvSaAZLhETV3sIa0r
+QgoI
+=iQ+M
+-----END PGP MESSAGE-----
+
+--5d8b0f2e_f8f75182_bb0c--
+
+"###;
+            let sender_addr = "bob@example.org";
+
+            let t = dummy_context();
+            let _ = configure_alice_keypair(&t.ctx);
+
+            assert_eq!(
+                vec![Some(String::from("This is a message"))],
+                decrypt_message_in_memory(&t.ctx, content_type, content, sender_addr).unwrap()
+            );
+        }
+    }
+
 
     mod ensure_secret_key_exists {
         use super::*;

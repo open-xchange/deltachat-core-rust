@@ -1,8 +1,10 @@
 use async_imap::{
     error::Result as ImapResult,
+    extensions::metadata::MetadataDepth,
     types::{Capabilities, Fetch, Mailbox, Name},
     Session as ImapSession,
 };
+use imap_proto::types::Metadata;
 use async_native_tls::TlsStream;
 use async_std::net::TcpStream;
 use async_std::prelude::*;
@@ -167,6 +169,32 @@ impl Session {
             Session::Insecure(i) => i.uid_copy(uid_set, mailbox_name).await?,
         }
 
+        Ok(())
+    }
+
+    pub async fn get_metadata<S: AsRef<str>>(
+        &mut self,
+        mbox: S,
+        key: &[S],
+        depth: MetadataDepth,
+        max_size: Option<usize>,
+    ) -> ImapResult<Vec<Metadata>> {
+        let res = match self {
+            Session::Secure(i) => i.get_metadata(mbox, key, depth, max_size).await?,
+            Session::Insecure(i) => i.get_metadata(mbox, key, depth, max_size).await?,
+        };
+        Ok(res)
+    }
+
+    pub async fn set_metadata<S: AsRef<str>>(
+        &mut self,
+        mbox: S,
+        keyval: &[Metadata],
+    ) -> ImapResult<()> {
+        match self {
+            Session::Secure(i) => i.set_metadata(mbox, keyval).await?,
+            Session::Insecure(i) => i.set_metadata(mbox, keyval).await?,
+        }
         Ok(())
     }
 }

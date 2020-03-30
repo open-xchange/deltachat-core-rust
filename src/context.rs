@@ -21,6 +21,8 @@ use crate::message::{self, Message, MessengerMessage, MsgId};
 use crate::param::Params;
 use crate::smtp::Smtp;
 use crate::sql::Sql;
+use crate::webpush::WebPushConfig;
+use crate::coi::CoiDeltachatMode;
 
 /// Callback function type for [Context]
 ///
@@ -56,6 +58,8 @@ pub struct Context {
     pub running_state: Arc<RwLock<RunningState>>,
     /// Mutex to avoid generating the key for the user more than once.
     pub generating_key_mutex: Mutex<()>,
+    pub webpush_config: Option<WebPushConfig>,
+    pub coi_deltachat_mode: Arc<Mutex<CoiDeltachatMode>>,
     pub translated_stockstrings: RwLock<HashMap<usize, String>>,
 }
 
@@ -137,6 +141,8 @@ impl Context {
             probe_imap_network: Arc::new(RwLock::new(false)),
             perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
             generating_key_mutex: Mutex::new(()),
+            webpush_config: None,
+            coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
             translated_stockstrings: RwLock::new(HashMap::new()),
         };
 
@@ -414,7 +420,7 @@ impl Context {
     }
 
     pub fn is_mvbox(&self, folder_name: impl AsRef<str>) -> bool {
-        let mvbox_name = self.sql.get_raw_config(self, "configured_mvbox_folder");
+        let mvbox_name = self.get_mvbox_folder_override();
 
         if let Some(name) = mvbox_name {
             name == folder_name.as_ref()

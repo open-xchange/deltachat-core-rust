@@ -8,8 +8,9 @@ use std::{fmt, time};
 use deltachat_derive::{FromSql, ToSql};
 use itertools::Itertools;
 use rand::{thread_rng, Rng};
-
+use imap_proto::Metadata;
 use async_std::task;
+pub use async_imap::extensions::metadata::MetadataDepth;
 
 use crate::blob::BlobObject;
 use crate::chat::{self, ChatId};
@@ -84,6 +85,8 @@ pub enum Action {
     MarkseenMdnOnImap = 120,
     MarkseenMsgOnImap = 130,
     MoveMsg = 200,
+    SetMetadata = 300,
+    GetMetadata = 310,
     ConfigureImap = 900,
     ImexImap = 910, // ... high priority
 
@@ -113,6 +116,8 @@ impl From<Action> for Thread {
             MarkseenMdnOnImap => Thread::Imap,
             MarkseenMsgOnImap => Thread::Imap,
             MoveMsg => Thread::Imap,
+            SetMetadata => Thread::Imap,
+            GetMetadata => Thread::Imap,
             ConfigureImap => Thread::Imap,
             ImexImap => Thread::Imap,
 
@@ -434,6 +439,67 @@ impl Job {
             }
         } else {
             Status::Finished(Err(format_err!("No mvbox folder configured")))
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn SetMetadata(&self, context: &Context) -> Status {
+        if let Some(meta) = self.param.get_map(Param::Metadata) {
+            let meta: Vec<Metadata> = meta.iter().map(|(k, v)| Metadata {
+                entry: k.to_string(),
+                value: if v.is_empty() { None } else { Some(v.to_string()) },
+            }).collect();
+            let inbox = &context.inbox_thread.read().unwrap().imap;
+            match inbox.set_metadata(context, "", &meta) {
+                Ok(_) => {
+                    context.call_cb(Event::SetMetadataDone { foreign_id: self.foreign_id });
+                    task::block_on(async{inbox.update_metadata(context, None, None).await});
+                    Status::Finished(Ok(()))
+                },
+                Err(e) => {
+                    error!(context, "Cannot set metadata: {} ({})", e, self.foreign_id);
+                    Status::Finished(Err(format_err!("Cannot set metadata: {} ({})", e, self.foreign_id)))
+                },
+            }
+        } else {
+            Status::Finished(Err(format_err!("Missing metadata")))
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn GetMetadata(&self, context: &Context) -> Status {
+        // let result: Result<Option<String>, String> = if let Some(path) = self.param.get(Param::Metadata) {
+        let result = if let Some(path) = self.param.get(Param::Metadata) {
+            let inbox = &context.inbox_thread.read().unwrap().imap;
+            let res = inbox.get_metadata(context, "", &[path], MetadataDepth::Zero, None);
+            match res {
+                Ok(meta) => {
+                    if let Some(meta) = meta.first() {
+                        if meta.entry == path {
+                            Ok(meta.value.clone())
+                        } else {
+                            Err(format!("Invalid path in GETMETADATA response. Expected: {}, got: {}",
+                                                 path, meta.entry))
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                },
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            Err("Missing metadata path".into())
+        };
+
+        match result {
+            Ok(json) => {
+                context.call_cb(Event::Metadata { foreign_id: self.foreign_id, json });
+                Status::Finished(Ok(()))
+            }
+            Err(err) => {
+                context.call_cb(Event::Error(err));
+                Status::Finished(Err(format_err!("Couldn't get metadata")))
+            }
         }
     }
 
@@ -1050,6 +1116,8 @@ fn perform_job_action(context: &Context, mut job: &mut Job, thread: Thread, trie
         Action::MarkseenMdnOnImap => job.MarkseenMdnOnImap(context),
         Action::MoveMsg => job.MoveMsg(context),
         Action::SendMdn => job.SendMdn(context),
+        Action::SetMetadata => job.SetMetadata(context),
+        Action::GetMetadata => job.GetMetadata(context),
         Action::ConfigureImap => JobConfigureImap(context),
         Action::ImexImap => match JobImexImap(context, &job) {
             Ok(()) => Status::Finished(Ok(())),
