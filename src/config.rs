@@ -65,6 +65,9 @@ pub enum Config {
     #[strum(props(default = "0"))]
     KeyGenType,
 
+    #[strum(props(default = "38535168"))]
+    MaxAttachSize,
+
     SaveMimeHeaders,
     ConfiguredAddr,
     ConfiguredMailServer,

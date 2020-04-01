@@ -22,7 +22,6 @@ use crate::stock::StockMessage;
 // as an upper limit, we double the size; the core won't send messages larger than this
 // to get the netto sizes, we subtract 1 mb header-overhead and the base64-overhead.
 pub const RECOMMENDED_FILE_SIZE: u64 = 24 * 1024 * 1024 / 4 * 3;
-const UPPER_LIMIT_FILE_SIZE: u64 = 49 * 1024 * 1024 / 4 * 3;
 
 #[derive(Clone, Debug)]
 pub enum Loaded {
@@ -1101,7 +1100,7 @@ fn is_file_size_okay(context: &Context, msg: &Message) -> bool {
     match msg.param.get_path(Param::File, context).unwrap_or(None) {
         Some(path) => {
             let bytes = dc_get_filebytes(context, &path);
-            bytes <= UPPER_LIMIT_FILE_SIZE
+            bytes <= context.get_config_int(Config::MaxAttachSize) as u64
         }
         None => false,
     }
