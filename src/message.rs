@@ -224,6 +224,7 @@ impl Message {
             !id.is_special(),
             "Can not load special message IDs from DB."
         );
+        info!(context, "LEAVE: selecting messages from DB, msgID: {}", id);
         context
             .sql
             .query_row(
@@ -254,6 +255,7 @@ impl Message {
                 ),
                 params![id],
                 |row| {
+                    info!(context, "LEAVE: there is a row");
                     let mut msg = Message::default();
                     // msg.id = row.get::<_, AnyMsgId>("id")?;
                     msg.id = row.get("id")?;
@@ -298,7 +300,7 @@ impl Message {
                     msg.chat_blocked = row
                         .get::<_, Option<Blocked>>("blocked")?
                         .unwrap_or_default();
-
+info!(context, "LEAVE: returning queried msg");
                     Ok(msg)
                 },
             )
@@ -306,6 +308,7 @@ impl Message {
     }
 
     pub fn delete_from_db(context: &Context, msg_id: MsgId) {
+        info!(context, "LEAVE: delete msg from DB: {}", msg_id);
         if let Ok(msg) = Message::load_from_db(context, msg_id) {
             sql::execute(
                 context,

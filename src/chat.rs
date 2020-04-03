@@ -256,6 +256,7 @@ impl ChatId {
 
     // similar to as dc_set_draft() but does not emit an event
     fn set_draft_raw(self, context: &Context, msg: &mut Message) -> bool {
+        info!(context, "LEAVE: set_draft_raw");
         let deleted = self.maybe_delete_draft(context);
         let set = self.do_set_draft(context, msg).is_ok();
 
@@ -285,6 +286,7 @@ impl ChatId {
     ///
     /// Returns `true`, if message was deleted, `false` otherwise.
     fn maybe_delete_draft(self, context: &Context) -> bool {
+        info!(context, "LEAVE: maybe_delete_draft");
         match self.get_draft_msg_id(context) {
             Some(msg_id) => {
                 Message::delete_from_db(context, msg_id);
@@ -714,7 +716,7 @@ impl Chat {
         let mut to_id = 0;
         let mut location_id = 0;
         let new_rfc724_mid;
-
+info!(context, "LEAVE: prepare_raw started");
         if !(self.typ == Chattype::Single
             || self.typ == Chattype::Group
             || self.typ == Chattype::VerifiedGroup)
@@ -803,8 +805,8 @@ impl Chat {
                         } else {
                             info!(context, "[autocrypt] no peerstate for {}", addr,);
                             can_encrypt = false;
-                            all_mutual = false;
                         }
+                            all_mutual = false;
                         Ok(())
                     },
                     |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
@@ -813,8 +815,8 @@ impl Chat {
                     Ok(_) => {}
                     Err(err) => {
                         warn!(context, "chat: failed to load peerstates: {:?}", err);
-                    }
                 }
+                    }
 
                 if can_encrypt && (all_mutual || self.parent_is_encrypted(context)?) {
                     msg.param.set_int(Param::GuaranteeE2ee, 1);
@@ -889,7 +891,7 @@ impl Chat {
             }
 
             // add message to the database
-
+info!(context, "LEAVE: inserting msg to database");
             if sql::execute(
                         context,
                         &context.sql,
@@ -917,7 +919,8 @@ impl Chat {
                             "rfc724_mid",
                             new_rfc724_mid,
                         );
-                    } else {
+                info!(context, "LEAVE: inserted msg to DB id: {}", msg_id);
+            } else {
                         error!(
                             context,
                             "Cannot send message, cannot insert to database ({}).",
@@ -927,7 +930,7 @@ impl Chat {
         } else {
             error!(context, "Cannot send message, not configured.",);
         }
-
+info!(context, "LEAVE: prepare_msg raw, returning: {}", msg_id);
         Ok(MsgId::new(msg_id))
     }
 }
@@ -1336,10 +1339,13 @@ fn prepare_msg_common(
     msg: &mut Message,
 ) -> Result<MsgId, Error> {
     msg.id = MsgId::new_unset();
+    info!(context, "LEAVE: calling prepare_msg_blob");
     prepare_msg_blob(context, msg)?;
     chat_id.unarchive(context)?;
 
+    info!(context, "LEAVE: Loading chat from DB");
     let mut chat = Chat::load_from_db(context, chat_id)?;
+    info!(context, "LEAVE: chat is loaded");
     ensure!(chat.can_send(), "cannot send to {}", chat_id);
 
     // The OutPreparing state is set by dc_prepare_msg() before it
@@ -1350,7 +1356,9 @@ fn prepare_msg_common(
         msg.state = MessageState::OutPending;
     }
 
+    info!(context, "LEAVE: calling prepare_msg_raw");
     msg.id = chat.prepare_msg_raw(context, msg, dc_create_smeared_timestamp(context))?;
+    info!(context, "LEAVE: prepare_msg_raw succeded");
     msg.chat_id = chat_id;
 
     Ok(msg.id)
@@ -1386,8 +1394,10 @@ pub fn send_msg(context: &Context, chat_id: ChatId, msg: &mut Message) -> Result
     // the state to OutPending.
     if msg.state != MessageState::OutPreparing {
         // automatically prepare normal messages
+        info!(context, "LEAVE: calling prepare_msg_common");
         prepare_msg_common(context, chat_id, msg)?;
     } else {
+        info!(context, "LEAVE: message OutPreparing");
         // update message state of separately prepared messages
         ensure!(
             chat_id.is_unset() || chat_id == msg.chat_id,
@@ -1396,7 +1406,9 @@ pub fn send_msg(context: &Context, chat_id: ChatId, msg: &mut Message) -> Result
         message::update_msg_state(context, msg.id, MessageState::OutPending);
     }
 
+    info!(context, "LEAVE: calling job_send_msg");
     job_send_msg(context, msg.id)?;
+    info!(context, "LEAVE: job_send_msg succeded");
 
     context.call_cb(Event::MsgsChanged {
         chat_id: msg.chat_id,
@@ -1739,6 +1751,7 @@ pub fn create_group_chat(
         if add_to_chat_contacts_table(context, chat_id, DC_CONTACT_ID_SELF) {
             let mut draft_msg = Message::new(Viewtype::Text);
             draft_msg.set_text(Some(draft_txt));
+            info!(context, "LEAVE: draft raw from create_group_chat");
             chat_id.set_draft_raw(context, &mut draft_msg);
         }
 
@@ -2050,6 +2063,7 @@ pub fn remove_contact_from_chat(
         "Cannot remove special contact"
     );
 
+    info!(context, "LEAVE: remove contact {} start", contact_id);
     let mut msg = Message::default();
     let mut success = false;
 
@@ -2058,6 +2072,7 @@ pub fn remove_contact_from_chat(
     if let Ok(chat) = Chat::load_from_db(context, chat_id) {
         if real_group_exists(context, chat_id) {
             if !is_contact_in_chat(context, chat_id, DC_CONTACT_ID_SELF) {
+                info!(context,"contact is not in chat!!!");
                 emit_event!(
                     context,
                     Event::ErrorSelfNotInGroup(
@@ -2066,11 +2081,13 @@ pub fn remove_contact_from_chat(
                 );
             } else {
                 /* we should respect this - whatever we send to the group, it gets discarded anyway! */
+                info!(context, "LEAVE: continuing removing");
                 if let Ok(contact) = Contact::get_by_id(context, contact_id) {
                     if chat.is_promoted() {
                         msg.viewtype = Viewtype::Text;
                         if contact.id == DC_CONTACT_ID_SELF {
                             set_group_explicitly_left(context, chat.grpid)?;
+                            info!(context, "LEAVE: creating SELF leave msg");
                             msg.text = Some(context.stock_system_msg(
                                 StockMessage::MsgGroupLeft,
                                 "",
@@ -2087,6 +2104,7 @@ pub fn remove_contact_from_chat(
                         }
                         msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
                         msg.param.set(Param::Arg, contact.get_addr());
+                        info!(context, "LEAVE: calling send_msg for notification");
                         msg.id = send_msg(context, chat_id, &mut msg)?;
                         context.call_cb(Event::MsgsChanged {
                             chat_id,
@@ -2099,8 +2117,8 @@ pub fn remove_contact_from_chat(
                     success = true;
                 }
             }
-        }
-    }
+        } else {info!(context, "LEAVE: GROUP not exists!!!");}
+    } else {info!(context, "LEAVE: NOT in DB");}
 
     if !success {
         bail!("Failed to remove contact");

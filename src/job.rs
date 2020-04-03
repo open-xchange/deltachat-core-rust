@@ -526,6 +526,7 @@ impl Job {
                     return Status::RetryNow;
                 }
             }
+            info!(context, "LEAVE delete msg in imap calling delete from db: {}", msg.id);
             Message::delete_from_db(context, msg.id);
             Status::Finished(Ok(()))
         } else {
@@ -865,12 +866,14 @@ fn set_delivered(context: &Context, msg_id: MsgId) {
 
 /* special case for DC_JOB_SEND_MSG_TO_SMTP */
 pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
+    info!(context, "LEAVE: loading msg from DB");
     let mut msg = Message::load_from_db(context, msg_id)?;
+    info!(context, "LEAVE: msg is loaded from DB");
     msg.try_calc_and_set_dimensions(context).ok();
 
     /* create message */
     let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
-
+info!(context, "LEAVE: need encryption: {}", needs_encryption);
     let attach_selfavatar = match chat::shall_attach_selfavatar(context, msg.chat_id) {
         Ok(attach_selfavatar) => attach_selfavatar,
         Err(err) => {
@@ -951,7 +954,7 @@ pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
         msg.param.set_int(Param::GuaranteeE2ee, 1);
         msg.save_param_to_disk(context);
     }
-
+info!(context, "LEAVE: Adding smtp_job");
     add_smtp_job(
         context,
         Action::SendMsgToSmtp,
@@ -959,7 +962,7 @@ pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
         recipients,
         &rendered_msg,
     )?;
-
+info!(context, "LEAVE: SMTP job is added.");
     Ok(())
 }
 
