@@ -199,20 +199,32 @@ pub fn dc_create_outgoing_rfc724_mid(
 
     match group_id {
         None => {
-            let mid_prefix = if context.get_config_bool(Config::Rfc724MsgIdPrefix) { "chat$" } else { "Mr." };
-            format!("{mid_prefix}{group}.{rand2}{hostname}",
+            let mid_prefix = if context.get_config_bool(Config::Rfc724MsgIdPrefix) {
+                "chat$"
+            } else {
+                "Mr."
+            };
+            format!(
+                "{mid_prefix}{group}.{rand2}{hostname}",
                 mid_prefix = mid_prefix,
                 group = dc_create_id(),
                 rand2 = dc_create_id(),
-                hostname = at_hostname)
+                hostname = at_hostname
+            )
         }
         Some(group) => {
-            let mid_prefix = if context.get_config_bool(Config::Rfc724MsgIdPrefix) { "chat$group." } else { "Gr." };
-            format!("{mid_prefix}{group}.{rand2}{hostname}",
+            let mid_prefix = if context.get_config_bool(Config::Rfc724MsgIdPrefix) {
+                "chat$group."
+            } else {
+                "Gr."
+            };
+            format!(
+                "{mid_prefix}{group}.{rand2}{hostname}",
                 mid_prefix = mid_prefix,
                 group = group,
                 rand2 = dc_create_id(),
-                hostname = at_hostname)
+                hostname = at_hostname
+            )
         }
     }
 }
@@ -258,7 +270,8 @@ const NEW_GROUP_ID_PREFIX: &str = "chat$group.";
 pub(crate) fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
     let mid = mid.trim_start_matches('<').trim_end_matches('>');
 
-    if mid.len() < 9 || !mid.starts_with("Gr.") {
+    if mid.len() < 9 || !mid.starts_with(OLD_GROUP_ID_PREFIX) && !mid.starts_with(NEW_GROUP_ID_PREFIX) {
+        println!("### returning for mid: '{}'", mid);
         return None;
     }
 
@@ -266,7 +279,7 @@ pub(crate) fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
         return suffix
             .split('.')
             .next()
-            .filter(|new_grpid| new_grpid.len() >= 12);
+            .filter(|new_grpid| new_grpid.len() >= 11 || new_grpid.len() == 16);
     }
 
     if let Some(suffix) = split_prefix(mid, OLD_GROUP_ID_PREFIX) {
