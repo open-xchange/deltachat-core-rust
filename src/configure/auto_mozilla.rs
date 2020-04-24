@@ -4,9 +4,8 @@
 use quick_xml;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 
-use crate::constants::*;
 use crate::context::Context;
-use crate::login_param::LoginParam;
+use crate::login_param::{LoginParam, ServerSecurity, Service};
 
 use super::read_url::read_url;
 
@@ -110,10 +109,10 @@ fn parse_xml(in_emailaddr: &str, xml_raw: &str) -> Result<LoginParam> {
         buf.clear();
     }
 
-    if moz_ac.out.mail_server.is_empty()
-        || moz_ac.out.mail_port == 0
-        || moz_ac.out.send_server.is_empty()
-        || moz_ac.out.send_port == 0
+    if moz_ac.out.srv_params[Service::Imap as usize].hostname.is_empty()
+        || moz_ac.out.srv_params[Service::Imap as usize].port == 0
+        || moz_ac.out.srv_params[Service::Smtp as usize].hostname.is_empty()
+        || moz_ac.out.srv_params[Service::Smtp as usize].port == 0
     {
         Err(Error::IncompleteAutoconfig(moz_ac.out))
     } else {
@@ -157,39 +156,17 @@ fn moz_autoconfigure_text_cb<B: std::io::BufRead>(
 
     match moz_ac.tag_server {
         MozServer::Imap => match moz_ac.tag_config {
-            MozConfigTag::Hostname => moz_ac.out.mail_server = val,
-            MozConfigTag::Port => moz_ac.out.mail_port = val.parse().unwrap_or_default(),
-            MozConfigTag::Username => moz_ac.out.mail_user = val,
-            MozConfigTag::Sockettype => {
-                let val_lower = val.to_lowercase();
-                if val_lower == "ssl" {
-                    moz_ac.out.server_flags |= DC_LP_IMAP_SOCKET_SSL as i32
-                }
-                if val_lower == "starttls" {
-                    moz_ac.out.server_flags |= DC_LP_IMAP_SOCKET_STARTTLS as i32
-                }
-                if val_lower == "plain" {
-                    moz_ac.out.server_flags |= DC_LP_IMAP_SOCKET_PLAIN as i32
-                }
-            }
+            MozConfigTag::Hostname => moz_ac.out.srv_params[Service::Imap as usize].hostname = val,
+            MozConfigTag::Port => moz_ac.out.srv_params[Service::Imap as usize].port = val.parse().unwrap_or_default(),
+            MozConfigTag::Username => moz_ac.out.srv_params[Service::Imap as usize].user = val,
+            MozConfigTag::Sockettype => moz_ac.out.srv_params[Service::Imap as usize].security = ServerSecurity::from_str_opt(val.to_lowercase().as_str()),
             _ => {}
         },
         MozServer::Smtp => match moz_ac.tag_config {
-            MozConfigTag::Hostname => moz_ac.out.send_server = val,
-            MozConfigTag::Port => moz_ac.out.send_port = val.parse().unwrap_or_default(),
-            MozConfigTag::Username => moz_ac.out.send_user = val,
-            MozConfigTag::Sockettype => {
-                let val_lower = val.to_lowercase();
-                if val_lower == "ssl" {
-                    moz_ac.out.server_flags |= DC_LP_SMTP_SOCKET_SSL as i32
-                }
-                if val_lower == "starttls" {
-                    moz_ac.out.server_flags |= DC_LP_SMTP_SOCKET_STARTTLS as i32
-                }
-                if val_lower == "plain" {
-                    moz_ac.out.server_flags |= DC_LP_SMTP_SOCKET_PLAIN as i32
-                }
-            }
+            MozConfigTag::Hostname => moz_ac.out.srv_params[Service::Smtp as usize].hostname = val,
+            MozConfigTag::Port => moz_ac.out.srv_params[Service::Smtp as usize].port = val.parse().unwrap_or_default(),
+            MozConfigTag::Username => moz_ac.out.srv_params[Service::Smtp as usize].user = val,
+            MozConfigTag::Sockettype => moz_ac.out.srv_params[Service::Smtp as usize].security = ServerSecurity::from_str_opt(val.to_lowercase().as_str()),
             _ => {}
         },
         MozServer::Undefined => {}

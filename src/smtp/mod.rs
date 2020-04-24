@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use async_smtp::smtp::client::net::*;
 use async_smtp::*;
+// use async_trait::async_trait;
 
-use crate::constants::*;
 use crate::context::Context;
 use crate::events::Event;
-use crate::login_param::{dc_build_tls, LoginParam};
+use crate::login_param::{dc_build_tls, AuthScheme, LoginParam, ServerSecurity, Service};
 use crate::oauth2::*;
 
 /// SMTP write and read timeout in seconds.
@@ -98,15 +98,14 @@ impl Smtp {
     /// Connect using the provided login params.
     pub fn connect(&mut self, context: &Context, lp: &LoginParam) -> Result<()> {
         async_std::task::block_on(self.inner_connect(context, lp))
-    }
+	}
 
     async fn inner_connect(&mut self, context: &Context, lp: &LoginParam) -> Result<()> {
         if self.is_connected() {
             warn!(context, "SMTP already connected.");
             return Ok(());
         }
-
-        if lp.send_server.is_empty() || lp.send_port == 0 {
+        if lp.srv_params[Service::Smtp as usize].hostname.is_empty() || lp.srv_params[Service::Smtp as usize].port == 0 {
             context.call_cb(Event::ErrorNetwork("SMTP bad parameters.".into()));
             return Err(Error::BadParameters);
         }
@@ -118,23 +117,23 @@ impl Smtp {
             })?;
         self.from = Some(from);
 
-        let domain = &lp.send_server;
-        let port = lp.send_port as u16;
+        let hostname = &lp.srv_params[Service::Smtp as usize].hostname;
+        let port = lp.srv_params[Service::Smtp as usize].port as u16;
 
-        let tls_config = dc_build_tls(lp.smtp_certificate_checks);
-        let tls_parameters = ClientTlsParameters::new(domain.to_string(), tls_config);
+        let tls_config = dc_build_tls(lp.srv_params[Service::Smtp as usize].certificate_checks);
+        let tls_parameters = ClientTlsParameters::new(hostname.to_string(), tls_config);
 
-        let (creds, mechanism) = if 0 != lp.server_flags & (DC_LP_AUTH_OAUTH2 as i32) {
+        let (creds, mechanism) = if lp.auth_scheme == AuthScheme::Oauth2 {
             // oauth2
             let addr = &lp.addr;
-            let send_pw = &lp.send_pw;
-            let access_token = dc_get_oauth2_access_token(context, addr, send_pw, false);
+            let smtp_pw = &lp.srv_params[Service::Smtp as usize].pw;
+            let access_token = dc_get_oauth2_access_token(context, addr, smtp_pw, false);
             if access_token.is_none() {
                 return Err(Error::Oauth2Error {
                     address: addr.to_string(),
                 });
             }
-            let user = &lp.send_user;
+            let user = &lp.srv_params[Service::Smtp as usize].user;
             (
                 smtp::authentication::Credentials::new(
                     user.to_string(),
@@ -144,8 +143,8 @@ impl Smtp {
             )
         } else {
             // plain
-            let user = lp.send_user.clone();
-            let pw = lp.send_pw.clone();
+            let user = lp.srv_params[Service::Smtp as usize].user.clone();
+            let pw = lp.srv_params[Service::Smtp as usize].pw.clone();
             (
                 smtp::authentication::Credentials::new(user, pw),
                 vec![
@@ -155,15 +154,16 @@ impl Smtp {
             )
         };
 
-        let security = if 0
-            != lp.server_flags & (DC_LP_SMTP_SOCKET_STARTTLS | DC_LP_SMTP_SOCKET_PLAIN) as i32
-        {
-            smtp::ClientSecurity::Opportunistic(tls_parameters)
-        } else {
-            smtp::ClientSecurity::Wrapper(tls_parameters)
+        let security = match lp.srv_params[Service::Smtp as usize].security.unwrap() {
+            ServerSecurity::Ssl => {
+                smtp::ClientSecurity::Wrapper(tls_parameters)
+            },
+            _ => {
+                smtp::ClientSecurity::Opportunistic(tls_parameters)
+            },
         };
 
-        let client = smtp::SmtpClient::with_security((domain.as_str(), port), security)
+        let client = smtp::SmtpClient::with_security((hostname.as_str(), port), security)
             .await
             .map_err(Error::ConnectionSetupFailure)?;
 
@@ -181,9 +181,25 @@ impl Smtp {
         self.last_success = Some(Instant::now());
         context.call_cb(Event::SmtpConnected(format!(
             "SMTP-LOGIN as {} ok",
-            lp.send_user,
+            lp.srv_params[Service::Smtp as usize].user,
         )));
 
         Ok(())
     }
+
+    pub(crate) async fn try_connect(&mut self, context: &Context, lp: &LoginParam) -> bool {
+        // let mut smtp_clone = self.clone();
+        println!("Try CONNECT!");
+        match self.inner_connect(context, lp).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(context, "SMTP connection error: {}",err);
+                false
+            },
+        }
+    }
 }
+
+// #[async_trait]
+// impl TryConnect for Smtp {
+// }
