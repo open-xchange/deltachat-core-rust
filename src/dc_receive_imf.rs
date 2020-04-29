@@ -56,7 +56,7 @@ pub fn dc_receive_imf(
         println!("{}", String::from_utf8_lossy(imf_raw));
     }
 
-    let mut mime_parser = MimeMessage::from_bytes(context, imf_raw)?;
+    let mut mime_parser = MimeMessage::from_bytes(context, imf_raw, true)?;
 
     // we can not add even an empty record if we have no info whatsoever
     ensure!(mime_parser.has_headers(), "No Headers Found");
@@ -1669,7 +1669,7 @@ mod tests {
                     References: <Gr.HcxyMARjyJy.9-uvzWPTLtV@nauta.cu>\n\
                     \n\
                     hello\x00";
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(extract_grpid(&mimeparser, HeaderDef::InReplyTo), None);
         let grpid = Some("HcxyMARjyJy");
         assert_eq!(extract_grpid(&mimeparser, HeaderDef::References), grpid);
@@ -1684,7 +1684,7 @@ mod tests {
                     References: <qweqweqwe>, <Gr.HcxyMARjyJy.9-uvzWPTLtV@nau.ca>\n\
                     \n\
                     hello\x00";
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         let grpid = Some("HcxyMARjyJy");
         assert_eq!(extract_grpid(&mimeparser, HeaderDef::InReplyTo), grpid);
         assert_eq!(extract_grpid(&mimeparser, HeaderDef::References), grpid);
