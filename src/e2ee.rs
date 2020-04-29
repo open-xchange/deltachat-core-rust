@@ -123,6 +123,7 @@ pub fn try_decrypt(
     context: &Context,
     mail: &ParsedMail<'_>,
     message_time: i64,
+    allow_side_effects: bool,
 ) -> Result<(Option<Vec<u8>>, HashSet<String>)> {
     let from = mail
         .headers
@@ -135,7 +136,7 @@ pub fn try_decrypt(
     let mut peerstate = None;
     let autocryptheader = Aheader::from_headers(context, &from, &mail.headers);
 
-    if message_time > 0 {
+    if message_time > 0 && allow_side_effects {
         peerstate = Peerstate::from_addr(context, &context.sql, &from);
 
         if let Some(ref mut peerstate) = peerstate {
@@ -376,7 +377,7 @@ pub fn decrypt_message_in_memory(
         self_addr, sender_addr, content_type, content
     );
 
-   let mime_parser = MimeMessage::from_bytes(context, full_mime_msg.as_bytes())?;
+   let mime_parser = MimeMessage::from_bytes(context, full_mime_msg.as_bytes(), false)?;
 
     ensure!(mime_parser.has_headers(), "No Headers Found");
 

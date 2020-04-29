@@ -80,7 +80,7 @@ impl Default for SystemMessage {
 const MIME_AC_SETUP_FILE: &str = "application/autocrypt-setup";
 
 impl MimeMessage {
-    pub fn from_bytes(context: &Context, body: &[u8]) -> Result<Self> {
+    pub fn from_bytes(context: &Context, body: &[u8], allow_side_effects: bool) -> Result<Self> {
         let mail = mailparse::parse_mail(body)?;
 
         let message_time = mail
@@ -98,7 +98,12 @@ impl MimeMessage {
         let mail_raw;
         let mut gossipped_addr = Default::default();
 
-        let (mail, signatures) = match e2ee::try_decrypt(context, &mail, message_time) {
+        let (mail, signatures) = match e2ee::try_decrypt(
+            context,
+            &mail,
+            message_time,
+            allow_side_effects
+        ) {
             Ok((raw, signatures)) => {
                 if let Some(raw) = raw {
                     // Valid autocrypt message, encrypted
@@ -135,7 +140,7 @@ impl MimeMessage {
                 // and the caller cannot display the message
                 // and try to assign the message to a chat
                 warn!(context, "decryption failed: {}", err);
-                return Err(err)
+                return Err(err);
             }
         };
 
@@ -1106,7 +1111,7 @@ mod tests {
     fn test_dc_mimeparser_crash() {
         let context = dummy_context();
         let raw = include_bytes!("../test-data/message/issue_523.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
 
         assert_eq!(mimeparser.get_subject(), None);
         assert_eq!(mimeparser.parts.len(), 1);
@@ -1116,7 +1121,7 @@ mod tests {
     fn test_get_rfc724_mid_exists() {
         let context = dummy_context();
         let raw = include_bytes!("../test-data/message/mail_with_message_id.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
 
         assert_eq!(
             mimeparser.get_rfc724_mid(),
@@ -1128,7 +1133,7 @@ mod tests {
     fn test_get_rfc724_mid_not_exists() {
         let context = dummy_context();
         let raw = include_bytes!("../test-data/message/issue_523.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(mimeparser.get_rfc724_mid(), None);
     }
 
@@ -1136,7 +1141,7 @@ mod tests {
     fn test_get_recipients() {
         let context = dummy_context();
         let raw = include_bytes!("../test-data/message/mail_with_cc.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         let recipients = get_recipients(mimeparser.header.iter());
         assert!(recipients.contains("abc@bcd.com"));
         assert!(recipients.contains("def@def.de"));
@@ -1192,7 +1197,7 @@ mod tests {
                     test1\n\
                     ";
 
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
 
         let of = mimeparser
             .parse_first_addr(&context.ctx, HeaderDef::From_)
@@ -1225,7 +1230,7 @@ mod tests {
                     --==break==--\n\
                     \n";
 
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
 
         // non-overwritten headers do not bubble up
         let of = mimeparser.get(HeaderDef::SecureJoinGroup).unwrap();
@@ -1250,26 +1255,26 @@ mod tests {
         let t = dummy_context();
 
         let raw = include_bytes!("../test-data/message/mail_attach_txt.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..], true).unwrap();
         assert_eq!(mimeparser.user_avatar, None);
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_avatar.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..], true).unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert!(mimeparser.user_avatar.unwrap().is_change());
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_avatar_deleted.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..], true).unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert_eq!(mimeparser.user_avatar, Some(AvatarAction::Delete));
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_and_group_avatars.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..], true).unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert!(mimeparser.user_avatar.unwrap().is_change());
@@ -1279,7 +1284,7 @@ mod tests {
         let raw = include_bytes!("../test-data/message/mail_with_user_and_group_avatars.eml");
         let raw = String::from_utf8_lossy(raw).to_string();
         let raw = raw.replace("Chat-User-Avatar:", "Xhat-Xser-Xvatar:");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw.as_bytes()).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw.as_bytes(), true).unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Image);
         assert_eq!(mimeparser.user_avatar, None);
@@ -1316,7 +1321,7 @@ Content-Disposition: attachment; filename=\"message.kml\"\n\
 --==break==--\n\
 ;";
 
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(
             mimeparser.get_subject(),
             Some("Location streaming".to_string())
@@ -1363,7 +1368,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
 --kJBbU58X1xeWNHgBtTbMk80M5qnV4N--\n\
 ";
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(
             message.get_subject(),
             Some("Chat: Message opened".to_string())
@@ -1441,7 +1446,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
 --outer--\n\
 ";
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(
             message.get_subject(),
             Some("Chat: Message opened".to_string())
@@ -1486,7 +1491,7 @@ Additional-Message-IDs: <foo@example.com> <foo@example.net>\n\
 --kJBbU58X1xeWNHgBtTbMk80M5qnV4N--\n\
 ";
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(
             message.get_subject(),
             Some("Chat: Message opened".to_string())
@@ -1528,7 +1533,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
 ------=_Part_25_46172632.1581201680436--
 "#;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
         assert_eq!(
             message.get_subject(),
             Some("Mail with inline attachment".to_string())
