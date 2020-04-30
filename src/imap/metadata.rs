@@ -91,20 +91,24 @@ impl Imap {
             keys.push("/private/vendor/vendor.dovecot/webpush");
             webpush = Some(WebPushConfig::default());
         }
-        
+
         let metadata = self.get_metadata(context, "", &keys, MetadataDepth::One, None);
-        
+
         if let Ok(metadata) = metadata {
             for meta in metadata {
                 match meta.entry.as_str() {
                     "/private/vendor/vendor.dovecot/coi/config/mailbox-root" => {
                         if coi.is_some() && meta.value.is_some() {
-                            coi.as_mut().unwrap().set_mailbox_root(&meta.value.unwrap());
+                            coi.as_mut()
+                                .unwrap()
+                                .coi_root = meta.value.unwrap();
                         }
                     }
                     "/private/vendor/vendor.dovecot/coi/config/enabled" => {
-                        if coi.is_some() && meta.value.is_some() {
-                            coi.as_mut().unwrap().enabled = meta.value.unwrap() == "yes";
+                        if let Some(ref mut c) = coi {
+                            if let Some(val) = meta.value {
+                                c.enabled = val == "yes";
+                            }
                         }
                     }
                     "/private/vendor/vendor.dovecot/coi/config/message-filter" => {

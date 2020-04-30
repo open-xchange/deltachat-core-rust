@@ -113,7 +113,7 @@ impl Imap {
                             async_std::future::timeout(Duration::from_secs(15), handle.done())
                                 .await
                                 .map_err(|err| {
-                                    self.trigger_reconnect();
+                                    self.trigger_reconnect(context);
                                     Error::IdleTimeout(err)
                                 })?;
 
@@ -125,7 +125,7 @@ impl Imap {
                                 // if we cannot terminate IDLE it probably
                                 // means that we waited long (with idle_wait)
                                 // but the network went away/changed
-                                self.trigger_reconnect();
+                                self.trigger_reconnect(context);
                                 return Err(Error::IdleProtocolFailed(err));
                             }
                         }
@@ -168,7 +168,7 @@ impl Imap {
                             async_std::future::timeout(Duration::from_secs(15), handle.done())
                                 .await
                                 .map_err(|err| {
-                                    self.trigger_reconnect();
+                                    self.trigger_reconnect(context);
                                     Error::IdleTimeout(err)
                                 })?;
 
@@ -180,7 +180,7 @@ impl Imap {
                                 // if we cannot terminate IDLE it probably
                                 // means that we waited long (with idle_wait)
                                 // but the network went away/changed
-                                self.trigger_reconnect();
+                                self.trigger_reconnect(context);
                                 return Err(Error::IdleProtocolFailed(err));
                             }
                         }
@@ -242,7 +242,7 @@ impl Imap {
                             }
                             Err(err) => {
                                 error!(context, "could not fetch from folder: {}", err);
-                                self.trigger_reconnect()
+                                self.trigger_reconnect(context)
                             }
                         }
                     }

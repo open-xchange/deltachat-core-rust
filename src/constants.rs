@@ -181,7 +181,7 @@ pub const DC_BOB_SUCCESS: i32 = 1;
 pub const AVATAR_SIZE: u32 = 192;
 
 // this value can be increased if the folder configuration is changed and must be redone on next program start
-pub const DC_FOLDERS_CONFIGURED_VERSION: i32 = 3;
+pub const DC_FOLDERS_CONFIGURED_VERSION: i32 = 4;
 
 #[derive(
     Debug,

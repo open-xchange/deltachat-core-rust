@@ -13,12 +13,13 @@ use async_imap::{
 };
 use async_std::sync::{Mutex, RwLock};
 use async_std::task;
+use futures::future::{BoxFuture, FutureExt};
 pub use imap_proto::types::Address;
 
 use crate::coi::CoiConfig;
 use crate::config::*;
 use crate::constants::*;
-use crate::context::Context;
+use crate::context::{ConfigurableFolders, Context};
 use crate::dc_receive_imf::{
     dc_receive_imf, from_field_to_contact_id, is_msgrmsg_rfc724_mid_in_list,
 };
@@ -159,7 +160,6 @@ struct ImapConfig {
     pub selected_folder_needs_expunge: bool,
     pub can_idle: bool,
     pub auth_scheme: AuthScheme,
-
     /// True if the server has MOVE capability as defined in
     /// https://tools.ietf.org/html/rfc6851
     pub can_move: bool,
@@ -202,7 +202,8 @@ impl Imap {
         self.should_reconnect.load(Ordering::Relaxed)
     }
 
-    pub fn trigger_reconnect(&self) {
+    pub fn trigger_reconnect(&self, context: &Context) {
+        *context.config_folders.write().unwrap() = None;
         self.should_reconnect.store(true, Ordering::Relaxed)
     }
 
@@ -223,26 +224,24 @@ impl Imap {
             let server_security = config.server_security;
             let imap_server: &str = config.imap_server.as_ref();
             let imap_port = config.imap_port;
-            match server_security  {
+            match server_security {
                 ServerSecurity::Ssl => {
                     Client::connect_secure(
                         (imap_server, imap_port),
                         imap_server,
                         config.certificate_checks,
                     )
-                        .await
-                },
-                _ => {
-                    match Client::connect_insecure((imap_server, imap_port)).await {
-                        Ok(client) => {
-                            if server_security == ServerSecurity::Starttls {
-                                client.secure(imap_server, config.certificate_checks).await
-                            } else {
-                                Ok(client)
-                            }
+                    .await
+                }
+                _ => match Client::connect_insecure((imap_server, imap_port)).await {
+                    Ok(client) => {
+                        if server_security == ServerSecurity::Starttls {
+                            client.secure(imap_server, config.certificate_checks).await
+                        } else {
+                            Ok(client)
                         }
-                        Err(err) => Err(err),
                     }
+                    Err(err) => Err(err),
                 },
             }
         };
@@ -257,7 +256,9 @@ impl Imap {
                     if auth_scheme == AuthScheme::Oauth2 {
                         let addr: &str = config.addr.as_ref();
 
-                        if let Some(token) = dc_get_oauth2_access_token(context, addr, imap_pw, true) {
+                        if let Some(token) =
+                            dc_get_oauth2_access_token(context, addr, imap_pw, true)
+                        {
                             let auth = OAuth2 {
                                 user: imap_user.into(),
                                 access_token: token,
@@ -303,7 +304,7 @@ impl Imap {
                     context,
                     Event::ErrorNetwork(format!("{} ({})", message, err))
                 );
-                self.trigger_reconnect();
+                self.trigger_reconnect(context);
                 Err(Error::LoginFailed(format!("cannot login as {}", imap_user)))
             }
         }
@@ -339,7 +340,7 @@ impl Imap {
         cfg.can_idle = false;
         cfg.can_move = false;
     }
-    
+
     /// Connects to imap account using already-configured parameters.
     pub fn connect_configured(&self, context: &Context) -> Result<()> {
         if async_std::task::block_on(self.is_connected()) && !self.should_reconnect() {
@@ -352,17 +353,163 @@ impl Imap {
         let param = LoginParam::from_database(context, "configured_");
         // the trailing underscore is correct
 
-        if task::block_on(self.connect(context, &param)) {
-            self.ensure_configured_folders(context, true)
-        } else {
-            Err(Error::ConnectionFailed(format!("{}", param)))
+        task::block_on(
+            async {
+                if self.connect(context, &param).await {
+                    self.ensure_configured_folders(context).await
+                } else {
+                    Err(Error::ConnectionFailed(format!("{}", param)))
+                }
+            }
+        )
+    }
+
+    fn create_folder<'a>(
+        context: &'a Context,
+        session: &'a mut Session,
+        folder: String,
+        delimiter: String,
+        try_under_inbox: bool,
+    ) -> BoxFuture<'a, Result<bool>> {
+        async move {
+            match session.create(folder.clone()).await {
+                Ok(_) => {
+                    // SUBSCRIBE is needed to make the folder visible to the LSUB command
+                    // that may be used by other MUAs to list folders.
+                    // for the LIST command, the folder is always visible.
+                    if let Err(err) = session.subscribe(folder.clone()).await {
+                        warn!(context, "could not subscribe to {:?}: {:?}", folder.clone(), err);
+                    }
+                    Ok(!try_under_inbox)
+                }
+                Err(err) => {
+                    warn!(
+                        context,
+                        "Cannot create MVBOX-folder{}. ({})",
+                        if try_under_inbox {
+                            ", trying to create INBOX subfolder"
+                        } else {
+                            ""
+                        },
+                        err,
+                    );
+                    if try_under_inbox {
+                        Self::create_folder(
+                            context,
+                            session,
+                            format!("INBOX{}{}", delimiter, folder.clone()),
+                            delimiter,
+                            false,
+                        ).await
+                    } else {Err(Error::NoMailbox("Couldnot create mailbox".to_string()))}
+                }
+            }
+        }.boxed()
+    }
+
+    async fn configure_folders(&self, context: &Context) -> Result<ConfigurableFolders> {
+        let mvbox_root_config_key = "movebox_under_inbox";
+        let folders_configured_key = "folders_configured";
+        if let Some(ref mut session) = &mut *self.session.lock().await {
+            let folders = match self.list_folders(session, context).await {
+                Some(f) => f,
+                None => {
+                    return Err(Error::Other("list_folders failed".to_string()));
+                }
+            };
+            let mut delimiter = "";
+            if let Some(folder) = folders.first() {
+                if let Some(d) = folder.delimiter() {
+                    delimiter = d;
+                }
+            }
+            if delimiter.is_empty() {
+                return Err(Error::Other("IMAP delimiter not found".to_string()));
+            }
+
+            let sentbox_folder = match folders
+                .iter()
+                .find(|folder| match get_folder_meaning(folder) {
+                    FolderMeaning::SentObjects => true,
+                    _ => false,
+                }) {
+                    Some(folder) => folder.name().to_string(),
+                    None => {return Err(Error::NoMailbox("Sentbox not found".to_string()));}
+                };
+
+            let movebox_folder;
+            let move_folder = format!(
+                "{}{}Chats",
+                if let Some(coi) = &self.config.read().await.coi {
+                    coi.coi_root.clone()
+                } else {
+                    "COI".to_string()
+                },
+                delimiter,
+            );
+            let fallback_folder = format!("INBOX{}{}", delimiter, move_folder);
+            let mvbox_under_inbox: bool;
+            let folders_configured = context
+                .sql
+                .get_raw_config_int(context, folders_configured_key);
+            if folders_configured.unwrap_or_default() >= DC_FOLDERS_CONFIGURED_VERSION {
+                if context
+                    .sql
+                    .get_raw_config_bool(context, mvbox_root_config_key)
+                {
+                    movebox_folder = fallback_folder;
+                } else {
+                    movebox_folder = move_folder;
+                }
+            } else {
+                let existing_mvbox = folders
+                    .iter()
+                    .find(|folder| folder.name() == move_folder || folder.name() == fallback_folder)
+                    .map(|n| n.name().to_string());
+                if existing_mvbox.is_some() {
+                    movebox_folder = existing_mvbox.unwrap();
+                    mvbox_under_inbox = movebox_folder != move_folder;
+                } else {
+                    mvbox_under_inbox =
+                        Self::create_folder(
+                            context,
+                            session,
+                            move_folder.clone(),
+                            delimiter.to_string(),
+                            true,
+                        ).await?;
+                    movebox_folder = if mvbox_under_inbox {
+                        fallback_folder
+                    } else {
+                        move_folder.clone()
+                    };
+                }
+                context.sql.set_raw_config_bool(
+                    context,
+                    mvbox_root_config_key,
+                    mvbox_under_inbox,
+                )?;
+                context.sql.set_raw_config_int(
+                    context,
+                    folders_configured_key,
+                    DC_FOLDERS_CONFIGURED_VERSION,
+                )?;
+            }
+            return Ok(ConfigurableFolders {
+                sentbox_folder,
+                movebox_folder,
+            });
         }
+        Err(Error::Other("Couldn't acquire session lock".to_string()))
     }
 
     /// tries connecting to imap account using the specific login
     /// parameters
     pub async fn connect(&self, context: &Context, lp: &LoginParam) -> bool {
-        if lp.srv_params[Service::Imap as usize].hostname.is_empty() || lp.srv_params[Service::Imap as usize].user.is_empty() || lp.srv_params[Service::Imap as usize].pw.is_empty() {
+        if lp.srv_params[Service::Imap as usize].hostname.is_empty()
+            || lp.srv_params[Service::Imap as usize].user.is_empty()
+            || lp.srv_params[Service::Imap as usize].pw.is_empty()
+        {
             context.call_cb(Event::ErrorNetwork("IMAP bad parameters.".into()));
             return false;
         }
@@ -399,7 +546,11 @@ impl Imap {
             Some(ref mut session) => match session.capabilities().await {
                 Ok(caps) => {
                     if !context.sql.is_open() {
-                        warn!(context, "IMAP-LOGIN as {} ok but ABORTING", lp.srv_params[Service::Imap as usize].user,);
+                        warn!(
+                            context,
+                            "IMAP-LOGIN as {} ok but ABORTING",
+                            lp.srv_params[Service::Imap as usize].user,
+                        );
                         true
                     } else {
                         let can_idle = caps.has_str("IDLE");
@@ -421,7 +572,8 @@ impl Imap {
                             context,
                             Event::ImapConnected(format!(
                                 "IMAP-LOGIN as {}, capabilities: {}",
-                                lp.srv_params[Service::Imap as usize].user, caps_list,
+                                lp.srv_params[Service::Imap as usize].user,
+                                caps_list,
                             ))
                         );
                         false
@@ -735,7 +887,7 @@ impl Imap {
                 Err(err) => {
                     // TODO maybe differentiate between IO and input/parsing problems
                     // so we don't reconnect if we have a (rare) input/output parsing problem?
-                    self.trigger_reconnect();
+                    self.trigger_reconnect(context);
                     warn!(
                         context,
                         "Error on fetching message #{} from folder \"{}\"; error={}.",
@@ -748,7 +900,7 @@ impl Imap {
             }
         } else {
             // we could not get a valid imap session, this should be retried
-            self.trigger_reconnect();
+            self.trigger_reconnect(context);
             return Err(Error::Other("Could not get IMAP session".to_string()));
         };
 
@@ -1056,123 +1208,18 @@ impl Imap {
         })
     }
 
-    pub fn ensure_configured_folders(&self, context: &Context, create_mvbox: bool) -> Result<()> {
-        let folders_configured = context
-            .sql
-            .get_raw_config_int(context, "folders_configured");
-        if folders_configured.unwrap_or_default() >= DC_FOLDERS_CONFIGURED_VERSION {
+    async fn ensure_configured_folders(&self, context: &Context) -> Result<()> {
+        let mut folders = match context.config_folders.write() {
+            Ok(f) => f,
+            Err(_) => {return Err(Error::Other("Could not lock config_folders.".to_string()));}
+        };
+        if folders.is_some() {
+            // Already configured by another thread.
             return Ok(());
         }
-
-        self.configure_folders(context, create_mvbox)
-    }
-
-    pub fn configure_folders(&self, context: &Context, create_mvbox: bool) -> Result<()> {
-        task::block_on(async move {
-            if !self.is_connected().await {
-                return Err(Error::NoConnection);
-            }
-
-            info!(context, "Configuring IMAP-folders.");
-
-            if let Some(ref mut session) = &mut *self.session.lock().await {
-                let folders = match self.list_folders(session, context).await {
-                    Some(f) => f,
-                    None => {
-                        return Err(Error::Other("list_folders failed".to_string()));
-                    }
-                };
-
-                let sentbox_folder =
-                    folders
-                        .iter()
-                        .find(|folder| match get_folder_meaning(folder) {
-                            FolderMeaning::SentObjects => true,
-                            _ => false,
-                        });
-                info!(context, "sentbox folder is {:?}", sentbox_folder);
-
-                let mut delimiter = ".";
-                if let Some(folder) = folders.first() {
-                    if let Some(d) = folder.delimiter() {
-                        if !d.is_empty() {
-                            delimiter = d;
-                        }
-                    }
-                }
-                info!(context, "Using \"{}\" as folder-delimiter.", delimiter);
-                let fallback_folder = format!("INBOX{}DeltaChat", delimiter);
-
-                let mut mvbox_folder = folders
-                    .iter()
-                    .find(|folder| folder.name() == "DeltaChat" || folder.name() == fallback_folder)
-                    .map(|n| n.name().to_string());
-
-                if mvbox_folder.is_none() && create_mvbox {
-                    info!(context, "Creating MVBOX-folder \"DeltaChat\"...",);
-
-                    match session.create("DeltaChat").await {
-                        Ok(_) => {
-                            mvbox_folder = Some("DeltaChat".into());
-
-                            info!(context, "MVBOX-folder created.",);
-                        }
-                        Err(err) => {
-                            warn!(
-                                context,
-                                "Cannot create MVBOX-folder, trying to create INBOX subfolder. ({})",
-                                err
-                            );
-
-                            match session.create(&fallback_folder).await {
-                                Ok(_) => {
-                                    mvbox_folder = Some(fallback_folder);
-                                    info!(
-                                        context,
-                                        "MVBOX-folder created as INBOX subfolder. ({})", err
-                                    );
-                                }
-                                Err(err) => {
-                                    warn!(context, "Cannot create MVBOX-folder. ({})", err);
-                                }
-                            }
-                        }
-                    }
-                    // SUBSCRIBE is needed to make the folder visible to the LSUB command
-                    // that may be used by other MUAs to list folders.
-                    // for the LIST command, the folder is always visible.
-                    if let Some(ref mvbox) = mvbox_folder {
-                        if let Err(err) = session.subscribe(mvbox).await {
-                            warn!(context, "could not subscribe to {:?}: {:?}", mvbox, err);
-                        }
-                    }
-                }
-                context
-                    .sql
-                    .set_raw_config(context, "configured_inbox_folder", Some("INBOX"))?;
-                if let Some(ref mvbox_folder) = mvbox_folder {
-                    context.sql.set_raw_config(
-                        context,
-                        "configured_mvbox_folder",
-                        Some(mvbox_folder),
-                    )?;
-                }
-                if let Some(ref sentbox_folder) = sentbox_folder {
-                    context.sql.set_raw_config(
-                        context,
-                        "configured_sentbox_folder",
-                        Some(sentbox_folder.name()),
-                    )?;
-                }
-                context.sql.set_raw_config_int(
-                    context,
-                    "folders_configured",
-                    DC_FOLDERS_CONFIGURED_VERSION,
-                )?;
-            }
-            info!(context, "FINISHED configuring IMAP-folders.");
-            Ok(())
-        })
+        let configured_folders = self.configure_folders(context).await?;
+        *folders = Some(configured_folders);
+        return Ok(());
     }
 
     async fn list_folders(&self, session: &mut Session, context: &Context) -> Option<Vec<Name>> {

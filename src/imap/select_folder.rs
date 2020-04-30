@@ -37,7 +37,7 @@ impl Imap {
                         info!(context, "close/expunge succeeded");
                     }
                     Err(err) => {
-                        self.trigger_reconnect();
+                        self.trigger_reconnect(context);
                         return Err(Error::CloseExpungeFailed(err));
                     }
                 }
@@ -62,7 +62,7 @@ impl Imap {
             let mut cfg = self.config.write().await;
             cfg.selected_folder = None;
             cfg.selected_folder_needs_expunge = false;
-            self.trigger_reconnect();
+            self.trigger_reconnect(context);
             return Err(Error::NoSession);
         }
 
@@ -91,7 +91,7 @@ impl Imap {
                     Ok(())
                 }
                 Err(async_imap::error::Error::ConnectionLost) => {
-                    self.trigger_reconnect();
+                    self.trigger_reconnect(context);
                     self.config.write().await.selected_folder = None;
                     Err(Error::ConnectionLost)
                 }
@@ -100,7 +100,7 @@ impl Imap {
                 }
                 Err(err) => {
                     self.config.write().await.selected_folder = None;
-                    self.trigger_reconnect();
+                    self.trigger_reconnect(context);
                     Err(Error::Other(err.to_string()))
                 }
             }

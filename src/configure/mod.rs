@@ -10,7 +10,6 @@ use async_std::task;
 use futures::select;
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use crate::config::Config;
 use crate::constants::*;
 use crate::context::Context;
 use crate::dc_tools::*;
@@ -506,30 +505,31 @@ pub(crate) fn JobConfigureImap(context: &Context) -> job::Status {
                 );
                 smtp_connected_here
             }
+            // 16 => {
+            //     // Legacy step.
+            //     progress!(context, 900);
+            //     let create_mvbox = context.get_config_bool(Config::MvboxWatch)
+            //         || context.get_config_bool(Config::MvboxMove);
+            //     let imap = &context.inbox_thread.read().unwrap().imap;
+            //     if task::block_on(imap.connect(context, &param)) {
+            //         if let Err(err) = imap.configure_folders(context, create_mvbox) {
+            //             warn!(context, "configuring folders failed: {:?}", err);
+            //             false
+            //         } else {
+            //             let res = imap.select_with_uidvalidity(context, "INBOX");
+            //             if let Err(err) = res {
+            //                 error!(context, "could not read INBOX status: {:?}", err);
+            //                 false
+            //             } else {
+            //                 true
+            //             }
+            //         }
+            //     } else {
+            //         false
+            //     }
+            // }
             16 => {
                 progress!(context, 900);
-                let create_mvbox = context.get_config_bool(Config::MvboxWatch)
-                    || context.get_config_bool(Config::MvboxMove);
-                let imap = &context.inbox_thread.read().unwrap().imap;
-                if task::block_on(imap.connect(context, &param)) {
-                    if let Err(err) = imap.configure_folders(context, create_mvbox) {
-                        warn!(context, "configuring folders failed: {:?}", err);
-                        false
-                    } else {
-                        let res = imap.select_with_uidvalidity(context, "INBOX");
-                        if let Err(err) = res {
-                            error!(context, "could not read INBOX status: {:?}", err);
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                } else {
-                    false
-                }
-            }
-            17 => {
-                progress!(context, 910);
                 /* configuration success - write back the configured parameters with the "configured_" prefix; also write the "configured"-flag */
 
                 param
@@ -542,7 +542,7 @@ pub(crate) fn JobConfigureImap(context: &Context) -> job::Status {
                 context.sql.set_raw_config_bool(context, "configured", true);
                 true
             }
-            18 => {
+            17 => {
                 progress!(context, 920);
                 // we generate the keypair just now - we could also postpone this until the first message is sent, however,
                 // this may result in a unexpected and annoying delay when the user sends his very first message

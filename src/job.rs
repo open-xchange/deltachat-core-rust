@@ -483,16 +483,10 @@ impl Job {
 
         let msg = job_try!(Message::load_from_db(context, MsgId::new(self.foreign_id)));
 
-        if let Err(err) = imap_inbox.ensure_configured_folders(context, true) {
-            warn!(context, "could not configure folders: {:?}", err);
-            return Status::RetryLater;
-        }
-        let mut dest_folder = context.get_mvbox_folder_override();
-        if dest_folder.is_none() {
-            dest_folder = context
-                .sql
-                .get_raw_config(context, "configured_mvbox_folder");
-        }
+        let dest_folder = match context.config_folders.read().unwrap().clone() {
+            Some(f) => Some(f.movebox_folder),
+            None => None,
+        };
 
         if let Some(dest_folder) = dest_folder {
             let server_folder = msg.server_folder.as_ref().unwrap();

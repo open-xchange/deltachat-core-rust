@@ -14,7 +14,7 @@ use crate::error::*;
 use crate::events::Event;
 use crate::imap::*;
 use crate::job::*;
-use crate::job_thread::JobThread;
+use crate::job_thread::{FolderSpec, JobThread};
 use crate::key::{DcKey, Key, SignedPublicKey};
 use crate::login_param::LoginParam;
 use crate::lot::Lot;
@@ -23,7 +23,6 @@ use crate::param::Params;
 use crate::smtp::Smtp;
 use crate::sql::Sql;
 use crate::webpush::WebPushConfig;
-use crate::coi::CoiDeltachatMode;
 use std::time::SystemTime;
 
 /// Callback function type for [Context]
@@ -35,6 +34,12 @@ use std::time::SystemTime;
 /// * `data1` - Depends on the event parameter, see [Event].
 /// * `data2` - Depends on the event parameter, see [Event].
 pub type ContextCallback = dyn Fn(&Context, Event) -> () + Send + Sync;
+
+#[derive(Clone, Debug)]
+pub struct ConfigurableFolders {
+    pub sentbox_folder: String,
+    pub movebox_folder: String,
+}
 
 #[derive(DebugStub)]
 pub struct Context {
@@ -61,7 +66,8 @@ pub struct Context {
     /// Mutex to avoid generating the key for the user more than once.
     pub generating_key_mutex: Mutex<()>,
     pub webpush_config: Option<WebPushConfig>,
-    pub coi_deltachat_mode: Arc<Mutex<CoiDeltachatMode>>,
+    // pub coi_deltachat_mode: Arc<Mutex<CoiDeltachatMode>>,
+    pub config_folders: RwLock<Option<ConfigurableFolders>>,
     pub translated_stockstrings: RwLock<HashMap<usize, String>>,
     creation_time: SystemTime,
 }
@@ -127,25 +133,22 @@ impl Context {
             last_smeared_timestamp: RwLock::new(0),
             cmdline_sel_chat_id: Arc::new(RwLock::new(ChatId::new(0))),
             inbox_thread: Arc::new(RwLock::new(JobThread::new(
-                "INBOX",
-                "configured_inbox_folder",
+                FolderSpec::InboxFolder,
                 Imap::new(),
             ))),
             sentbox_thread: Arc::new(RwLock::new(JobThread::new(
-                "SENTBOX",
-                "configured_sentbox_folder",
+                FolderSpec::SentboxFolder,
                 Imap::new(),
             ))),
             mvbox_thread: Arc::new(RwLock::new(JobThread::new(
-                "MVBOX",
-                "configured_mvbox_folder",
+                FolderSpec::MvboxFolder,
                 Imap::new(),
             ))),
             probe_imap_network: Arc::new(RwLock::new(false)),
             perform_inbox_jobs_needed: Arc::new(RwLock::new(false)),
             generating_key_mutex: Mutex::new(()),
+            config_folders: RwLock::new(None),
             webpush_config: None,
-            coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
             translated_stockstrings: RwLock::new(HashMap::new()),
             creation_time: std::time::SystemTime::now(),
         };
@@ -426,12 +429,10 @@ impl Context {
     }
 
     pub fn is_mvbox(&self, folder_name: impl AsRef<str>) -> bool {
-        let mvbox_name = self.get_mvbox_folder_override();
-
-        if let Some(name) = mvbox_name {
-            name == folder_name.as_ref()
-        } else {
-            false
+        let folders = self.config_folders.read().unwrap().clone();
+        match folders {
+            Some(f) => f.movebox_folder == folder_name.as_ref(),
+            None => false,
         }
     }
 
