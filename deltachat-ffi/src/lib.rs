@@ -23,6 +23,7 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use libc::uintptr_t;
+use num_traits::{FromPrimitive, ToPrimitive};
 
 use deltachat::chat::{ChatId, ChatVisibility, MuteDuration};
 use deltachat::coi::CoiMessageFilter;
