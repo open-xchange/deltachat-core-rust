@@ -1,23 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context as _;
 use deltachat_derive::{FromSql, ToSql};
 use lettre_email::mime::{self, Mime};
 use mailparse::{DispositionType, MailAddr, MailHeaderMap};
 
 use crate::aheader::Aheader;
-use crate::bail;
 use crate::blob::BlobObject;
-use crate::config::Config;
 use crate::constants::Viewtype;
 use crate::contact::*;
 use crate::context::Context;
 use crate::dc_tools::*;
 use crate::dehtml::dehtml;
 use crate::e2ee;
-use crate::error::Result;
+use crate::error::{bail, Result};
 use crate::events::Event;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::job::{job_add, Action};
 use crate::location;
 use crate::message;
 use crate::param::*;
@@ -85,7 +83,7 @@ impl MimeMessage {
 
         let message_time = mail
             .headers
-            .get_header_value(HeaderDef::Date)?
+            .get_header_value(HeaderDef::Date)
             .and_then(|v| mailparse::dateparse(&v).ok())
             .unwrap_or_default();
 
@@ -93,6 +91,9 @@ impl MimeMessage {
 
         // init known headers with what mailparse provided us
         MimeMessage::merge_headers(&mut headers, &mail.headers);
+
+        // remove headers that are allowed _only_ in the encrypted part
+        headers.remove("secure-join-fingerprint");
 
         // Memory location for a possible decrypted message.
         let mail_raw;
@@ -116,8 +117,7 @@ impl MimeMessage {
 
                     // Handle any gossip headers if the mail was encrypted.  See section
                     // "3.6 Key Gossip" of https://autocrypt.org/autocrypt-spec-1.1.0.pdf
-                    let gossip_headers =
-                        decrypted_mail.headers.get_all_values("Autocrypt-Gossip")?;
+                    let gossip_headers = decrypted_mail.headers.get_all_values("Autocrypt-Gossip");
                     gossipped_addr =
                         update_gossip_peerstates(context, message_time, &mail, gossip_headers)?;
 
@@ -208,10 +208,8 @@ impl MimeMessage {
     /// Delta Chat sends attachments, such as images, in two-part messages, with the first message
     /// containing an explanation. If such a message is detected, first part can be safely dropped.
     fn squash_attachment_parts(&mut self) {
-        if self.has_chat_version() && self.parts.len() == 2 {
+        if let [textpart, filepart] = &self.parts[..] {
             let need_drop = {
-                let textpart = &self.parts[0];
-                let filepart = &self.parts[1];
                 textpart.typ == Viewtype::Text
                     && (filepart.typ == Viewtype::Image
                         || filepart.typ == Viewtype::Gif
@@ -479,7 +477,9 @@ impl MimeMessage {
             apple mail: "plaintext" as an alternative to "html+PDF attachment") */
             (mime::MULTIPART, "alternative") => {
                 for cur_data in &mail.subparts {
-                    if get_mime_type(cur_data)?.0 == "multipart/mixed" {
+                    if get_mime_type(cur_data)?.0 == "multipart/mixed"
+                        || get_mime_type(cur_data)?.0 == "multipart/related"
+                    {
                         any_part_added = self.parse_mime_recursive(context, cur_data)?;
                         break;
                     }
@@ -501,15 +501,6 @@ impl MimeMessage {
                             break;
                         }
                     }
-                }
-            }
-            (mime::MULTIPART, "related") => {
-                /* add the "root part" - the other parts may be referenced which is
-                not interesting for us (eg. embedded images) we assume he "root part"
-                being the first one, which may not be always true ...
-                however, most times it seems okay. */
-                if let Some(first) = mail.subparts.iter().next() {
-                    any_part_added = self.parse_mime_recursive(context, first)?;
                 }
             }
             (mime::MULTIPART, "encrypted") => {
@@ -550,6 +541,16 @@ impl MimeMessage {
                             if let Some(report) = self.process_report(context, mail)? {
                                 self.reports.push(report);
                             }
+
+                            // Add MDN part so we can track it, avoid
+                            // downloading the message again and
+                            // delete if automatic message deletion is
+                            // enabled.
+                            let mut part = Part::default();
+                            part.typ = Viewtype::Unknown;
+                            self.parts.push(part);
+
+                            any_part_added = true;
                         } else {
                             /* eg. `report-type=delivery-status`;
                             maybe we should show them as a little error icon */
@@ -751,16 +752,13 @@ impl MimeMessage {
 
     fn merge_headers(headers: &mut HashMap<String, String>, fields: &[mailparse::MailHeader<'_>]) {
         for field in fields {
-            if let Ok(key) = field.get_key() {
-                // lowercasing all headers is technically not correct, but makes things work better
-                let key = key.to_lowercase();
-                if !headers.contains_key(&key) || // key already exists, only overwrite known types (protected headers)
+            // lowercasing all headers is technically not correct, but makes things work better
+            let key = field.get_key().to_lowercase();
+            if !headers.contains_key(&key) || // key already exists, only overwrite known types (protected headers)
                     is_known(&key) || key.starts_with("chat-")
-                {
-                    if let Ok(value) = field.get_value() {
-                        headers.insert(key, value);
-                    }
-                }
+            {
+                let value = field.get_value();
+                headers.insert(key.to_string(), value);
             }
         }
     }
@@ -775,21 +773,13 @@ impl MimeMessage {
         let (report_fields, _) = mailparse::parse_headers(&report_body)?;
 
         // must be present
-        if let Some(_disposition) = report_fields
-            .get_header_value(HeaderDef::Disposition)
-            .ok()
-            .flatten()
-        {
+        if let Some(_disposition) = report_fields.get_header_value(HeaderDef::Disposition) {
             if let Some(original_message_id) = report_fields
                 .get_header_value(HeaderDef::OriginalMessageId)
-                .ok()
-                .flatten()
                 .and_then(|v| parse_message_id(&v).ok())
             {
                 let additional_message_ids = report_fields
                     .get_header_value(HeaderDef::AdditionalMessageIds)
-                    .ok()
-                    .flatten()
                     .map_or_else(Vec::new, |v| {
                         v.split(' ')
                             .filter_map(|s| parse_message_id(s).ok())
@@ -805,26 +795,18 @@ impl MimeMessage {
         warn!(
             context,
             "ignoring unknown disposition-notification, Message-Id: {:?}",
-            report_fields.get_header_value(HeaderDef::MessageId).ok()
+            report_fields.get_header_value(HeaderDef::MessageId)
         );
 
         Ok(None)
     }
 
     /// Handle reports (only MDNs for now)
-    pub fn handle_reports(
-        &self,
-        context: &Context,
-        from_id: u32,
-        sent_timestamp: i64,
-        server_folder: impl AsRef<str>,
-        server_uid: u32,
-    ) {
+    pub fn handle_reports(&self, context: &Context, from_id: u32, sent_timestamp: i64) {
         if self.reports.is_empty() {
             return;
         }
 
-        let mut mdn_recognized = false;
         for report in &self.reports {
             for original_message_id in
                 std::iter::once(&report.original_message_id).chain(&report.additional_message_ids)
@@ -833,19 +815,8 @@ impl MimeMessage {
                     message::mdn_from_ext(context, from_id, original_message_id, sent_timestamp)
                 {
                     context.call_cb(Event::MsgRead { chat_id, msg_id });
-                    mdn_recognized = true;
                 }
             }
-        }
-
-        if self.has_chat_version() || mdn_recognized {
-            let mut param = Params::new();
-            param.set(Param::ServerFolder, server_folder.as_ref());
-            param.set_int(Param::ServerUid, server_uid as i32);
-            if self.has_chat_version() && context.get_config_bool(Config::MvboxMove) {
-                param.set_int(Param::AlsoMove, 1);
-            }
-            job_add(context, Action::MarkseenMdnOnImap, 0, param, 0);
         }
     }
 }
@@ -865,14 +836,9 @@ fn update_gossip_peerstates(
 
         if let Ok(ref header) = gossip_header {
             if recipients.is_none() {
-                recipients = Some(get_recipients(mail.headers.iter().filter_map(|v| {
-                    let key = v.get_key();
-                    let value = v.get_value();
-                    if key.is_err() || value.is_err() {
-                        return None;
-                    }
-                    Some((v.get_key().unwrap(), v.get_value().unwrap()))
-                })));
+                recipients = Some(get_recipients(
+                    mail.headers.iter().map(|v| (v.get_key(), v.get_value())),
+                ));
             }
 
             if recipients
@@ -917,16 +883,10 @@ pub(crate) struct Report {
 }
 
 pub(crate) fn parse_message_id(value: &str) -> crate::error::Result<String> {
-    let ids = mailparse::msgidparse(value)
-        .map_err(|err| format_err!("failed to parse message id {:?}", err))?;
+    let ids = mailparse::msgidparse(value).context("failed to parse message id")?;
 
-    if ids.len() == 1 {
-        let id = &ids[0];
-        if id.starts_with('<') && id.ends_with('>') {
-            Ok(id.chars().skip(1).take(id.len() - 2).collect())
-        } else {
-            bail!("message-ID {} is not enclosed in < and >", value);
-        }
+    if let Some(id) = ids.first() {
+        Ok(id.to_string())
     } else {
         bail!("could not parse message_id: {}", value);
     }
@@ -992,15 +952,12 @@ fn get_mime_type(mail: &mailparse::ParsedMail<'_>) -> Result<(Mime, Viewtype)> {
 }
 
 fn is_attachment_disposition(mail: &mailparse::ParsedMail<'_>) -> bool {
-    if let Ok(ct) = mail.get_content_disposition() {
-        return ct.disposition == DispositionType::Attachment
-            && ct
-                .params
-                .iter()
-                .any(|(key, _value)| key.starts_with("filename"));
-    }
-
-    false
+    let ct = mail.get_content_disposition();
+    ct.disposition == DispositionType::Attachment
+        && ct
+            .params
+            .iter()
+            .any(|(key, _value)| key.starts_with("filename"))
 }
 
 /// Tries to get attachment filename.
@@ -1015,7 +972,7 @@ fn get_attachment_filename(mail: &mailparse::ParsedMail) -> Result<Option<String
     // or `Content-Disposition: ... filename*0*=... filename*1*=... filename*2*=...`
     // or `Content-Disposition: ... filename=...`
 
-    let ct = mail.get_content_disposition()?;
+    let ct = mail.get_content_disposition();
 
     let desired_filename: Option<String> = ct
         .params
@@ -1031,6 +988,11 @@ fn get_attachment_filename(mail: &mailparse::ParsedMail) -> Result<Option<String
 
     let desired_filename =
         desired_filename.or_else(|| ct.params.get("name").map(|s| s.to_string()));
+
+    // MS Outlook is known to specify filename in the "name" attribute of
+    // Content-Type and omit Content-Disposition.
+    let desired_filename =
+        desired_filename.or_else(|| mail.ctype.params.get("name").map(|s| s.to_string()));
 
     // If there is no filename, but part is an attachment, guess filename
     if ct.disposition == DispositionType::Attachment && desired_filename.is_none() {
@@ -1216,14 +1178,16 @@ mod tests {
                     Content-Type: multipart/mixed; boundary=\"==break==\";\n\
                     Subject: outer-subject\n\
                     Secure-Join-Group: no\n\
-                    Test-Header: Bar\nChat-Version: 0.0\n\
+                    Secure-Join-Fingerprint: 123456\n\
+                    Test-Header: Bar\n\
+                    chat-VERSION: 0.0\n\
                     \n\
                     --==break==\n\
                     Content-Type: text/plain; protected-headers=\"v1\";\n\
                     Subject: inner-subject\n\
                     SecureBar-Join-Group: yes\n\
                     Test-Header: Xy\n\
-                    Chat-Version: 1.0\n\
+                    chat-VERSION: 1.0\n\
                     \n\
                     test1\n\
                     \n\
@@ -1242,12 +1206,17 @@ mod tests {
 
         // the following fields would bubble up
         // if the test would really use encryption for the protected part
-        // however, as this is not the case, the outer things stay valid
+        // however, as this is not the case, the outer things stay valid.
+        // for Chat-Version, also the case-insensivity is tested.
         assert_eq!(mimeparser.get_subject(), Some("outer-subject".into()));
 
         let of = mimeparser.get(HeaderDef::ChatVersion).unwrap();
         assert_eq!(of, "0.0");
         assert_eq!(mimeparser.parts.len(), 1);
+
+        // make sure, headers that are only allowed in the encrypted part
+        // cannot be set from the outer part
+        assert!(mimeparser.get(HeaderDef::SecureJoinFingerprint).is_none());
     }
 
     #[test]
@@ -1374,7 +1343,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
             Some("Chat: Message opened".to_string())
         );
 
-        assert_eq!(message.parts.len(), 0);
+        assert_eq!(message.parts.len(), 1);
         assert_eq!(message.reports.len(), 1);
     }
 
@@ -1452,7 +1421,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
             Some("Chat: Message opened".to_string())
         );
 
-        assert_eq!(message.parts.len(), 0);
+        assert_eq!(message.parts.len(), 2);
         assert_eq!(message.reports.len(), 2);
     }
 
@@ -1497,7 +1466,7 @@ Additional-Message-IDs: <foo@example.com> <foo@example.net>\n\
             Some("Chat: Message opened".to_string())
         );
 
-        assert_eq!(message.parts.len(), 0);
+        assert_eq!(message.parts.len(), 1);
         assert_eq!(message.reports.len(), 1);
         assert_eq!(message.reports[0].original_message_id, "foo@example.org");
         assert_eq!(
@@ -1539,6 +1508,194 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
             Some("Mail with inline attachment".to_string())
         );
 
-        assert_eq!(message.parts.len(), 2);
+        assert_eq!(message.parts.len(), 1);
+        assert_eq!(message.parts[0].typ, Viewtype::File);
+        assert_eq!(message.parts[0].msg, "Hello!");
+    }
+
+    #[test]
+    fn parse_inline_image() {
+        let context = dummy_context();
+        let raw = br#"Message-ID: <foobar@example.org>
+From: foo <foo@example.org>
+Subject: example
+To: bar@example.org
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="--11019878869865180"
+
+----11019878869865180
+Content-Type: text/plain; charset=utf-8
+
+Test
+
+----11019878869865180
+Content-Type: image/jpeg;
+ name="JPEG_filename.jpg"
+Content-Transfer-Encoding: base64
+Content-Disposition: inline;
+ filename="JPEG_filename.jpg"
+
+ISVb1L3m7z15Wy5w97a2cJg6W8P8YKOYfWn3PJ/UCSFcvCPtvBhcXieiN3M3ljguzG4XK7BnGgxG
+acAQdY8e0cWz1n+zKPNeNn4Iu3GXAXz4/IPksHk54inl1//0Lv8ggZjljfjnf0q1SPftYI7lpZWT
+/4aTCkimRrAIcwrQJPnZJRb7BPSC6kfn1QJHMv77mRMz2+4WbdfpyPQQ0CWLJsgVXtBsSMf2Awal
+n+zZzhGpXyCbWTEw1ccqZcK5KaiKNqWv51N4yVXw9dzJoCvxbYtCFGZZJdx7c+ObDotaF1/9KY4C
+xJjgK9/NgTXCZP1jYm0XIBnJsFSNg0pnMRETttTuGbOVi1/s/F1RGv5RNZsCUt21d9FhkWQQXsd2
+rOzDgTdag6BQCN3hSU9eKW/GhNBuMibRN9eS7Sm1y2qFU1HgGJBQfPPRPLKxXaNi++Zt0tnon2IU
+8pg5rP/IvStXYQNUQ9SiFdfAUkLU5b1j8ltnka8xl+oXsleSG44GPz6kM0RmwUrGkl4z/+NfHSsI
+K+TuvC7qOah0WLFhcsXWn2+dDV1bXuAeC769TkqkpHhdXfUHnVgK3Pv7u3rVPT5AMeFUGxRB2dP4
+CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
+
+
+----11019878869865180--
+"#;
+
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        assert_eq!(message.get_subject(), Some("example".to_string()));
+
+        assert_eq!(message.parts.len(), 1);
+        assert_eq!(message.parts[0].typ, Viewtype::Image);
+        assert_eq!(message.parts[0].msg, "Test");
+    }
+
+    #[test]
+    fn parse_thunderbird_html_embedded_image() {
+        let context = dummy_context();
+        let raw = br#"To: Alice <alice@example.org>
+From: Bob <bob@example.org>
+Subject: Test subject
+Message-ID: <foobarbaz@example.org>
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101
+ Thunderbird/68.7.0
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="------------779C1631600DF3DB8C02E53A"
+Content-Language: en-US
+
+This is a multi-part message in MIME format.
+--------------779C1631600DF3DB8C02E53A
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Test
+
+
+--------------779C1631600DF3DB8C02E53A
+Content-Type: multipart/related;
+ boundary="------------10CC6C2609EB38DA782C5CA9"
+
+
+--------------10CC6C2609EB38DA782C5CA9
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html>
+<head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+</head>
+<body>
+Test<br>
+<p><img moz-do-not-send="false" src="cid:part1.9DFA679B.52A88D69@example.org" alt=""></p>
+</body>
+</html>
+
+--------------10CC6C2609EB38DA782C5CA9
+Content-Type: image/png;
+ name="1.png"
+Content-Transfer-Encoding: base64
+Content-ID: <part1.9DFA679B.52A88D69@example.org>
+Content-Disposition: inline;
+ filename="1.png"
+
+ISVb1L3m7z15Wy5w97a2cJg6W8P8YKOYfWn3PJ/UCSFcvCPtvBhcXieiN3M3ljguzG4XK7BnGgxG
+acAQdY8e0cWz1n+zKPNeNn4Iu3GXAXz4/IPksHk54inl1//0Lv8ggZjljfjnf0q1SPftYI7lpZWT
+/4aTCkimRrAIcwrQJPnZJRb7BPSC6kfn1QJHMv77mRMz2+4WbdfpyPQQ0CWLJsgVXtBsSMf2Awal
+n+zZzhGpXyCbWTEw1ccqZcK5KaiKNqWv51N4yVXw9dzJoCvxbYtCFGZZJdx7c+ObDotaF1/9KY4C
+xJjgK9/NgTXCZP1jYm0XIBnJsFSNg0pnMRETttTuGbOVi1/s/F1RGv5RNZsCUt21d9FhkWQQXsd2
+rOzDgTdag6BQCN3hSU9eKW/GhNBuMibRN9eS7Sm1y2qFU1HgGJBQfPPRPLKxXaNi++Zt0tnon2IU
+8pg5rP/IvStXYQNUQ9SiFdfAUkLU5b1j8ltnka8xl+oXsleSG44GPz6kM0RmwUrGkl4z/+NfHSsI
+K+TuvC7qOah0WLFhcsXWn2+dDV1bXuAeC769TkqkpHhdXfUHnVgK3Pv7u3rVPT5AMeFUGxRB2dP4
+CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
+--------------10CC6C2609EB38DA782C5CA9--
+
+--------------779C1631600DF3DB8C02E53A--"#;
+
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        assert_eq!(message.get_subject(), Some("Test subject".to_string()));
+
+        assert_eq!(message.parts.len(), 1);
+        assert_eq!(message.parts[0].typ, Viewtype::Image);
+        assert_eq!(message.parts[0].msg, "Test");
+    }
+
+    // Outlook specifies filename in the "name" attribute of Content-Type
+    #[test]
+    fn parse_outlook_html_embedded_image() {
+        let context = dummy_context();
+        let raw = br##"From: Anonymous <anonymous@example.org>
+To: Anonymous <anonymous@example.org>
+Subject: Delta Chat is great stuff!
+Date: Tue, 5 May 2020 01:23:45 +0000
+MIME-Version: 1.0
+Content-Type: multipart/related;
+	boundary="----=_NextPart_000_0003_01D622B3.CA753E60"
+X-Mailer: Microsoft Outlook 15.0
+
+This is a multipart message in MIME format.
+
+------=_NextPart_000_0003_01D622B3.CA753E60
+Content-Type: multipart/alternative;
+	boundary="----=_NextPart_001_0004_01D622B3.CA753E60"
+
+
+------=_NextPart_001_0004_01D622B3.CA753E60
+Content-Type: text/plain;
+	charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+
+
+
+------=_NextPart_001_0004_01D622B3.CA753E60
+Content-Type: text/html;
+	charset="us-ascii"
+Content-Transfer-Encoding: quoted-printable
+
+<html>
+<body>
+<p>
+Test<img src="cid:image001.jpg@01D622B3.C9D8D750">
+</p>
+</body>
+</html>
+------=_NextPart_001_0004_01D622B3.CA753E60--
+
+------=_NextPart_000_0003_01D622B3.CA753E60
+Content-Type: image/jpeg;
+	name="image001.jpg"
+Content-Transfer-Encoding: base64
+Content-ID: <image001.jpg@01D622B3.C9D8D750>
+
+ISVb1L3m7z15Wy5w97a2cJg6W8P8YKOYfWn3PJ/UCSFcvCPtvBhcXieiN3M3ljguzG4XK7BnGgxG
+acAQdY8e0cWz1n+zKPNeNn4Iu3GXAXz4/IPksHk54inl1//0Lv8ggZjljfjnf0q1SPftYI7lpZWT
+/4aTCkimRrAIcwrQJPnZJRb7BPSC6kfn1QJHMv77mRMz2+4WbdfpyPQQ0CWLJsgVXtBsSMf2Awal
+n+zZzhGpXyCbWTEw1ccqZcK5KaiKNqWv51N4yVXw9dzJoCvxbYtCFGZZJdx7c+ObDotaF1/9KY4C
+xJjgK9/NgTXCZP1jYm0XIBnJsFSNg0pnMRETttTuGbOVi1/s/F1RGv5RNZsCUt21d9FhkWQQXsd2
+rOzDgTdag6BQCN3hSU9eKW/GhNBuMibRN9eS7Sm1y2qFU1HgGJBQfPPRPLKxXaNi++Zt0tnon2IU
+8pg5rP/IvStXYQNUQ9SiFdfAUkLU5b1j8ltnka8xl+oXsleSG44GPz6kM0RmwUrGkl4z/+NfHSsI
+K+TuvC7qOah0WLFhcsXWn2+dDV1bXuAeC769TkqkpHhdXfUHnVgK3Pv7u3rVPT5AMeFUGxRB2dP4
+CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
+
+------=_NextPart_000_0003_01D622B3.CA753E60--
+"##;
+
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..]).unwrap();
+        assert_eq!(
+            message.get_subject(),
+            Some("Delta Chat is great stuff!".to_string())
+        );
+
+        assert_eq!(message.parts.len(), 1);
+        assert_eq!(message.parts[0].typ, Viewtype::Image);
+        assert_eq!(message.parts[0].msg, "Test");
     }
 }

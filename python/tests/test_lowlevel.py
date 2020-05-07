@@ -1,5 +1,7 @@
 from __future__ import print_function
 from deltachat import capi, cutil, const, set_context_callback, clear_context_callback
+from deltachat import register_global_plugin
+from deltachat.hookspec import global_hookimpl
 from deltachat.capi import ffi
 from deltachat.capi import lib
 
@@ -16,21 +18,31 @@ def test_callback_None2int():
     clear_context_callback(ctx)
 
 
-def test_dc_close_events(tmpdir):
-    from deltachat.account import Account
-    p = tmpdir.join("hello.db")
-    ac1 = Account(p.strpath)
+def test_dc_close_events(tmpdir, acfactory):
+    ac1 = acfactory.get_unconfigured_account()
+
+    # register after_shutdown function
+    shutdowns = []
+
+    class ShutdownPlugin:
+        @global_hookimpl
+        def dc_account_after_shutdown(self, account):
+            assert account._dc_context is None
+            shutdowns.append(account)
+    register_global_plugin(ShutdownPlugin())
+    assert hasattr(ac1, "_dc_context")
     ac1.shutdown()
+    assert shutdowns == [ac1]
 
     def find(info_string):
-        evlog = ac1._evlogger
+        evlog = ac1._evtracker
         while 1:
             ev = evlog.get_matching("DC_EVENT_INFO", check_error=False)
-            data2 = ev[2]
+            data2 = ev.data2
             if info_string in data2:
                 return
             else:
-                print("skipping event", *ev)
+                print("skipping event", ev)
 
     find("disconnecting inbox-thread")
     find("disconnecting sentbox-thread")
@@ -80,10 +92,10 @@ def test_markseen_invalid_message_ids(acfactory):
     contact1 = ac1.create_contact(email="some1@example.com", name="some1")
     chat = ac1.create_chat_by_contact(contact1)
     chat.send_text("one messae")
-    ac1._evlogger.get_matching("DC_EVENT_MSGS_CHANGED")
+    ac1._evtracker.get_matching("DC_EVENT_MSGS_CHANGED")
     msg_ids = [9]
     lib.dc_markseen_msgs(ac1._dc_context, msg_ids, len(msg_ids))
-    ac1._evlogger.ensure_event_not_queued("DC_EVENT_WARNING|DC_EVENT_ERROR")
+    ac1._evtracker.ensure_event_not_queued("DC_EVENT_WARNING|DC_EVENT_ERROR")
 
 
 def test_get_special_message_id_returns_empty_message(acfactory):

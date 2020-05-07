@@ -41,7 +41,7 @@ typedef struct _dc_provider dc_provider_t;
  * uintptr_t event_handler_func(dc_context_t* context, int event,
  *                              uintptr_t data1, uintptr_t data2)
  * {
- *     return 0; // for unhandled events, it is always safe to return 0
+ *     return 0;
  * }
  *
  * dc_context_t* context = dc_context_new(event_handler_func, NULL, NULL);
@@ -208,7 +208,7 @@ typedef struct _dc_provider dc_provider_t;
  * @param event one of the @ref DC_EVENT constants
  * @param data1 depends on the event parameter
  * @param data2 depends on the event parameter
- * @return return 0 unless stated otherwise in the event parameter documentation
+ * @return events do not expect a return value, just always return 0
  */
 typedef uintptr_t (*dc_callback_t) (dc_context_t* context, int event, uintptr_t data1, uintptr_t data2);
 
@@ -229,7 +229,7 @@ typedef uintptr_t (*dc_callback_t) (dc_context_t* context, int event, uintptr_t 
  *       otherwise!
  *     - The callback SHOULD return _fast_, for GUI updates etc. you should
  *       post yourself an asynchronous message to your GUI thread, if needed.
- *     - If not mentioned otherweise, the callback should return 0.
+ *     - events do not expect a return value, just always return 0.
  * @param userdata can be used by the client for any purpuse.  He finds it
  *     later in dc_get_userdata().
  * @param os_name is only for decorative use
@@ -344,7 +344,8 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `smtp_certificate_checks` = how to check SMTP certificates, one of the @ref DC_CERTCK flags, defaults to #DC_CERTCK_AUTO (0)
  * - `displayname`  = Own name to use when sending messages.  MUAs are allowed to spread this way eg. using CC, defaults to empty
  * - `selfstatus`   = Own status to display eg. in email footers, defaults to a standard text
- * - `selfavatar`   = File containing avatar. Will be copied to blob directory.
+ * - `selfavatar`   = File containing avatar. Will immediately be copied to the 
+ *                    `blobdir`; the original image will not be needed anymore.
  *                    NULL to remove the avatar.
  *                    It is planned for future versions
  *                    to send this image together with the next messages.
@@ -375,6 +376,22 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `save_mime_headers` = 1=save mime headers
  *                    and make dc_get_mime_headers() work for subsequent calls,
  *                    0=do not save mime headers (default)
+ * - `delete_device_after` = 0=do not delete messages from device automatically (default),
+ *                    >=1=seconds, after which messages are deleted automatically from the device.
+ *                    Messages in the "saved messages" chat (see dc_chat_is_self_talk()) are skipped.
+ *                    Messages are deleted whether they were seen or not, the UI should clearly point that out.
+ * - `delete_server_after` = 0=do not delete messages from server automatically (default),
+ *                    >=1=seconds, after which messages are deleted automatically from the server.
+ *                    "Saved messages" are deleted from the server as well as
+ *                    emails matching the `show_emails` settings above, the UI should clearly point that out.
+ * - `media_quality` = DC_MEDIA_QUALITY_BALANCED (0) =
+ *                    good outgoing images/videos/voice quality at reasonable sizes (default)
+ *                    DC_MEDIA_QUALITY_WORSE (1)
+ *                    allow worse images/videos/voice quality to gain smaller sizes,
+ *                    suitable for providers or areas known to have a bad connection.
+ *                    In contrast to other options, the implementation of this option is currently up to the UIs;
+ *                    this may change in future, however,
+ *                    having the option in the core allows provider-specific-defaults already today.
  *
  * If you want to retrieve a value, use dc_get_config().
  *
@@ -1308,6 +1325,21 @@ int             dc_get_msg_cnt               (dc_context_t* context, uint32_t ch
 int             dc_get_fresh_msg_cnt         (dc_context_t* context, uint32_t chat_id);
 
 
+
+/**
+ * Estimate the number of messages that will be deleted
+ * by the dc_set_config()-options `delete_device_after` or `delete_server_after`.
+ * This is typically used to show the estimated impact to the user before actually enabling ephemeral messages.
+ *
+ * @param context The context object as returned from dc_context_new().
+ * @param from_server 1=Estimate deletion count for server, 0=Estimate deletion count for device
+ * @param seconds Count messages older than the given number of seconds.
+ * @return Number of messages that are older than the given number of seconds.
+ *     This includes emails downloaded due to the `show_emails` option.
+ *     Messages in the "saved messages" folder are not counted as they will not be deleted automatically.
+ */
+int             dc_estimate_deletion_cnt    (dc_context_t* context, int from_server, int64_t seconds);
+
 /**
  * Returns the message IDs of all _fresh_ messages of any chat.
  * Typically used for implementing notification summaries.
@@ -1602,8 +1634,10 @@ int             dc_set_chat_name             (dc_context_t* context, uint32_t ch
  * @memberof dc_context_t
  * @param context The context as created by dc_context_new().
  * @param chat_id The chat ID to set the image for.
- * @param image Full path of the image to use as the group image.  If you pass NULL here,
- *     the group image is deleted (for promoted groups, all members are informed about this change anyway).
+ * @param image Full path of the image to use as the group image. The image will immediately be copied to the 
+ *     `blobdir`; the original image will not be needed anymore.
+ *      If you pass NULL here, the group image is deleted (for promoted groups, all members are informed about 
+ *      this change anyway).
  * @return 1=success, 0=error
  */
 int             dc_set_chat_profile_image    (dc_context_t* context, uint32_t chat_id, const char* image);
@@ -1671,8 +1705,9 @@ char*           dc_get_mime_headers          (dc_context_t* context, uint32_t ms
  */
 void            dc_delete_msgs               (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt);
 
-/**
+/*
  * Empty IMAP server folder: delete all messages.
+ * Deprecated, use dc_set_config() with the key "delete_server_after" instead.
  *
  * @memberof dc_context_t
  * @param context The context object as created by dc_context_new()
@@ -1775,7 +1810,7 @@ int             dc_may_be_valid_addr         (const char* addr);
 
 /**
  * Check if an e-mail address belongs to a known and unblocked contact.
- * Known and unblocked contacts will be returned by dc_get_contacts().
+ * To get a list of all known and unblocked contacts, use dc_get_contacts().
  *
  * To validate an e-mail address independently of the contact database
  * use dc_may_be_valid_addr().
@@ -1783,7 +1818,8 @@ int             dc_may_be_valid_addr         (const char* addr);
  * @memberof dc_context_t
  * @param context The context object as created by dc_context_new().
  * @param addr The e-mail-address to check.
- * @return 1=address is a contact in use, 0=address is not a contact in use.
+ * @return Contact ID of the contact belonging to the e-mail-address
+ *     or 0 if there is no contact that is or was introduced by an accepted contact.  
  */
 uint32_t        dc_lookup_contact_id_by_addr (dc_context_t* context, const char* addr);
 
@@ -2814,19 +2850,6 @@ int             dc_chat_get_type             (const dc_chat_t* chat);
  * @return Chat name as a string. Must be released using dc_str_unref() after usage. Never NULL.
  */
 char*           dc_chat_get_name             (const dc_chat_t* chat);
-
-
-/*
- * Get a subtitle for a chat.  The subtitle is eg. the email-address or the
- * number of group members.
- *
- * Deprecated function. Subtitles should be created in the ui
- * where plural forms and other specials can be handled more gracefully.
- *
- * @param chat The chat object to calulate the subtitle for.
- * @return Subtitle as a string. Must be released using dc_str_unref() after usage. Never NULL.
- */
-char*           dc_chat_get_subtitle         (const dc_chat_t* chat);
 
 
 /**
@@ -4161,28 +4184,8 @@ char*           dc_decrypt_message_in_memory(
  */
 
 
-/**
- * @defgroup DC_EMPTY DC_EMPTY
- *
- * These constants configure emptying imap folders with dc_empty_server()
- *
- * @addtogroup DC_EMPTY
- * @{
- */
-
-/**
- * Clear all mvbox messages.
- */
-#define DC_EMPTY_MVBOX 0x01
-
-/**
- * Clear all INBOX messages.
- */
-#define DC_EMPTY_INBOX 0x02
-
-/**
- * @}
- */
+#define DC_EMPTY_MVBOX 0x01 // Deprecated, flag for dc_empty_server(): Clear all mvbox messages
+#define DC_EMPTY_INBOX 0x02 // Deprecated, flag for dc_empty_server(): Clear all INBOX messages
 
 
 /**
@@ -4190,8 +4193,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * These constants are used as events
  * reported to the callback given to dc_context_new().
- * If you do not want to handle an event, it is always safe to return 0,
- * so there is no need to add a "case" for every event.
  *
  * @addtogroup DC_EVENT
  * @{
@@ -4206,7 +4207,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_INFO                     100
 
@@ -4217,7 +4217,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_SMTP_CONNECTED           101
 
@@ -4228,7 +4227,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_IMAP_CONNECTED           102
 
@@ -4238,7 +4236,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_SMTP_MESSAGE_SENT        103
 
@@ -4248,7 +4245,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_IMAP_MESSAGE_DELETED   104
 
@@ -4258,7 +4254,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_IMAP_MESSAGE_MOVED   105
 
@@ -4268,7 +4263,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) folder name.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_IMAP_FOLDER_EMPTIED  106
 
@@ -4278,7 +4272,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) path name
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_NEW_BLOB_FILE 150
 
@@ -4288,7 +4281,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) path name
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_DELETED_BLOB_FILE 151
 
@@ -4301,7 +4293,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 0
  * @param data2 (const char*) Warning string in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_WARNING                  300
 
@@ -4324,7 +4315,6 @@ char*           dc_decrypt_message_in_memory(
  *     Some error strings are taken from dc_set_stock_translation(),
  *     however, most error strings will be in english language.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_ERROR                    400
 
@@ -4348,7 +4338,6 @@ char*           dc_decrypt_message_in_memory(
  *     0=subsequent network error, should be logged only
  * @param data2 (const char*) Error string, always set, never NULL.
  *     Must not be unref'd or modified and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_ERROR_NETWORK            401
 
@@ -4364,7 +4353,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data2 (const char*) Info string in english language.
  *     Must not be unref'd or modified
  *     and is valid only until the callback returns.
- * @return 0
  */
 #define DC_EVENT_ERROR_SELF_NOT_IN_GROUP  410
 
@@ -4378,7 +4366,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) chat_id for single added messages
  * @param data2 (int) msg_id for single added messages
- * @return 0
  */
 #define DC_EVENT_MSGS_CHANGED             2000
 
@@ -4391,7 +4378,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) chat_id
  * @param data2 (int) msg_id
- * @return 0
  */
 #define DC_EVENT_INCOMING_MSG             2005
 
@@ -4402,7 +4388,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) chat_id
  * @param data2 (int) msg_id
- * @return 0
  */
 #define DC_EVENT_MSG_DELIVERED            2010
 
@@ -4413,7 +4398,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) chat_id
  * @param data2 (int) msg_id
- * @return 0
  */
 #define DC_EVENT_MSG_FAILED               2012
 
@@ -4424,7 +4408,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) chat_id
  * @param data2 (int) msg_id
- * @return 0
  */
 #define DC_EVENT_MSG_READ                 2015
 
@@ -4437,7 +4420,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) chat_id
  * @param data2 0
- * @return 0
  */
 #define DC_EVENT_CHAT_MODIFIED            2020
 
@@ -4447,7 +4429,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) If not 0, this is the contact_id of an added contact that should be selected.
  * @param data2 0
- * @return 0
  */
 #define DC_EVENT_CONTACTS_CHANGED         2030
 
@@ -4460,7 +4441,6 @@ char*           dc_decrypt_message_in_memory(
  *     If the locations of several contacts have been changed,
  *     eg. after calling dc_delete_all_locations(), this parameter is set to 0.
  * @param data2 0
- * @return 0
  */
 #define DC_EVENT_LOCATION_CHANGED         2035
 
@@ -4470,7 +4450,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) 0=error, 1-999=progress in permille, 1000=success and done
  * @param data2 0
- * @return 0
  */
 #define DC_EVENT_CONFIGURE_PROGRESS       2041
 
@@ -4480,7 +4459,6 @@ char*           dc_decrypt_message_in_memory(
  *
  * @param data1 (int) 0=error, 1-999=progress in permille, 1000=success and done
  * @param data2 0
- * @return 0
  */
 #define DC_EVENT_IMEX_PROGRESS            2051
 
@@ -4495,7 +4473,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data1 (const char*) Path and file name.
  *     Must not be unref'd or modified and is valid only until the callback returns.
  * @param data2 0
- * @return 0
  */
 #define DC_EVENT_IMEX_FILE_WRITTEN        2052
 
@@ -4513,7 +4490,6 @@ char*           dc_decrypt_message_in_memory(
  *     600=vg-/vc-request-with-auth received, vg-member-added/vc-contact-confirm sent, typically shown as "bob@addr verified".
  *     800=vg-member-added-received received, shown as "bob@addr securely joined GROUP", only sent for the verified-group-protocol.
  *     1000=Protocol finished for this contact.
- * @return 0
  */
 #define DC_EVENT_SECUREJOIN_INVITER_PROGRESS      2060
 
@@ -4529,7 +4505,6 @@ char*           dc_decrypt_message_in_memory(
  * @param data2 (int) Progress as:
  *     400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
  *     (Bob has verified alice and waits until Alice does the same for him)
- * @return 0
  */
 #define DC_EVENT_SECUREJOIN_JOINER_PROGRESS       2061
 
@@ -4553,21 +4528,6 @@ char*           dc_decrypt_message_in_memory(
  * @return 0
  */
 #define DC_EVENT_METADATA                         2071
-
-
-// the following events are functions that should be provided by the frontends
-
-
-/**
- * This event is sent out to the inviter when a joiner successfully joined a group.
- *
- * @param data1 (int) chat_id
- * @param data2 (int) contact_id
- * @return 0
- */
-#define DC_EVENT_SECUREJOIN_MEMBER_ADDED 2062
-
-
 /**
  * @}
  */
@@ -4583,8 +4543,6 @@ char*           dc_decrypt_message_in_memory(
 #define DC_EVENT_DATA2_IS_STRING(e)  ((e)>=100 && (e)<=499 || (e)==DC_EVENT_METADATA)
 #define DC_EVENT_RETURNS_INT(e)      ((e)==DC_EVENT_IS_OFFLINE) // not used anymore
 #define DC_EVENT_RETURNS_STRING(e)   ((e)==DC_EVENT_GET_STRING) // not used anymore
-char*           dc_get_version_str           (void); // deprecated
-void            dc_array_add_id              (dc_array_t*, uint32_t); // deprecated
 #define dc_archive_chat(a,b,c)  dc_set_chat_visibility((a), (b), (c)? 1 : 0) // not used anymore
 #define dc_chat_get_archived(a) (dc_chat_get_visibility((a))==1? 1 : 0)      // not used anymore
 
@@ -4595,6 +4553,14 @@ void            dc_array_add_id              (dc_array_t*, uint32_t); // depreca
 #define DC_SHOW_EMAILS_OFF               0
 #define DC_SHOW_EMAILS_ACCEPTED_CONTACTS 1
 #define DC_SHOW_EMAILS_ALL               2
+
+
+/*
+ * Values for dc_get|set_config("media_quality")
+ */
+#define DC_MEDIA_QUALITY_BALANCED 0
+#define DC_MEDIA_QUALITY_WORSE    1
+
 
 /*
  * Values for dc_get|set_config("key_gen_type")
@@ -4722,8 +4688,6 @@ void            dc_array_add_id              (dc_array_t*, uint32_t); // depreca
 #define DC_STR_NOMESSAGES                 1
 #define DC_STR_SELF                       2
 #define DC_STR_DRAFT                      3
-#define DC_STR_MEMBER                     4
-#define DC_STR_CONTACT                    6
 #define DC_STR_VOICEMESSAGE               7
 #define DC_STR_DEADDROP                   8
 #define DC_STR_IMAGE                      9
@@ -4755,7 +4719,6 @@ void            dc_array_add_id              (dc_array_t*, uint32_t); // depreca
 #define DC_STR_STARREDMSGS                41
 #define DC_STR_AC_SETUP_MSG_SUBJECT       42
 #define DC_STR_AC_SETUP_MSG_BODY          43
-#define DC_STR_SELFTALK_SUBTITLE          50
 #define DC_STR_CANNOT_LOGIN               60
 #define DC_STR_SERVER_RESPONSE            61
 #define DC_STR_MSGACTIONBYUSER            62

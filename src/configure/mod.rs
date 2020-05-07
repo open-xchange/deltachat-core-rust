@@ -15,6 +15,7 @@ use crate::constants::*;
 use crate::context::Context;
 use crate::dc_tools::*;
 use crate::imap::Imap;
+use crate::error::format_err;
 use crate::job::{self, job_add, job_kill_action};
 use crate::login_param::{
     AuthScheme, CertificateChecks, LoginParam, ServerParam, ServerSecurity, Service,
@@ -753,6 +754,28 @@ fn try_srv_options(
     ))
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Invalid email address: {0:?}")]
+    InvalidEmailAddress(String),
+
+    #[error("XML error at position {position}")]
+    InvalidXml {
+        position: usize,
+        #[source]
+        error: quick_xml::Error,
+    },
+
+    #[error("Bad or incomplete autoconfig")]
+    IncompleteAutoconfig(LoginParam),
+
+    #[error("Failed to get URL")]
+    ReadUrlError(#[from] self::read_url::Error),
+
+    #[error("Number of redirection is exceeded")]
+    RedirectionError,
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -782,7 +805,7 @@ mod tests {
         let mut params = LoginParam::new();
         params.addr = "someone123@nauta.cu".to_string();
         let found_params = get_offline_autoconfig(&context, &params).unwrap();
-        assert_eq!(found_params.mail_server, "imap.nauta.cu".to_string());
-        assert_eq!(found_params.send_server, "smtp.nauta.cu".to_string());
+        assert_eq!(found_params.srv_params[Service::Imap as usize].hostname, "imap.nauta.cu".to_string());
+        assert_eq!(found_params.srv_params[Service::Smtp as usize].hostname, "smtp.nauta.cu".to_string());
     }
 }

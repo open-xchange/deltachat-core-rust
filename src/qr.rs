@@ -2,20 +2,20 @@
 
 use lazy_static::lazy_static;
 use percent_encoding::percent_decode_str;
+use reqwest::Url;
+use serde::Deserialize;
 
 use crate::chat;
 use crate::config::*;
 use crate::constants::Blocked;
 use crate::contact::*;
 use crate::context::Context;
-use crate::error::Error;
+use crate::error::{bail, ensure, format_err, Error};
 use crate::key::dc_format_fingerprint;
 use crate::key::dc_normalize_fingerprint;
 use crate::lot::{Lot, LotState};
 use crate::param::*;
 use crate::peerstate::*;
-use reqwest::Url;
-use serde::Deserialize;
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
 const DCACCOUNT_SCHEME: &str = "DCACCOUNT:";
@@ -37,6 +37,10 @@ impl Into<Lot> for Error {
     }
 }
 
+fn starts_with_ignore_case(string: &str, pattern: &str) -> bool {
+    string.to_lowercase().starts_with(&pattern.to_lowercase())
+}
+
 /// Check a scanned QR code.
 /// The function should be called after a QR code is scanned.
 /// The function takes the raw text scanned and checks what can be done with it.
@@ -45,9 +49,9 @@ pub fn check_qr(context: &Context, qr: impl AsRef<str>) -> Lot {
 
     info!(context, "Scanned QR code: {}", qr);
 
-    if qr.starts_with(OPENPGP4FPR_SCHEME) {
+    if starts_with_ignore_case(qr, OPENPGP4FPR_SCHEME) {
         decode_openpgp(context, qr)
-    } else if qr.starts_with(DCACCOUNT_SCHEME) {
+    } else if starts_with_ignore_case(qr, DCACCOUNT_SCHEME) {
         decode_account(context, qr)
     } else if qr.starts_with(MAILTO_SCHEME) {
         decode_mailto(context, qr)
@@ -221,27 +225,20 @@ pub fn set_config_from_qr(context: &Context, qr: &str) -> Result<(), Error> {
 
     let response = reqwest::blocking::Client::new().post(url_str).send();
     if response.is_err() {
-        return Err(format_err!(
-            "Cannot create account, request to {} failed",
-            url_str
-        ));
+        bail!("Cannot create account, request to {} failed", url_str);
     }
     let response = response.unwrap();
     if !response.status().is_success() {
-        return Err(format_err!(
-            "Request to {} unsuccessful: {:?}",
-            url_str,
-            response
-        ));
+        bail!("Request to {} unsuccessful: {:?}", url_str, response);
     }
 
     let parsed: reqwest::Result<CreateAccountResponse> = response.json();
     if parsed.is_err() {
-        return Err(format_err!(
+        bail!(
             "Failed to parse JSON response from {}: error: {:?}",
             url_str,
             parsed
-        ));
+        );
     }
     println!("response: {:?}", &parsed);
     let parsed = parsed.unwrap();
@@ -289,7 +286,6 @@ fn decode_smtp(context: &Context, qr: &str) -> Lot {
         Ok(addr) => addr,
         Err(err) => return err.into(),
     };
-
     let name = "".to_string();
     Lot::from_address(context, name, addr)
 }
@@ -525,6 +521,17 @@ mod tests {
         assert_ne!(res.get_id(), 0);
         assert_eq!(res.get_text1().unwrap(), "test ? test !");
 
+        // Test it again with lowercased "openpgp4fpr:" uri scheme
+        let res = check_qr(
+            &ctx.ctx,
+            "openpgp4fpr:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+        );
+
+        println!("{:?}", res);
+        assert_eq!(res.get_state(), LotState::QrAskVerifyGroup);
+        assert_ne!(res.get_id(), 0);
+        assert_eq!(res.get_text1().unwrap(), "test ? test !");
+
         let contact = Contact::get_by_id(&ctx.ctx, res.get_id()).unwrap();
         assert_eq!(contact.get_addr(), "cli@deltachat.de");
     }
@@ -536,6 +543,16 @@ mod tests {
         let res = check_qr(
             &ctx.ctx,
             "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&n=J%C3%B6rn%20P.+P.&i=TbnwJ6lSvD5&s=0ejvbdFSQxB"
+        );
+
+        println!("{:?}", res);
+        assert_eq!(res.get_state(), LotState::QrAskVerifyContact);
+        assert_ne!(res.get_id(), 0);
+
+        // Test it again with lowercased "openpgp4fpr:" uri scheme
+        let res = check_qr(
+            &ctx.ctx,
+            "openpgp4fpr:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&n=J%C3%B6rn%20P.+P.&i=TbnwJ6lSvD5&s=0ejvbdFSQxB"
         );
 
         println!("{:?}", res);
@@ -562,6 +579,19 @@ mod tests {
         );
         assert_eq!(res.get_id(), 0);
 
+        // Test it again with lowercased "openpgp4fpr:" uri scheme
+
+        let res = check_qr(
+            &ctx.ctx,
+            "openpgp4fpr:1234567890123456789012345678901234567890",
+        );
+        assert_eq!(res.get_state(), LotState::QrFprWithoutAddr);
+        assert_eq!(
+            res.get_text1().unwrap(),
+            "1234 5678 9012 3456 7890\n1234 5678 9012 3456 7890"
+        );
+        assert_eq!(res.get_id(), 0);
+
         let res = check_qr(&ctx.ctx, "OPENPGP4FPR:12345678901234567890");
         assert_eq!(res.get_state(), LotState::QrError);
         assert_eq!(res.get_id(), 0);
@@ -577,6 +607,14 @@ mod tests {
         );
         assert_eq!(res.get_state(), LotState::QrAccount);
         assert_eq!(res.get_text1().unwrap(), "example.org");
+
+        // Test it again with lowercased "dcaccount:" uri scheme
+        let res = check_qr(
+            &ctx.ctx,
+            "dcaccount:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
+        );
+        assert_eq!(res.get_state(), LotState::QrAccount);
+        assert_eq!(res.get_text1().unwrap(), "example.org");
     }
 
     #[test]
@@ -586,6 +624,14 @@ mod tests {
         let res = check_qr(
             &ctx.ctx,
             "DCACCOUNT:http://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
+        );
+        assert_eq!(res.get_state(), LotState::QrError);
+        assert!(res.get_text1().is_some());
+
+        // Test it again with lowercased "dcaccount:" uri scheme
+        let res = check_qr(
+            &ctx.ctx,
+            "dcaccount:http://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
         );
         assert_eq!(res.get_state(), LotState::QrError);
         assert!(res.get_text1().is_some());

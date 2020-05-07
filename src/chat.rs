@@ -15,7 +15,7 @@ use crate::constants::*;
 use crate::contact::*;
 use crate::context::Context;
 use crate::dc_tools::*;
-use crate::error::Error;
+use crate::error::{bail, ensure, format_err, Error};
 use crate::events::Event;
 use crate::job::*;
 use crate::message::{self, InvalidMsgId, Message, MessageState, MsgId};
@@ -286,10 +286,7 @@ impl ChatId {
     /// Returns `true`, if message was deleted, `false` otherwise.
     fn maybe_delete_draft(self, context: &Context) -> bool {
         match self.get_draft_msg_id(context) {
-            Some(msg_id) => {
-                Message::delete_from_db(context, msg_id);
-                true
-            }
+            Some(msg_id) => msg_id.delete_from_db(context).is_ok(),
             None => false,
         }
     }
@@ -327,7 +324,7 @@ impl ChatId {
                 time(),
                 msg.viewtype,
                 MessageState::OutDraft,
-                msg.text.as_ref().map(String::as_str).unwrap_or(""),
+                msg.text.as_deref().unwrap_or(""),
                 msg.param.to_string(),
                 1,
             ],
@@ -360,6 +357,74 @@ impl ChatId {
                 params![self],
             )
             .unwrap_or_default() as usize
+    }
+
+    pub(crate) fn get_param(self, context: &Context) -> Result<Params, Error> {
+        let res: Option<String> = context
+            .sql
+            .query_get_value_result("SELECT param FROM chats WHERE id=?", params![self])?;
+        Ok(res
+            .map(|s| s.parse().unwrap_or_default())
+            .unwrap_or_default())
+    }
+
+    // Returns true if chat is a saved messages chat.
+    pub fn is_self_talk(self, context: &Context) -> Result<bool, Error> {
+        Ok(self.get_param(context)?.exists(Param::Selftalk))
+    }
+
+    /// Returns true if chat is a device chat.
+    pub fn is_device_talk(self, context: &Context) -> Result<bool, Error> {
+        Ok(self.get_param(context)?.exists(Param::Devicetalk))
+    }
+
+    fn parent_query<T, F>(self, context: &Context, fields: &str, f: F) -> sql::Result<Option<T>>
+    where
+        F: FnOnce(&rusqlite::Row) -> rusqlite::Result<T>,
+    {
+        let sql = &context.sql;
+        let query = format!(
+            "SELECT {} \
+             FROM msgs WHERE chat_id=? AND state NOT IN (?, ?, ?, ?) \
+             ORDER BY timestamp DESC, id DESC \
+             LIMIT 1;",
+            fields
+        );
+        sql.query_row_optional(
+            query,
+            params![
+                self,
+                MessageState::OutPreparing,
+                MessageState::OutDraft,
+                MessageState::OutPending,
+                MessageState::OutFailed
+            ],
+            f,
+        )
+    }
+
+    fn get_parent_mime_headers(self, context: &Context) -> Option<(String, String, String)> {
+        let collect = |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?, row.get(2)?));
+        self.parent_query(
+            context,
+            "rfc724_mid, mime_in_reply_to, mime_references",
+            collect,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn parent_is_encrypted(self, context: &Context) -> Result<bool, Error> {
+        let collect = |row: &rusqlite::Row| Ok(row.get(0)?);
+        let packed: Option<String> = self.parent_query(context, "param", collect)?;
+
+        if let Some(ref packed) = packed {
+            let param = packed.parse::<Params>()?;
+            Ok(param.exists(Param::GuaranteeE2ee))
+        } else {
+            // No messages
+            Ok(false)
+        }
     }
 
     /// Bad evil escape hatch.
@@ -539,76 +604,6 @@ impl Chat {
         &self.name
     }
 
-    pub fn get_subtitle(&self, context: &Context) -> String {
-        // returns either the address or the number of chat members
-
-        if self.typ == Chattype::Single && self.param.exists(Param::Selftalk) {
-            return context.stock_str(StockMessage::SelfTalkSubTitle).into();
-        }
-
-        if self.typ == Chattype::Single {
-            return context
-                .sql
-                .query_get_value(
-                    context,
-                    "SELECT c.addr
-                       FROM chats_contacts cc
-                       LEFT JOIN contacts c ON c.id=cc.contact_id
-                      WHERE cc.chat_id=?;",
-                    params![self.id],
-                )
-                .unwrap_or_else(|| "Err".into());
-        }
-
-        if self.typ == Chattype::Group || self.typ == Chattype::VerifiedGroup {
-            if self.id.is_deaddrop() {
-                return context.stock_str(StockMessage::DeadDrop).into();
-            }
-            let cnt = get_chat_contact_cnt(context, self.id);
-            return context.stock_string_repl_int(StockMessage::Member, cnt as i32);
-        }
-
-        "Err".to_string()
-    }
-
-    fn parent_query(fields: &str) -> String {
-        // Check for server_uid guarantees that we don't
-        // select a draft or undelivered message.
-        format!(
-            "SELECT {} \
-             FROM msgs WHERE chat_id=?1 AND server_uid!=0 \
-             ORDER BY timestamp DESC, id DESC \
-             LIMIT 1;",
-            fields
-        )
-    }
-
-    fn get_parent_mime_headers(&self, context: &Context) -> Option<(String, String, String)> {
-        let collect = |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?, row.get(2)?));
-        let params = params![self.id];
-        let sql = &context.sql;
-
-        let query = Self::parent_query("rfc724_mid, mime_in_reply_to, mime_references");
-
-        sql.query_row(&query, params, collect).ok()
-    }
-
-    fn parent_is_encrypted(&self, context: &Context) -> Result<bool, Error> {
-        let sql = &context.sql;
-        let params = params![self.id];
-        let query = Self::parent_query("param");
-
-        let packed: Option<String> = sql.query_get_value_result(&query, params)?;
-
-        if let Some(ref packed) = packed {
-            let param = packed.parse::<Params>()?;
-            Ok(param.exists(Param::GuaranteeE2ee))
-        } else {
-            // No messages
-            Ok(false)
-        }
-    }
-
     pub fn get_profile_image(&self, context: &Context) -> Option<PathBuf> {
         if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {
@@ -666,7 +661,6 @@ impl Chat {
             is_sending_locations: self.is_sending_locations,
             color: self.get_color(context),
             profile_image: self.get_profile_image(context).unwrap_or_else(PathBuf::new),
-            subtitle: self.get_subtitle(context),
             draft,
             is_muted: self.is_muted(),
         })
@@ -816,7 +810,7 @@ impl Chat {
                     }
                 }
 
-                if can_encrypt && (all_mutual || self.parent_is_encrypted(context)?) {
+                if can_encrypt && (all_mutual || self.id.parent_is_encrypted(context)?) {
                     msg.param.set_int(Param::GuaranteeE2ee, 1);
                 }
             }
@@ -831,7 +825,7 @@ impl Chat {
             // we do not set In-Reply-To/References in this case.
             if !self.is_self_talk() {
                 if let Some((parent_rfc724_mid, parent_in_reply_to, parent_references)) =
-                    self.get_parent_mime_headers(context)
+                    self.id.get_parent_mime_headers(context)
                 {
                     if !parent_rfc724_mid.is_empty() {
                         new_in_reply_to = parent_rfc724_mid.clone();
@@ -1009,9 +1003,6 @@ pub struct ChatInfo {
     /// If there is no profile image set this will be an empty string
     /// currently.
     pub profile_image: PathBuf,
-
-    /// Subtitle for the chat.
-    pub subtitle: String,
 
     /// The draft message text.
     ///
@@ -1451,6 +1442,18 @@ pub fn get_chat_msgs(
     flags: u32,
     marker1before: Option<MsgId>,
 ) -> Vec<MsgId> {
+    match delete_device_expired_messages(context) {
+        Err(err) => warn!(context, "Failed to delete expired messages: {}", err),
+        Ok(messages_deleted) => {
+            if messages_deleted {
+                context.call_cb(Event::MsgsChanged {
+                    msg_id: MsgId::new(0),
+                    chat_id: ChatId::new(0),
+                })
+            }
+        }
+    }
+
     let process_row =
         |row: &rusqlite::Row| Ok((row.get::<_, MsgId>("id")?, row.get::<_, i64>("timestamp")?));
     let process_rows = |rows: rusqlite::MappedRows<_>| {
@@ -1585,6 +1588,48 @@ pub fn marknoticed_all_chats(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
+/// Deletes messages which are expired according to "delete_device_after" setting.
+///
+/// Returns true if any message is deleted, so event can be emitted. If nothing
+/// has been deleted, returns false.
+pub fn delete_device_expired_messages(context: &Context) -> Result<bool, Error> {
+    if let Some(delete_device_after) = context.get_config_delete_device_after() {
+        let threshold_timestamp = time() - delete_device_after;
+
+        let self_chat_id = lookup_by_contact_id(context, DC_CONTACT_ID_SELF)
+            .unwrap_or_default()
+            .0;
+        let device_chat_id = lookup_by_contact_id(context, DC_CONTACT_ID_DEVICE)
+            .unwrap_or_default()
+            .0;
+
+        // Delete expired messages
+        //
+        // Only update the rows that have to be updated, to avoid emitting
+        // unnecessary "chat modified" events.
+        let rows_modified = context.sql.execute(
+            "UPDATE msgs \
+             SET txt = 'DELETED', chat_id = ? \
+             WHERE timestamp < ? \
+             AND chat_id > ? \
+             AND chat_id != ? \
+             AND chat_id != ? \
+             AND NOT hidden",
+            params![
+                DC_CHAT_ID_TRASH,
+                threshold_timestamp,
+                DC_CHAT_ID_LAST_SPECIAL,
+                self_chat_id,
+                device_chat_id
+            ],
+        )?;
+
+        Ok(rows_modified > 0)
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn get_chat_media(
     context: &Context,
     chat_id: ChatId,
@@ -1659,17 +1704,17 @@ pub fn get_next_media(
             msg_type2,
             msg_type3,
         );
-        for i in 0..list.len() {
-            if curr_msg_id == list[i] {
+        for (i, msg_id) in list.iter().enumerate() {
+            if curr_msg_id == *msg_id {
                 match direction {
                     Direction::Forward => {
                         if i + 1 < list.len() {
-                            ret = Some(list[i + 1]);
+                            ret = list.get(i + 1).copied();
                         }
                     }
                     Direction::Backward => {
                         if i >= 1 {
-                            ret = Some(list[i - 1]);
+                            ret = list.get(i - 1).copied();
                         }
                     }
                 }
@@ -1751,36 +1796,52 @@ pub fn create_group_chat(
     Ok(chat_id)
 }
 
+/// add a contact to the chats_contact table
 pub(crate) fn add_to_chat_contacts_table(
     context: &Context,
     chat_id: ChatId,
     contact_id: u32,
 ) -> bool {
-    // add a contact to a chat; the function does not check the type or if any of the record exist or are already
-    // added to the chat!
-    sql::execute(
+    match sql::execute(
         context,
         &context.sql,
         "INSERT INTO chats_contacts (chat_id, contact_id) VALUES(?, ?)",
         params![chat_id, contact_id as i32],
-    )
-    .is_ok()
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            error!(
+                context,
+                "could not add {} to chat {} table: {}", contact_id, chat_id, err
+            );
+
+            false
+        }
+    }
 }
 
+/// remove a contact from the chats_contact table
 pub(crate) fn remove_from_chat_contacts_table(
     context: &Context,
     chat_id: ChatId,
     contact_id: u32,
 ) -> bool {
-    // remove a contact from the chats_contact table unconditionally
-    // the function does not check the type or if the record exist
-    sql::execute(
+    match sql::execute(
         context,
         &context.sql,
         "DELETE FROM chats_contacts WHERE chat_id=? AND contact_id=?",
         params![chat_id, contact_id as i32],
-    )
-    .is_ok()
+    ) {
+        Ok(()) => true,
+        Err(_) => {
+            warn!(
+                context,
+                "could not remove contact {:?} from chat {:?}", contact_id, chat_id
+            );
+
+            false
+        }
+    }
 }
 
 /// Adds a contact to the chat.
@@ -1874,16 +1935,9 @@ pub(crate) fn add_contact_to_chat_ex(
         msg.param.set_cmd(SystemMessage::MemberAddedToGroup);
         msg.param.set(Param::Arg, contact.get_addr());
         msg.param.set_int(Param::Arg2, from_handshake.into());
+
         msg.id = send_msg(context, chat_id, &mut msg)?;
-        context.call_cb(Event::MsgsChanged {
-            chat_id,
-            msg_id: msg.id,
-        });
     }
-    context.call_cb(Event::MsgsChanged {
-        chat_id,
-        msg_id: MsgId::new(0),
-    });
     context.call_cb(Event::ChatModified(chat_id));
     Ok(true)
 }
@@ -2065,7 +2119,6 @@ pub fn remove_contact_from_chat(
                     )
                 );
             } else {
-                /* we should respect this - whatever we send to the group, it gets discarded anyway! */
                 if let Ok(contact) = Contact::get_by_id(context, contact_id) {
                     if chat.is_promoted() {
                         msg.viewtype = Viewtype::Text;
@@ -2088,16 +2141,20 @@ pub fn remove_contact_from_chat(
                         msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
                         msg.param.set(Param::Arg, contact.get_addr());
                         msg.id = send_msg(context, chat_id, &mut msg)?;
-                        context.call_cb(Event::MsgsChanged {
-                            chat_id,
-                            msg_id: msg.id,
-                        });
                     }
                 }
-                if remove_from_chat_contacts_table(context, chat_id, contact_id) {
-                    context.call_cb(Event::ChatModified(chat_id));
-                    success = true;
-                }
+                // we remove the member from the chat after constructing the
+                // to-be-send message. If between send_msg() and here the
+                // process dies the user will have to re-do the action.  It's
+                // better than the other way round: you removed
+                // someone from DB but no peer or device gets to know about it and
+                // group membership is thus different on different devices.
+                // Note also that sending a message needs all recipients
+                // in order to correctly determine encryption so if we
+                // removed it first, it would complicate the
+                // check/encryption logic.
+                success = remove_from_chat_contacts_table(context, chat_id, contact_id);
+                context.call_cb(Event::ChatModified(chat_id));
             }
         }
     }
@@ -2546,7 +2603,6 @@ mod tests {
                 "is_sending_locations": false,
                 "color": 15895624,
                 "profile_image": "",
-                "subtitle": "bob@example.com",
                 "draft": "",
                 "is_muted": false
             }
@@ -3055,5 +3111,17 @@ mod tests {
             Chat::load_from_db(&t.ctx, chat_id).unwrap().is_muted(),
             false
         );
+    }
+
+    #[test]
+    fn test_parent_is_encrypted() {
+        let t = dummy_context();
+        let chat_id = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "foo").unwrap();
+        assert!(!chat_id.parent_is_encrypted(&t.ctx).unwrap());
+
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("hello".to_string()));
+        chat_id.set_draft(&t.ctx, Some(&mut msg));
+        assert!(!chat_id.parent_is_encrypted(&t.ctx).unwrap());
     }
 }

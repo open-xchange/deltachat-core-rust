@@ -13,9 +13,8 @@ extern crate human_panic;
 extern crate num_traits;
 extern crate serde_json;
 
-use num_traits::{FromPrimitive, ToPrimitive};
+use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write;
 use std::ptr;
@@ -28,7 +27,7 @@ use libc::uintptr_t;
 use deltachat::chat::{ChatId, ChatVisibility, MuteDuration};
 use deltachat::coi::CoiMessageFilter;
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
-use deltachat::contact::Contact;
+use deltachat::contact::{Contact, Origin};
 use deltachat::context::Context;
 use deltachat::key::DcKey;
 use deltachat::message::MsgId;
@@ -122,17 +121,17 @@ impl ContextWrapper {
     /// Unlock the context and execute a closure with it.
     ///
     /// This is like [ContextWrapper::with_inner] but uses
-    /// [failure::Error] as error type.  This allows you to write a
+    /// [anyhow::Error] as error type.  This allows you to write a
     /// closure which could produce many errors, use the `?` operator
     /// to return them and handle them all as the return of this call.
-    fn try_inner<T, F>(&self, ctxfn: F) -> Result<T, failure::Error>
+    fn try_inner<T, F>(&self, ctxfn: F) -> Result<T, anyhow::Error>
     where
-        F: FnOnce(&Context) -> Result<T, failure::Error>,
+        F: FnOnce(&Context) -> Result<T, anyhow::Error>,
     {
         let guard = self.inner.read().unwrap();
         match guard.as_ref() {
             Some(ref ctx) => ctxfn(ctx),
-            None => Err(failure::err_msg("context not open")),
+            None => Err(anyhow::format_err!("context not open")),
         }
     }
 
@@ -197,17 +196,6 @@ impl ContextWrapper {
                         event_id,
                         contact_id as uintptr_t,
                         progress as uintptr_t,
-                    );
-                }
-                Event::SecurejoinMemberAdded {
-                    chat_id,
-                    contact_id,
-                } => {
-                    ffi_cb(
-                        self,
-                        event_id,
-                        chat_id.to_u32() as uintptr_t,
-                        contact_id as uintptr_t,
                     );
                 }
                 Event::SetMetadataDone {foreign_id} => {ffi_cb(self, event_id, foreign_id as usize, 0);},
@@ -441,7 +429,7 @@ pub unsafe extern "C" fn dc_set_config_from_qr(
 pub unsafe extern "C" fn dc_get_info(context: *mut dc_context_t) -> *mut libc::c_char {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_get_info()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_context = &*context;
     let guard = ffi_context.inner.read().unwrap();
@@ -453,7 +441,7 @@ pub unsafe extern "C" fn dc_get_info(context: *mut dc_context_t) -> *mut libc::c
 }
 
 fn render_info(
-    info: HashMap<&'static str, String>,
+    info: BTreeMap<&'static str, String>,
 ) -> std::result::Result<String, std::fmt::Error> {
     let mut res = String::new();
     for (key, value) in &info {
@@ -647,11 +635,6 @@ pub unsafe extern "C" fn dc_validate_webpush(
     let ffi_context = &*context;
     ffi_context
     .with_inner(|ctx| {ctx.validate_webpush(uid.as_str(), msg.as_str(), id);}).unwrap_or_default();
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_get_version_str() -> *mut libc::c_char {
-    context::get_version_str().strdup()
 }
 
 #[no_mangle]
@@ -1219,6 +1202,25 @@ pub unsafe extern "C" fn dc_get_fresh_msg_cnt(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_estimate_deletion_cnt(
+    context: *mut dc_context_t,
+    from_server: libc::c_int,
+    seconds: i64,
+) -> libc::c_int {
+    if context.is_null() || seconds < 0 {
+        eprintln!("ignoring careless call to dc_estimate_deletion_cnt()");
+        return 0;
+    }
+    let ffi_context = &*context;
+    ffi_context
+        .with_inner(|ctx| {
+            message::estimate_deletion_cnt(ctx, from_server != 0, seconds).unwrap_or(0)
+                as libc::c_int
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_get_fresh_msgs(
     context: *mut dc_context_t,
 ) -> *mut dc_array::dc_array_t {
@@ -1628,7 +1630,7 @@ pub unsafe extern "C" fn dc_get_msg_info(
 ) -> *mut libc::c_char {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_get_msg_info()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_context = &*context;
     ffi_context
@@ -1811,7 +1813,9 @@ pub unsafe extern "C" fn dc_lookup_contact_id_by_addr(
     }
     let ffi_context = &*context;
     ffi_context
-        .with_inner(|ctx| Contact::lookup_id_by_addr(ctx, to_string_lossy(addr)))
+        .with_inner(|ctx| {
+            Contact::lookup_id_by_addr(ctx, to_string_lossy(addr), Origin::IncomingReplyTo)
+        })
         .unwrap_or(0)
 }
 
@@ -2249,16 +2253,6 @@ pub unsafe extern "C" fn dc_array_unref(a: *mut dc_array::dc_array_t) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_array_add_id(array: *mut dc_array_t, item: libc::c_uint) {
-    if array.is_null() {
-        eprintln!("ignoring careless call to dc_array_add_id()");
-        return;
-    }
-
-    (*array).add_id(item);
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_array_get_cnt(array: *const dc_array_t) -> libc::size_t {
     if array.is_null() {
         eprintln!("ignoring careless call to dc_array_get_cnt()");
@@ -2579,23 +2573,10 @@ pub unsafe extern "C" fn dc_chat_get_type(chat: *mut dc_chat_t) -> libc::c_int {
 pub unsafe extern "C" fn dc_chat_get_name(chat: *mut dc_chat_t) -> *mut libc::c_char {
     if chat.is_null() {
         eprintln!("ignoring careless call to dc_chat_get_name()");
-        return dc_strdup(ptr::null());
-    }
-    let ffi_chat = &*chat;
-    ffi_chat.chat.get_name().strdup()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_chat_get_subtitle(chat: *mut dc_chat_t) -> *mut libc::c_char {
-    if chat.is_null() {
-        eprintln!("ignoring careless call to dc_chat_get_subtitle()");
         return "".strdup();
     }
     let ffi_chat = &*chat;
-    let ffi_context: &ContextWrapper = &*ffi_chat.context;
-    ffi_context
-        .with_inner(|ctx| ffi_chat.chat.get_subtitle(ctx).strdup())
-        .unwrap_or_else(|_| "".strdup())
+    ffi_chat.chat.get_name().strdup()
 }
 
 #[no_mangle]
@@ -2901,7 +2882,7 @@ pub unsafe extern "C" fn dc_msg_get_sort_timestamp(msg: *mut dc_msg_t) -> i64 {
 pub unsafe extern "C" fn dc_msg_get_text(msg: *mut dc_msg_t) -> *mut libc::c_char {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_get_text()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_msg = &*msg;
     ffi_msg.message.get_text().unwrap_or_default().strdup()
@@ -2920,8 +2901,7 @@ pub unsafe extern "C" fn dc_msg_get_file(msg: *mut dc_msg_t) -> *mut libc::c_cha
             ffi_msg
                 .message
                 .get_file(ctx)
-                .and_then(|p| p.to_c_string().ok())
-                .map(|cs| dc_strdup(cs.as_ptr()))
+                .map(|p| p.strdup())
                 .unwrap_or_else(|| "".strdup())
         })
         .unwrap_or_else(|_| "".strdup())
@@ -2931,7 +2911,7 @@ pub unsafe extern "C" fn dc_msg_get_file(msg: *mut dc_msg_t) -> *mut libc::c_cha
 pub unsafe extern "C" fn dc_msg_get_filename(msg: *mut dc_msg_t) -> *mut libc::c_char {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_get_filename()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_msg = &*msg;
     ffi_msg.message.get_filename().unwrap_or_default().strdup()
@@ -2941,13 +2921,13 @@ pub unsafe extern "C" fn dc_msg_get_filename(msg: *mut dc_msg_t) -> *mut libc::c
 pub unsafe extern "C" fn dc_msg_get_filemime(msg: *mut dc_msg_t) -> *mut libc::c_char {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_get_filemime()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_msg = &*msg;
     if let Some(x) = ffi_msg.message.get_filemime() {
         x.strdup()
     } else {
-        dc_strdup(ptr::null())
+        "".strdup()
     }
 }
 
@@ -3271,7 +3251,7 @@ pub unsafe extern "C" fn dc_contact_get_id(contact: *mut dc_contact_t) -> u32 {
 pub unsafe extern "C" fn dc_contact_get_addr(contact: *mut dc_contact_t) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_addr()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_addr().strdup()
@@ -3281,7 +3261,7 @@ pub unsafe extern "C" fn dc_contact_get_addr(contact: *mut dc_contact_t) -> *mut
 pub unsafe extern "C" fn dc_contact_get_name(contact: *mut dc_contact_t) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_name()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_name().strdup()
@@ -3293,7 +3273,7 @@ pub unsafe extern "C" fn dc_contact_get_display_name(
 ) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_display_name()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_display_name().strdup()
@@ -3305,7 +3285,7 @@ pub unsafe extern "C" fn dc_contact_get_name_n_addr(
 ) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_name_n_addr()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_name_n_addr().strdup()
@@ -3317,7 +3297,7 @@ pub unsafe extern "C" fn dc_contact_get_first_name(
 ) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_first_name()");
-        return dc_strdup(ptr::null());
+        return "".strdup();
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_first_name().strdup()

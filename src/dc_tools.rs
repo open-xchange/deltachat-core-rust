@@ -5,7 +5,7 @@ use core::cmp::{max, min};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{fmt, fs};
 
 use chrono::{Local, TimeZone};
@@ -13,7 +13,7 @@ use rand::{thread_rng, Rng};
 
 use crate::config::Config;
 use crate::context::Context;
-use crate::error::Error;
+use crate::error::{bail, Error};
 use crate::events::Event;
 
 /// Shortens a string to a specified length and adds "[...]" to the
@@ -70,6 +70,14 @@ pub(crate) fn dc_str_to_color(s: impl AsRef<str>) -> u32 {
 pub fn dc_timestamp_to_str(wanted: i64) -> String {
     let ts = Local.timestamp(wanted, 0);
     ts.format("%Y.%m.%d %H:%M:%S").to_string()
+}
+
+pub fn duration_to_str(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = (secs % 3600) % 60;
+    format!("{}h {}m {}s", h, m, s)
 }
 
 pub(crate) fn dc_gm2local_offset() -> i64 {
@@ -267,7 +275,6 @@ pub(crate) fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
     let mid = mid.trim_start_matches('<').trim_end_matches('>');
 
     if mid.len() < 9 || !mid.starts_with(OLD_GROUP_ID_PREFIX) && !mid.starts_with(NEW_GROUP_ID_PREFIX) {
-        println!("### returning for mid: '{}'", mid);
         return None;
     }
 
@@ -518,6 +525,23 @@ pub(crate) fn time() -> i64 {
         .as_secs() as i64
 }
 
+/// An invalid email address was encountered
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid email address: {message} ({addr})")]
+pub struct InvalidEmailError {
+    message: String,
+    addr: String,
+}
+
+impl InvalidEmailError {
+    fn new(msg: impl Into<String>, addr: impl Into<String>) -> InvalidEmailError {
+        InvalidEmailError {
+            message: msg.into(),
+            addr: addr.into(),
+        }
+    }
+}
+
 /// Very simple email address wrapper.
 ///
 /// Represents an email address, right now just the `name@domain` portion.
@@ -541,7 +565,7 @@ pub struct EmailAddress {
 }
 
 impl EmailAddress {
-    pub fn new(input: &str) -> Result<Self, Error> {
+    pub fn new(input: &str) -> Result<Self, InvalidEmailError> {
         input.parse::<EmailAddress>()
     }
 }
@@ -553,31 +577,55 @@ impl fmt::Display for EmailAddress {
 }
 
 impl FromStr for EmailAddress {
-    type Err = Error;
+    type Err = InvalidEmailError;
 
     /// Performs a dead-simple parse of an email address.
-    fn from_str(input: &str) -> Result<EmailAddress, Error> {
-        ensure!(!input.is_empty(), "empty string is not valid");
+    fn from_str(input: &str) -> Result<EmailAddress, InvalidEmailError> {
+        if input.is_empty() {
+            return Err(InvalidEmailError::new("empty string is not valid", input));
+        }
         let parts: Vec<&str> = input.rsplitn(2, '@').collect();
 
-        ensure!(parts.len() > 1, "missing '@' character");
-        let local = parts[1];
-        let domain = parts[0];
+        let err = |msg: &str| {
+            Err(InvalidEmailError {
+                message: msg.to_string(),
+                addr: input.to_string(),
+            })
+        };
+        match &parts[..] {
+            [domain, local] => {
+                if local.is_empty() {
+                    return err("empty string is not valid for local part");
+                }
+                if domain.len() <= 3 {
+                    return err("domain is too short");
+                }
+                let dot = domain.find('.');
+                match dot {
+                    None => {
+                        return err("invalid domain");
+                    }
+                    Some(dot_idx) => {
+                        if dot_idx >= domain.len() - 2 {
+                            return err("invalid domain");
+                        }
+                    }
+                }
+                Ok(EmailAddress {
+                    local: (*local).to_string(),
+                    domain: (*domain).to_string(),
+                })
+            }
+            _ => err("missing '@' character"),
+        }
+    }
+}
 
-        ensure!(
-            !local.is_empty(),
-            "empty string is not valid for local part"
-        );
-        ensure!(domain.len() > 3, "domain is too short");
-
-        let dot = domain.find('.');
-        ensure!(dot.is_some(), "invalid domain");
-        ensure!(dot.unwrap() < domain.len() - 2, "invalid domain");
-
-        Ok(EmailAddress {
-            local: local.to_string(),
-            domain: domain.to_string(),
-        })
+impl rusqlite::types::ToSql for EmailAddress {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+        let val = rusqlite::types::Value::Text(self.to_string());
+        let out = rusqlite::types::ToSqlOutput::Owned(val);
+        Ok(out)
     }
 }
 
@@ -906,5 +954,38 @@ mod tests {
         let start = dc_create_smeared_timestamps(&t.ctx, count as usize);
         let next = dc_smeared_time(&t.ctx);
         assert!((start + count - 1) < next);
+    }
+
+    #[test]
+    fn test_duration_to_str() {
+        assert_eq!(duration_to_str(Duration::from_secs(0)), "0h 0m 0s");
+        assert_eq!(duration_to_str(Duration::from_secs(59)), "0h 0m 59s");
+        assert_eq!(duration_to_str(Duration::from_secs(60)), "0h 1m 0s");
+        assert_eq!(duration_to_str(Duration::from_secs(61)), "0h 1m 1s");
+        assert_eq!(duration_to_str(Duration::from_secs(59 * 60)), "0h 59m 0s");
+        assert_eq!(
+            duration_to_str(Duration::from_secs(59 * 60 + 59)),
+            "0h 59m 59s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(59 * 60 + 60)),
+            "1h 0m 0s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(2 * 60 * 60 + 59 * 60 + 59)),
+            "2h 59m 59s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(2 * 60 * 60 + 59 * 60 + 60)),
+            "3h 0m 0s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(3 * 60 * 60 + 59)),
+            "3h 0m 59s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(3 * 60 * 60 + 60)),
+            "3h 1m 0s"
+        );
     }
 }

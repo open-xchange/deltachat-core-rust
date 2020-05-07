@@ -4,8 +4,6 @@
 #![recursion_limit="256"]
 
 #[macro_use]
-extern crate failure_derive;
-#[macro_use]
 extern crate num_derive;
 #[macro_use]
 extern crate smallvec;

@@ -4,10 +4,13 @@ use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
 
 use crate::blob::BlobObject;
+use crate::chat::ChatId;
 use crate::constants::DC_VERSION_STR;
 use crate::context::Context;
 use crate::dc_tools::*;
+use crate::events::Event;
 use crate::job::*;
+use crate::message::MsgId;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::stock::StockMessage;
 use rusqlite::NO_PARAMS;
@@ -67,11 +70,32 @@ pub enum Config {
     #[strum(props(default = "0"))] // also change ShowEmails.default() on changes
     ShowEmails,
 
+    #[strum(props(default = "0"))] // also change MediaQuality.default() on changes
+    MediaQuality,
+
     #[strum(props(default = "0"))]
     KeyGenType,
 
     #[strum(props(default = "38535168"))]
     MaxAttachSize,
+    /// Timer in seconds after which the message is deleted from the
+    /// server.
+    ///
+    /// Equals to 0 by default, which means the message is never
+    /// deleted.
+    ///
+    /// Value 1 is treated as "delete at once": messages are deleted
+    /// immediately, without moving to DeltaChat folder.
+    #[strum(props(default = "0"))]
+    DeleteServerAfter,
+
+    /// Timer in seconds after which the message is deleted from the
+    /// device.
+    ///
+    /// Equals to 0 by default, which means the message is never
+    /// deleted.
+    #[strum(props(default = "0"))]
+    DeleteDeviceAfter,
 
     SaveMimeHeaders,
     ConfiguredAddr,
@@ -139,6 +163,29 @@ impl Context {
         self.get_config_int(key) != 0
     }
 
+    /// Gets configured "delete_server_after" value.
+    ///
+    /// `None` means never delete the message, `Some(0)` means delete
+    /// at once, `Some(x)` means delete after `x` seconds.
+    pub fn get_config_delete_server_after(&self) -> Option<i64> {
+        match self.get_config_int(Config::DeleteServerAfter) {
+            0 => None,
+            1 => Some(0),
+            x => Some(x as i64),
+        }
+    }
+
+    /// Gets configured "delete_device_after" value.
+    ///
+    /// `None` means never delete the message, `Some(x)` means delete
+    /// after `x` seconds.
+    pub fn get_config_delete_device_after(&self) -> Option<i64> {
+        match self.get_config_int(Config::DeleteDeviceAfter) {
+            0 => None,
+            x => Some(x as i64),
+        }
+    }
+
     /// Set the given config key.
     /// If `None` is passed as a value the value is cleared and set to the default if there is one.
     pub fn set_config(&self, key: Config, value: Option<&str>) -> crate::sql::Result<()> {
@@ -182,6 +229,15 @@ impl Context {
 
                 self.sql.set_raw_config(self, key, val)
             }
+            Config::DeleteDeviceAfter => {
+                let ret = self.sql.set_raw_config(self, key, value);
+                // Force chatlist reload to delete old messages immediately.
+                self.call_cb(Event::MsgsChanged {
+                    msg_id: MsgId::new(0),
+                    chat_id: ChatId::new(0),
+                });
+                ret
+            }
             _ => self.sql.set_raw_config(self, key, value),
         }
     }
@@ -205,9 +261,11 @@ mod tests {
     use std::str::FromStr;
     use std::string::ToString;
 
+    use crate::constants;
     use crate::constants::AVATAR_SIZE;
     use crate::test_utils::*;
     use image::GenericImageView;
+    use num_traits::FromPrimitive;
     use std::fs::File;
     use std::io::Write;
 
@@ -279,5 +337,45 @@ mod tests {
         let img = image::open(avatar_src).unwrap();
         assert_eq!(img.width(), AVATAR_SIZE);
         assert_eq!(img.height(), AVATAR_SIZE);
+    }
+
+    #[test]
+    fn test_selfavatar_copy_without_recode() {
+        let t = dummy_context();
+        let avatar_src = t.dir.path().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
+        File::create(&avatar_src)
+            .unwrap()
+            .write_all(avatar_bytes)
+            .unwrap();
+        let avatar_blob = t.ctx.get_blobdir().join("avatar.png");
+        assert!(!avatar_blob.exists());
+        t.ctx
+            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))
+            .unwrap();
+        assert!(avatar_blob.exists());
+        assert_eq!(
+            std::fs::metadata(&avatar_blob).unwrap().len(),
+            avatar_bytes.len() as u64
+        );
+        let avatar_cfg = t.ctx.get_config(Config::Selfavatar);
+        assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
+    }
+
+    #[test]
+    fn test_media_quality_config_option() {
+        let t = dummy_context();
+        let media_quality = t.ctx.get_config_int(Config::MediaQuality);
+        assert_eq!(media_quality, 0);
+        let media_quality = constants::MediaQuality::from_i32(media_quality).unwrap_or_default();
+        assert_eq!(media_quality, constants::MediaQuality::Balanced);
+
+        t.ctx.set_config(Config::MediaQuality, Some("1")).unwrap();
+
+        let media_quality = t.ctx.get_config_int(Config::MediaQuality);
+        assert_eq!(media_quality, 1);
+        assert_eq!(constants::MediaQuality::Worse as i32, 1);
+        let media_quality = constants::MediaQuality::from_i32(media_quality).unwrap_or_default();
+        assert_eq!(media_quality, constants::MediaQuality::Worse);
     }
 }
