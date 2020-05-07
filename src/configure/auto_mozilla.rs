@@ -318,9 +318,9 @@ mod tests {
   </webMail>
 </clientConfig>";
         let res = parse_xml("example@outlook.com", xml_raw).expect("XML parsing failed");
-        assert_eq!(res.mail_server, "outlook.office365.com");
-        assert_eq!(res.mail_port, 993);
-        assert_eq!(res.send_server, "smtp.office365.com");
-        assert_eq!(res.send_port, 587);
+        assert_eq!(res.srv_params[Service::Imap as usize].hostname, "outlook.office365.com");
+        assert_eq!(res.srv_params[Service::Imap as usize].port, 993);
+        assert_eq!(res.srv_params[Service::Smtp as usize].hostname, "smtp.office365.com");
+        assert_eq!(res.srv_params[Service::Smtp as usize].port, 587);
     }
 }

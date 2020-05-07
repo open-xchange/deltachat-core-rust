@@ -782,7 +782,7 @@ mod tests {
         let mut params = LoginParam::new();
         params.addr = "someone123@nauta.cu".to_string();
         let found_params = get_offline_autoconfig(&context, &params).unwrap();
-        assert_eq!(found_params.mail_server, "imap.nauta.cu".to_string());
-        assert_eq!(found_params.send_server, "smtp.nauta.cu".to_string());
+        assert_eq!(found_params.srv_params[Service::Imap as usize].hostname, "imap.nauta.cu".to_string());
+        assert_eq!(found_params.srv_params[Service::Smtp as usize].hostname, "smtp.nauta.cu".to_string());
     }
 }
