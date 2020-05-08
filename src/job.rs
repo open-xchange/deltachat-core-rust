@@ -9,6 +9,10 @@ use deltachat_derive::{FromSql, ToSql};
 use itertools::Itertools;
 use rand::{thread_rng, Rng};
 use imap_proto::Metadata;
+
+use async_smtp::smtp::response::Category;
+use async_smtp::smtp::response::Code;
+use async_smtp::smtp::response::Detail;
 use async_std::task;
 pub use async_imap::extensions::metadata::MetadataDepth;
 
@@ -20,7 +24,7 @@ use crate::constants::*;
 use crate::contact::Contact;
 use crate::context::{Context, PerformJobsNeeded};
 use crate::dc_tools::*;
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, format_err, Error, Result};
 use crate::events::Event;
 use crate::imap::*;
 use crate::imex::*;
@@ -73,7 +77,19 @@ impl Default for Thread {
     }
 }
 
-#[derive(Debug, Display, Copy, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+#[derive(
+    Debug,
+    Display,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    FromPrimitive,
+    ToPrimitive,
+    FromSql,
+    ToSql,
+)]
 #[repr(i32)]
 pub enum Action {
     Unknown = 0,
@@ -81,12 +97,16 @@ pub enum Action {
     // Jobs in the INBOX-thread, range from DC_IMAP_THREAD..DC_IMAP_THREAD+999
     Housekeeping = 105, // low priority ...
     EmptyServer = 107,
-    DeleteMsgOnImap = 110,
-    MarkseenMdnOnImap = 120,
+    OldDeleteMsgOnImap = 110,
     MarkseenMsgOnImap = 130,
+
+    // Moving message is prioritized lower than deletion so we don't
+    // bother moving message if it is already scheduled for deletion.
     MoveMsg = 200,
+    DeleteMsgOnImap = 210,
     SetMetadata = 300,
     GetMetadata = 310,
+
     ConfigureImap = 900,
     ImexImap = 910, // ... high priority
 
@@ -111,9 +131,9 @@ impl From<Action> for Thread {
             Unknown => Thread::Unknown,
 
             Housekeeping => Thread::Imap,
+            OldDeleteMsgOnImap => Thread::Imap,
             DeleteMsgOnImap => Thread::Imap,
             EmptyServer => Thread::Imap,
-            MarkseenMdnOnImap => Thread::Imap,
             MarkseenMsgOnImap => Thread::Imap,
             MoveMsg => Thread::Imap,
             SetMetadata => Thread::Imap,
@@ -148,30 +168,68 @@ impl fmt::Display for Job {
 }
 
 impl Job {
-    /// Deletes the job from the database.
-    fn delete(&self, context: &Context) -> bool {
-        context
-            .sql
-            .execute("DELETE FROM jobs WHERE id=?;", params![self.job_id as i32])
-            .is_ok()
+    fn new(action: Action, foreign_id: u32, param: Params, delay_seconds: i64) -> Self {
+        let timestamp = time();
+
+        Self {
+            job_id: 0,
+            action,
+            foreign_id,
+            desired_timestamp: timestamp + delay_seconds,
+            added_timestamp: timestamp,
+            tries: 0,
+            param,
+            pending_error: None,
+        }
     }
 
-    /// Updates the job already stored in the database.
+    /// Deletes the job from the database.
+    fn delete(&self, context: &Context) -> bool {
+        if self.job_id != 0 {
+            context
+                .sql
+                .execute("DELETE FROM jobs WHERE id=?;", params![self.job_id as i32])
+                .is_ok()
+        } else {
+            // Already deleted.
+            true
+        }
+    }
+
+    /// Saves the job to the database, creating a new entry if necessary.
     ///
-    /// To add a new job, use [job_add].
-    fn update(&self, context: &Context) -> bool {
-        sql::execute(
-            context,
-            &context.sql,
-            "UPDATE jobs SET desired_timestamp=?, tries=?, param=? WHERE id=?;",
-            params![
-                self.desired_timestamp,
-                self.tries as i64,
-                self.param.to_string(),
-                self.job_id as i32,
-            ],
-        )
-        .is_ok()
+    /// The Job is consumed by this method.
+    fn save(self, context: &Context) -> bool {
+        let thread: Thread = self.action.into();
+
+        if self.job_id != 0 {
+            sql::execute(
+                context,
+                &context.sql,
+                "UPDATE jobs SET desired_timestamp=?, tries=?, param=? WHERE id=?;",
+                params![
+                    self.desired_timestamp,
+                    self.tries as i64,
+                    self.param.to_string(),
+                    self.job_id as i32,
+                ],
+            )
+            .is_ok()
+        } else {
+            sql::execute(
+                context,
+                &context.sql,
+                "INSERT INTO jobs (added_timestamp, thread, action, foreign_id, param, desired_timestamp) VALUES (?,?,?,?,?,?);",
+                params![
+                    self.added_timestamp,
+                    thread,
+                    self.action,
+                    self.foreign_id,
+                    self.param.to_string(),
+                    self.desired_timestamp
+                ]
+            ).is_ok()
+        }
     }
 
     fn smtp_send<F>(
@@ -201,8 +259,37 @@ impl Job {
                 self.pending_error = Some(err.to_string());
 
                 let res = match err {
-                    async_smtp::smtp::error::Error::Permanent(_) => {
-                        Status::Finished(Err(format_err!("Permanent SMTP error: {}", err)))
+                    async_smtp::smtp::error::Error::Permanent(ref response) => {
+                        match response.code {
+                            // Sometimes servers send a permanent error when actually it is a temporary error
+                            // For documentation see https://tools.ietf.org/html/rfc3463
+
+                            // Code 5.5.0, see https://support.delta.chat/t/every-other-message-gets-stuck/877/2
+                            Code {
+                                category: Category::MailSystem,
+                                detail: Detail::Zero,
+                                ..
+                            } => Status::RetryLater,
+
+                            _ => {
+                                // If we do not retry, add an info message to the chat
+                                // Error 5.7.1 should definitely go here: Yandex sends 5.7.1 with a link when it thinks that the email is SPAM.
+                                match Message::load_from_db(context, MsgId::new(self.foreign_id)) {
+                                    Ok(message) => chat::add_info_msg(
+                                        context,
+                                        message.chat_id,
+                                        err.to_string(),
+                                    ),
+                                    Err(e) => warn!(
+                                        context,
+                                        "couldn't load chat_id to inform user about SMTP error: {}",
+                                        e
+                                    ),
+                                };
+
+                                Status::Finished(Err(format_err!("Permanent SMTP error: {}", err)))
+                            }
+                        }
                     }
                     async_smtp::smtp::error::Error::Transient(_) => {
                         // We got a transient 4xx response from SMTP server.
@@ -228,7 +315,7 @@ impl Job {
                 // Local error, job is invalid, do not retry.
                 smtp.disconnect();
                 warn!(context, "SMTP job is invalid: {}", err);
-                Status::Finished(Err(Error::SmtpError(err)))
+                Status::Finished(Err(err.into()))
             }
             Err(crate::smtp::send::Error::NoTransport) => {
                 // Should never happen.
@@ -421,18 +508,12 @@ impl Job {
 
         if let Some(dest_folder) = dest_folder {
             let server_folder = msg.server_folder.as_ref().unwrap();
-            let mut dest_uid = 0;
 
-            match imap_inbox.mv(
-                context,
-                server_folder,
-                msg.server_uid,
-                &dest_folder,
-                &mut dest_uid,
-            ) {
+            match imap_inbox.mv(context, server_folder, msg.server_uid, &dest_folder) {
                 ImapActionResult::RetryLater => Status::RetryLater,
                 ImapActionResult::Success => {
-                    message::update_server_uid(context, &msg.rfc724_mid, &dest_folder, dest_uid);
+                    // XXX Rust-Imap provides no target uid on mv, so just set it to 0
+                    message::update_server_uid(context, &msg.rfc724_mid, &dest_folder, 0);
                     Status::Finished(Ok(()))
                 }
                 ImapActionResult::Failed => {
@@ -506,14 +587,29 @@ impl Job {
         }
     }
 
+    /// Deletes a message on the server.
+    ///
+    /// foreign_id is a MsgId pointing to a message in the trash chat
+    /// or a hidden message.
+    ///
+    /// This job removes the database record. If there are no more
+    /// records pointing to the same message on the server, the job
+    /// also removes the message on the server.
     #[allow(non_snake_case)]
     fn DeleteMsgOnImap(&mut self, context: &Context) -> Status {
         let imap_inbox = &context.inbox_thread.read().unwrap().imap;
 
-        let mut msg = job_try!(Message::load_from_db(context, MsgId::new(self.foreign_id)));
+        let msg = job_try!(Message::load_from_db(context, MsgId::new(self.foreign_id)));
 
         if !msg.rfc724_mid.is_empty() {
-            if message::rfc724_mid_cnt(context, &msg.rfc724_mid) > 1 {
+            let cnt = message::rfc724_mid_cnt(context, &msg.rfc724_mid);
+            info!(
+                context,
+                "Running delete job for message {} which has {} entries in the database",
+                &msg.rfc724_mid,
+                cnt
+            );
+            if cnt > 1 {
                 info!(
                     context,
                     "The message is deleted from the server when all parts are deleted.",
@@ -523,13 +619,47 @@ impl Job {
                 we delete the message from the server */
                 let mid = msg.rfc724_mid;
                 let server_folder = msg.server_folder.as_ref().unwrap();
-                let res = imap_inbox.delete_msg(context, &mid, server_folder, &mut msg.server_uid);
-                if res == ImapActionResult::RetryLater {
-                    // XXX RetryLater is converted to RetryNow here
-                    return Status::RetryNow;
+                let res = if msg.server_uid == 0 {
+                    // Message is already deleted on IMAP server.
+                    ImapActionResult::AlreadyDone
+                } else {
+                    imap_inbox.delete_msg(context, &mid, server_folder, msg.server_uid)
+                };
+                match res {
+                    ImapActionResult::AlreadyDone | ImapActionResult::Success => {}
+                    ImapActionResult::RetryLater | ImapActionResult::Failed => {
+                        // If job has failed, for example due to some
+                        // IMAP bug, we postpone it instead of failing
+                        // immediately. This will prevent adding it
+                        // immediately again if user has enabled
+                        // automatic message deletion. Without this,
+                        // we might waste a lot of traffic constantly
+                        // retrying message deletion.
+                        return Status::RetryLater;
+                    }
                 }
             }
-            Message::delete_from_db(context, msg.id);
+            if msg.chat_id.is_trash() || msg.hidden {
+                // Messages are stored in trash chat only to keep
+                // their server UID and Message-ID. Once message is
+                // deleted from the server, database record can be
+                // removed as well.
+                //
+                // Hidden messages are similar to trashed, but are
+                // related to some chat. We also delete their
+                // database records.
+                job_try!(msg.id.delete_from_db(context))
+            } else {
+                // Remove server UID from the database record.
+                //
+                // We have either just removed the message from the
+                // server, in which case UID is not valid anymore, or
+                // we have more refernces to the same server UID, so
+                // we remove UID to reduce the number of messages
+                // pointing to the corresponding UID. Once the counter
+                // reaches zero, we will remove the message.
+                job_try!(msg.id.unlink(context));
+            }
             Status::Finished(Ok(()))
         } else {
             /* eg. device messages have no Message-ID */
@@ -579,43 +709,6 @@ impl Job {
                 }
                 Status::Finished(Ok(()))
             }
-        }
-    }
-
-    #[allow(non_snake_case)]
-    fn MarkseenMdnOnImap(&mut self, context: &Context) -> Status {
-        let folder = self
-            .param
-            .get(Param::ServerFolder)
-            .unwrap_or_default()
-            .to_string();
-        let uid = self.param.get_int(Param::ServerUid).unwrap_or_default() as u32;
-        let imap_inbox = &context.inbox_thread.read().unwrap().imap;
-        if imap_inbox.set_seen(context, &folder, uid) == ImapActionResult::RetryLater {
-            return Status::RetryLater;
-        }
-        if self.param.get_bool(Param::AlsoMove).unwrap_or_default() {
-            if let Err(err) = imap_inbox.ensure_configured_folders(context, true) {
-                warn!(context, "configuring folders failed: {:?}", err);
-                return Status::RetryLater;
-            }
-            let dest_folder = context
-                .sql
-                .get_raw_config(context, "configured_mvbox_folder");
-            if let Some(dest_folder) = dest_folder {
-                let mut dest_uid = 0;
-                if ImapActionResult::RetryLater
-                    == imap_inbox.mv(context, &folder, uid, &dest_folder, &mut dest_uid)
-                {
-                    Status::RetryLater
-                } else {
-                    Status::Finished(Ok(()))
-                }
-            } else {
-                Status::Finished(Err(format_err!("MVBOX is not configured")))
-            }
-        } else {
-            Status::Finished(Ok(()))
         }
     }
 }
@@ -890,7 +983,11 @@ pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
         .get_config(Config::ConfiguredAddr)
         .unwrap_or_default();
     let lowercase_from = from.to_lowercase();
+
+    // Send BCC to self if it is enabled and we are not going to
+    // delete it immediately.
     if context.get_config_bool(Config::BccSelf)
+        && context.get_config_delete_server_after() != Some(0)
         && !recipients
             .iter()
             .any(|x| x.to_lowercase() == lowercase_from)
@@ -966,6 +1063,36 @@ pub fn job_send_msg(context: &Context, msg_id: MsgId) -> Result<()> {
     Ok(())
 }
 
+fn load_imap_deletion_msgid(context: &Context) -> sql::Result<Option<MsgId>> {
+    if let Some(delete_server_after) = context.get_config_delete_server_after() {
+        let threshold_timestamp = time() - delete_server_after;
+
+        context.sql.query_row_optional(
+            "SELECT id FROM msgs \
+             WHERE timestamp < ? \
+             AND server_uid != 0",
+            params![threshold_timestamp],
+            |row| row.get::<_, MsgId>(0),
+        )
+    } else {
+        Ok(None)
+    }
+}
+
+fn load_imap_deletion_job(context: &Context) -> sql::Result<Option<Job>> {
+    let res = if let Some(msg_id) = load_imap_deletion_msgid(context)? {
+        Some(Job::new(
+            Action::DeleteMsgOnImap,
+            msg_id.to_u32(),
+            Params::new(),
+            0,
+        ))
+    } else {
+        None
+    };
+    Ok(res)
+}
+
 pub fn perform_inbox_jobs(context: &Context) {
     info!(context, "dc_perform_inbox_jobs starting.",);
 
@@ -986,7 +1113,17 @@ pub fn perform_sentbox_jobs(context: &Context) {
 }
 
 fn job_perform(context: &Context, thread: Thread, probe_network: bool) {
+    let mut jobs_loaded = 0;
+
     while let Some(mut job) = load_next_job(context, thread, probe_network) {
+        jobs_loaded += 1;
+        if thread == Thread::Imap && jobs_loaded > 20 {
+            // Let the fetch run, but return back to the job afterwards.
+            info!(context, "postponing {}-job {} to run fetch...", thread, job);
+            *context.perform_inbox_jobs_needed.write().unwrap() = true;
+            break;
+        }
+
         info!(context, "{}-job {} started...", thread, job);
 
         // some configuration jobs are "exclusive":
@@ -1044,7 +1181,6 @@ fn job_perform(context: &Context, thread: Thread, probe_network: bool) {
                     job.tries = tries;
                     let time_offset = get_backoff_time_offset(tries);
                     job.desired_timestamp = time() + time_offset;
-                    job.update(context);
                     info!(
                         context,
                         "{}-job #{} not succeeded on try #{}, retry in {} seconds.",
@@ -1053,6 +1189,7 @@ fn job_perform(context: &Context, thread: Thread, probe_network: bool) {
                         tries,
                         time_offset
                     );
+                    job.save(context);
                     if thread == Thread::Smtp && tries < JOB_RETRIES - 1 {
                         context
                             .smtp_state
@@ -1114,9 +1251,9 @@ fn perform_job_action(context: &Context, mut job: &mut Job, thread: Thread, trie
         Action::Unknown => Status::Finished(Err(format_err!("Unknown job id found"))),
         Action::SendMsgToSmtp => job.SendMsgToSmtp(context),
         Action::EmptyServer => job.EmptyServer(context),
+        Action::OldDeleteMsgOnImap => job.DeleteMsgOnImap(context),
         Action::DeleteMsgOnImap => job.DeleteMsgOnImap(context),
         Action::MarkseenMsgOnImap => job.MarkseenMsgOnImap(context),
-        Action::MarkseenMdnOnImap => job.MarkseenMdnOnImap(context),
         Action::MoveMsg => job.MoveMsg(context),
         Action::SendMdn => job.SendMdn(context),
         Action::SetMetadata => job.SetMetadata(context),
@@ -1125,7 +1262,7 @@ fn perform_job_action(context: &Context, mut job: &mut Job, thread: Thread, trie
         Action::ImexImap => match JobImexImap(context, &job) {
             Ok(()) => Status::Finished(Ok(())),
             Err(err) => {
-                error!(context, "{}", err);
+                error!(context, "Import/export failed: {}", err);
                 Status::Finished(Err(err))
             }
         },
@@ -1212,27 +1349,16 @@ pub fn job_add(
         return;
     }
 
-    let timestamp = time();
-    let thread: Thread = action.into();
+    let job = Job::new(action, foreign_id as u32, param, delay_seconds);
+    job.save(context);
 
-    sql::execute(
-        context,
-        &context.sql,
-        "INSERT INTO jobs (added_timestamp, thread, action, foreign_id, param, desired_timestamp) VALUES (?,?,?,?,?,?);",
-        params![
-            timestamp,
-            thread,
-            action,
-            foreign_id,
-            param.to_string(),
-            (timestamp + delay_seconds as i64)
-        ]
-    ).ok();
-
-    match thread {
-        Thread::Imap => interrupt_inbox_idle(context),
-        Thread::Smtp => interrupt_smtp_idle(context),
-        Thread::Unknown => {}
+    if delay_seconds == 0 {
+        let thread: Thread = action.into();
+        match thread {
+            Thread::Imap => interrupt_inbox_idle(context),
+            Thread::Smtp => interrupt_smtp_idle(context),
+            Thread::Unknown => {}
+        }
     }
 }
 
@@ -1276,7 +1402,7 @@ fn load_next_job(context: &Context, thread: Thread, probe_network: bool) -> Opti
         params_probe
     };
 
-    context
+    let job = context
         .sql
         .query_map(
             query,
@@ -1305,7 +1431,23 @@ fn load_next_job(context: &Context, thread: Thread, probe_network: bool) -> Opti
                 Ok(None)
             },
         )
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if thread == Thread::Imap {
+        if let Some(job) = job {
+            if job.action < Action::DeleteMsgOnImap {
+                load_imap_deletion_job(context)
+                    .unwrap_or_default()
+                    .or(Some(job))
+            } else {
+                Some(job)
+            }
+        } else {
+            load_imap_deletion_job(context).unwrap_or_default()
+        }
+    } else {
+        job
+    }
 }
 
 #[cfg(test)]

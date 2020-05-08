@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobError, BlobObject};
 use crate::context::Context;
-use crate::error;
+use crate::error::{self, bail, ensure};
 use crate::message::MsgId;
 use crate::mimeparser::SystemMessage;
 
@@ -89,12 +89,6 @@ pub enum Param {
 
     /// For Jobs
     SetLongitude = b'n',
-
-    /// For Jobs
-    ServerFolder = b'Z',
-
-    /// For Jobs
-    ServerUid = b'z',
 
     /// For Jobs
     AlsoMove = b'M',

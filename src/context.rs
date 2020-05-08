@@ -1,6 +1,6 @@
 //! Context module
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -9,12 +9,13 @@ use crate::chat::*;
 use crate::config::Config;
 use crate::constants::*;
 use crate::contact::*;
+use crate::dc_tools::duration_to_str;
 use crate::error::*;
 use crate::events::Event;
 use crate::imap::*;
 use crate::job::*;
 use crate::job_thread::JobThread;
-use crate::key::Key;
+use crate::key::{DcKey, Key, SignedPublicKey};
 use crate::login_param::LoginParam;
 use crate::lot::Lot;
 use crate::message::{self, Message, MessengerMessage, MsgId};
@@ -23,6 +24,7 @@ use crate::smtp::Smtp;
 use crate::sql::Sql;
 use crate::webpush::WebPushConfig;
 use crate::coi::CoiDeltachatMode;
+use std::time::SystemTime;
 
 /// Callback function type for [Context]
 ///
@@ -61,6 +63,7 @@ pub struct Context {
     pub webpush_config: Option<WebPushConfig>,
     pub coi_deltachat_mode: Arc<Mutex<CoiDeltachatMode>>,
     pub translated_stockstrings: RwLock<HashMap<usize, String>>,
+    creation_time: SystemTime,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,8 +78,8 @@ pub struct RunningState {
 /// actual keys and their values which will be present are not
 /// guaranteed.  Calling [Context::get_info] also includes information
 /// about the context on top of the information here.
-pub fn get_info() -> HashMap<&'static str, String> {
-    let mut res = HashMap::new();
+pub fn get_info() -> BTreeMap<&'static str, String> {
+    let mut res = BTreeMap::new();
     res.insert("deltachat_core_version", format!("v{}", &*DC_VERSION_STR));
     res.insert("sqlite_version", rusqlite::version().to_string());
     res.insert("arch", (std::mem::size_of::<usize>() * 8).to_string());
@@ -144,6 +147,7 @@ impl Context {
             webpush_config: None,
             coi_deltachat_mode: Arc::new(Mutex::new(CoiDeltachatMode::Disabled)),
             translated_stockstrings: RwLock::new(HashMap::new()),
+            creation_time: std::time::SystemTime::now(),
         };
 
         ensure!(
@@ -228,7 +232,7 @@ impl Context {
      * UI chat/message related API
      ******************************************************************************/
 
-    pub fn get_info(&self) -> HashMap<&'static str, String> {
+    pub fn get_info(&self) -> BTreeMap<&'static str, String> {
         let unset = "0";
         let l = LoginParam::from_database(self, "");
         let l2 = LoginParam::from_database(self, "configured_");
@@ -257,10 +261,9 @@ impl Context {
             rusqlite::NO_PARAMS,
         );
 
-        let fingerprint_str = if let Some(key) = Key::from_self_public(self, &l2.addr, &self.sql) {
-            key.fingerprint()
-        } else {
-            "<Not yet calculated>".into()
+        let fingerprint_str = match SignedPublicKey::load_self(self) {
+            Ok(key) => Key::from(key).fingerprint(),
+            Err(err) => format!("<key failure: {}>", err),
         };
 
         let inbox_watch = self.get_config_int(Config::InboxWatch);
@@ -317,6 +320,9 @@ impl Context {
             pub_key_cnt.unwrap_or_default().to_string(),
         );
         res.insert("fingerprint", fingerprint_str);
+
+        let elapsed = self.creation_time.elapsed();
+        res.insert("uptime", duration_to_str(elapsed.unwrap_or_default()));
 
         res
     }

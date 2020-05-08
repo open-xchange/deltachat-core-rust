@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::str::FromStr;
 
+use anyhow::{bail, ensure};
 use deltachat::chat::{self, Chat, ChatId, ChatVisibility};
 use deltachat::chatlist::*;
 use deltachat::constants::*;
@@ -92,10 +93,10 @@ fn dc_reset_tables(context: &Context, bits: i32) -> i32 {
     1
 }
 
-fn dc_poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<(), Error> {
+fn dc_poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<(), anyhow::Error> {
     let data = dc_read_file(context, filename)?;
 
-    if let Err(err) = dc_receive_imf(context, &data, "import", 0, false) {
+    if let Err(err) = dc_receive_imf(context, &data, "import", 0, false, "".to_string()) {
         println!("dc_receive_imf errored: {:?}", err);
     }
     Ok(())
@@ -298,7 +299,7 @@ fn chat_prefix(chat: &Chat) -> &'static str {
     chat.typ.into()
 }
 
-pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
+pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), Error> {
     let chat_id = *context.cmdline_sel_chat_id.read().unwrap();
     let mut sel_chat = if !chat_id.is_unset() {
         Chat::load_from_db(context, chat_id).ok()
@@ -403,6 +404,7 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
                  providerinfo <addr>\n\
                  event <event-id to test>\n\
                  fileinfo <file>\n\
+                 estimatedeletion <seconds>\n\
                  emptyserver <flags> (1=MVBOX 2=INBOX)\n\
                  clear -- clear screen\n\
                  exit or quit\n\
@@ -415,7 +417,7 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
                 setup_code,
             ),
             Err(err) => bail!("Failed to generate setup code: {}", err),
-        },
+        }
         "get-setupcodebegin" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let msg_id: MsgId = MsgId::new(arg1.parse()?);
@@ -1059,6 +1061,16 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), failure::Error> {
             let id = 1; // XXX
             context.get_coi_message_filter(id);
             println!("coi-get-message-filter command queued with id: {}", id);
+        }
+        "estimatedeletion" => {
+            ensure!(!arg1.is_empty(), "Argument <seconds> missing");
+            let seconds = arg1.parse()?;
+            let device_cnt = message::estimate_deletion_cnt(context, false, seconds)?;
+            let server_cnt = message::estimate_deletion_cnt(context, true, seconds)?;
+            println!(
+                "estimated count of messages older than {} seconds:\non device: {}\non server: {}",
+                seconds, device_cnt, server_cnt
+            );
         }
         "emptyserver" => {
             ensure!(!arg1.is_empty(), "Argument <flags> missing");

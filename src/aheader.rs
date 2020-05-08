@@ -75,7 +75,7 @@ impl Aheader {
         wanted_from: &str,
         headers: &[mailparse::MailHeader<'_>],
     ) -> Option<Self> {
-        if let Ok(Some(value)) = headers.get_header_value(HeaderDef::Autocrypt) {
+        if let Some(value) = headers.get_header_value(HeaderDef::Autocrypt) {
             match Self::from_str(&value) {
                 Ok(header) => {
                     if addr_cmp(&header.addr, wanted_from) {
@@ -127,14 +127,10 @@ impl str::FromStr for Aheader {
             .split(';')
             .filter_map(|a| {
                 let attribute: Vec<&str> = a.trim().splitn(2, '=').collect();
-                if attribute.len() < 2 {
-                    return None;
+                match &attribute[..] {
+                    [key, value] => Some((key.trim().to_string(), value.trim().to_string())),
+                    _ => None,
                 }
-
-                Some((
-                    attribute[0].trim().to_string(),
-                    attribute[1].trim().to_string(),
-                ))
             })
             .collect();
 

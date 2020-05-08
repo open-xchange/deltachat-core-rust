@@ -8,55 +8,33 @@ use rusqlite::{Connection, OpenFlags, Statement, NO_PARAMS};
 use thread_local_object::ThreadLocal;
 
 use crate::chat::{update_device_icon, update_saved_messages_icon};
-use crate::constants::ShowEmails;
+use crate::constants::{ShowEmails, DC_CHAT_ID_TRASH};
 use crate::context::Context;
 use crate::dc_tools::*;
 use crate::param::*;
 use crate::peerstate::*;
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[fail(display = "Sqlite Error: {:?}", _0)]
-    Sql(#[cause] rusqlite::Error),
-    #[fail(display = "Sqlite Connection Pool Error: {:?}", _0)]
-    ConnectionPool(#[cause] r2d2::Error),
-    #[fail(display = "Sqlite: Connection closed")]
+    #[error("Sqlite Error: {0:?}")]
+    Sql(#[from] rusqlite::Error),
+    #[error("Sqlite Connection Pool Error: {0:?}")]
+    ConnectionPool(#[from] r2d2::Error),
+    #[error("Sqlite: Connection closed")]
     SqlNoConnection,
-    #[fail(display = "Sqlite: Already open")]
+    #[error("Sqlite: Already open")]
     SqlAlreadyOpen,
-    #[fail(display = "Sqlite: Failed to open")]
+    #[error("Sqlite: Failed to open")]
     SqlFailedToOpen,
-    #[fail(display = "{:?}", _0)]
-    Io(#[cause] std::io::Error),
-    #[fail(display = "{:?}", _0)]
-    BlobError(#[cause] crate::blob::BlobError),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0:?}")]
+    BlobError(#[from] crate::blob::BlobError),
+    #[error("{0}")]
+    Other(#[from] crate::error::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl From<rusqlite::Error> for Error {
-    fn from(err: rusqlite::Error) -> Error {
-        Error::Sql(err)
-    }
-}
-
-impl From<r2d2::Error> for Error {
-    fn from(err: r2d2::Error) -> Error {
-        Error::ConnectionPool(err)
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Error {
-        Error::Io(err)
-    }
-}
-
-impl From<crate::blob::BlobError> for Error {
-    fn from(err: crate::blob::BlobError) -> Error {
-        Error::BlobError(err)
-    }
-}
 
 /// A wrapper around the underlying Sqlite3 object.
 #[derive(DebugStub)]
@@ -96,7 +74,7 @@ impl Sql {
     pub fn open(&self, context: &Context, dbfile: &std::path::Path, readonly: bool) -> bool {
         match open(context, self, dbfile, readonly) {
             Ok(_) => true,
-            Err(crate::error::Error::SqlError(Error::SqlAlreadyOpen)) => false,
+            Err(Error::SqlAlreadyOpen) => false,
             Err(_) => {
                 self.close(context);
                 false
@@ -212,6 +190,30 @@ impl Sql {
         self.with_conn(|conn| conn.query_row(sql.as_ref(), params, f).map_err(Into::into))
     }
 
+    /// Execute a query which is expected to return zero or one row.
+    pub fn query_row_optional<T, P, F>(
+        &self,
+        sql: impl AsRef<str>,
+        params: P,
+        f: F,
+    ) -> Result<Option<T>>
+    where
+        P: IntoIterator,
+        P::Item: rusqlite::ToSql,
+        F: FnOnce(&rusqlite::Row) -> rusqlite::Result<T>,
+    {
+        match self.query_row(sql, params, f) {
+            Ok(res) => Ok(Some(res)),
+            Err(Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
+            Err(Error::Sql(rusqlite::Error::InvalidColumnType(
+                _,
+                _,
+                rusqlite::types::Type::Null,
+            ))) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn table_exists(&self, name: impl AsRef<str>) -> bool {
         self.with_conn(|conn| table_exists(conn, name))
             .unwrap_or_default()
@@ -226,16 +228,7 @@ impl Sql {
         P::Item: rusqlite::ToSql,
         T: rusqlite::types::FromSql,
     {
-        match self.query_row(query, params, |row| row.get::<_, T>(0)) {
-            Ok(res) => Ok(Some(res)),
-            Err(Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
-            Err(Error::Sql(rusqlite::Error::InvalidColumnType(
-                _,
-                _,
-                rusqlite::types::Type::Null,
-            ))) => Ok(None),
-            Err(err) => Err(err),
-        }
+        self.query_row_optional(query, params, |row| row.get::<_, T>(0))
     }
 
     /// Not resultified version of `query_get_value_result`. Returns
@@ -388,14 +381,14 @@ fn open(
     sql: &Sql,
     dbfile: impl AsRef<std::path::Path>,
     readonly: bool,
-) -> crate::error::Result<()> {
+) -> Result<()> {
     if sql.is_open() {
         error!(
             context,
             "Cannot open, database \"{:?}\" already opened.",
             dbfile.as_ref(),
         );
-        return Err(Error::SqlAlreadyOpen.into());
+        return Err(Error::SqlAlreadyOpen);
     }
 
     let mut open_flags = OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -545,7 +538,7 @@ fn open(
                     dbfile.as_ref(),
                 );
                 // cannot create the tables - maybe we cannot write?
-                return Err(Error::SqlFailedToOpen.into());
+                return Err(Error::SqlFailedToOpen);
             } else {
                 sql.set_raw_config_int(context, "dbversion", 0)?;
             }
@@ -1053,6 +1046,18 @@ pub fn get_rowid2_with_conn(
     }
 }
 
+/// Removes from the database locally deleted messages that also don't
+/// have a server UID.
+fn prune_tombstones(context: &Context) -> Result<()> {
+    context.sql.execute(
+        "DELETE FROM msgs \
+         WHERE (chat_id = ? OR hidden) \
+         AND server_uid = 0",
+        params![DC_CHAT_ID_TRASH],
+    )?;
+    Ok(())
+}
+
 pub fn housekeeping(context: &Context) {
     let mut files_in_use = HashSet::new();
     let mut unreferenced_count = 0;
@@ -1163,6 +1168,13 @@ pub fn housekeeping(context: &Context) {
                 err
             );
         }
+    }
+
+    if let Err(err) = prune_tombstones(context) {
+        warn!(
+            context,
+            "Housekeeping: Cannot prune message tombstones: {}", err
+        );
     }
 
     info!(context, "Housekeeping done.",);

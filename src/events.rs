@@ -223,10 +223,4 @@ pub enum Event {
     ///     Must not be free()'d or modified and is valid only until the callback returns.
     #[strum(props(id = "2071"))]
     Metadata { foreign_id: u32, json: Option<String> },
-
-    /// This event is sent out to the inviter when a joiner successfully joined a group.
-    /// @param data1 (int) chat_id
-    /// @param data2 (int) contact_id
-    #[strum(props(id = "2062"))]
-    SecurejoinMemberAdded { chat_id: ChatId, contact_id: u32 },
 }

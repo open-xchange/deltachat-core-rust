@@ -43,76 +43,46 @@ use session::Session;
 
 type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[fail(display = "IMAP Connect without configured params")]
+    #[error("IMAP Connect without configured params")]
     ConnectWithoutConfigure,
 
-    #[fail(display = "IMAP Connection Failed params: {}", _0)]
+    #[error("IMAP Connection Failed params: {0}")]
     ConnectionFailed(String),
 
-    #[fail(display = "IMAP No Connection established")]
+    #[error("IMAP No Connection established")]
     NoConnection,
 
-    #[fail(display = "IMAP Could not get OAUTH token")]
+    #[error("IMAP Could not get OAUTH token")]
     OauthError,
 
-    #[fail(display = "IMAP Could not login as {}", _0)]
+    #[error("IMAP Could not login as {0}")]
     LoginFailed(String),
 
-    #[fail(display = "IMAP Could not fetch")]
-    FetchFailed(#[cause] async_imap::error::Error),
+    #[error("IMAP Could not fetch")]
+    FetchFailed(#[from] async_imap::error::Error),
 
-    #[fail(display = "IMAP operation attempted while it is torn down")]
+    #[error("IMAP operation attempted while it is torn down")]
     InTeardown,
 
-    #[fail(display = "IMAP operation attempted while it is torn down")]
-    SqlError(#[cause] crate::sql::Error),
+    #[error("IMAP operation attempted while it is torn down")]
+    SqlError(#[from] crate::sql::Error),
 
-    #[fail(display = "IMAP got error from elsewhere")]
-    WrappedError(#[cause] crate::error::Error),
+    #[error("IMAP got error from elsewhere")]
+    WrappedError(#[from] crate::error::Error),
 
-    #[fail(display = "IMAP select folder error")]
-    SelectFolderError(#[cause] select_folder::Error),
+    #[error("IMAP select folder error")]
+    SelectFolderError(#[from] select_folder::Error),
 
-    #[fail(display = "Mail parse error")]
-    MailParseError(#[cause] mailparse::MailParseError),
+    #[error("Mail parse error")]
+    MailParseError(#[from] mailparse::MailParseError),
 
-    #[fail(display = "No mailbox selected, folder: {:?}", _0)]
+    #[error("No mailbox selected, folder: {0}")]
     NoMailbox(String),
 
-    #[fail(display = "IMAP other error: {:?}", _0)]
+    #[error("IMAP other error: {0}")]
     Other(String),
-}
-
-impl From<crate::sql::Error> for Error {
-    fn from(err: crate::sql::Error) -> Error {
-        Error::SqlError(err)
-    }
-}
-
-impl From<crate::error::Error> for Error {
-    fn from(err: crate::error::Error) -> Error {
-        Error::WrappedError(err)
-    }
-}
-
-impl From<Error> for crate::error::Error {
-    fn from(err: Error) -> crate::error::Error {
-        crate::error::Error::Message(err.to_string())
-    }
-}
-
-impl From<select_folder::Error> for Error {
-    fn from(err: select_folder::Error) -> Error {
-        Error::SelectFolderError(err)
-    }
-}
-
-impl From<mailparse::MailParseError> for Error {
-    fn from(err: mailparse::MailParseError) -> Error {
-        Error::MailParseError(err)
-    }
 }
 
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq)]
@@ -524,7 +494,7 @@ impl Imap {
         folder: &str,
     ) -> Result<(u32, u32)> {
         task::block_on(async move {
-            self.select_folder(context, Some(folder)).await?;
+            self.select_folder(context, folder).await?;
 
             // compare last seen UIDVALIDITY against the current one
             let (uid_validity, last_seen_uid) = self.get_config_last_seen_uid(context, &folder);
@@ -610,7 +580,7 @@ impl Imap {
         let (uid_validity, last_seen_uid) =
             self.select_with_uidvalidity(context, folder.as_ref())?;
 
-        let mut read_cnt = 0;
+        let mut read_cnt: u32 = 0;
 
         let mut list = if let Some(ref mut session) = &mut *self.session.lock().await {
             // fetch messages with larger UID than the last one seen
@@ -628,7 +598,7 @@ impl Imap {
 
         // prefetch info from all unfetched mails
         let mut new_last_seen_uid = last_seen_uid;
-        let mut read_errors = 0;
+        let mut read_errors: u32 = 0;
 
         list.sort_unstable_by_key(|msg| msg.uid.unwrap_or_default());
 
@@ -652,7 +622,7 @@ impl Imap {
 
             let headers = get_fetch_headers(fetch)?;
             let message_id = prefetch_get_message_id(&headers).unwrap_or_default();
-            if precheck_imf(context, &message_id, folder.as_ref(), cur_uid) {
+            if precheck_imf(context, &message_id, folder.as_ref(), cur_uid)? {
                 // we know the message-id already or don't want the message otherwise.
                 info!(
                     context,
@@ -683,7 +653,7 @@ impl Imap {
                             &folder,
                             cur_uid,
                             headers
-                                .get_header_value(HeaderDef::From_)?
+                                .get_header_value(HeaderDef::From_)
                                 .unwrap_or(String::from("")),
                         )
                         .await
@@ -790,22 +760,9 @@ impl Imap {
             if !is_deleted && msg.body().is_some() {
                 let body = msg.body().unwrap_or_default();
                 if let Err(err) =
-                    dc_receive_imf(context, &body, folder.as_ref(), server_uid, is_seen)
+                    dc_receive_imf(context, &body, folder.as_ref(), server_uid, is_seen, from)
                 {
-                    match err {
-                        crate::error::Error::Pgp(pgp::errors::Error::MissingKey) => {
-                            context.call_cb(Event::MissingKey(from));
-                        }
-                        _ => {
-                            warn!(
-                                context,
-                                "dc_receive_imf failed for imap-message {}/{}: {:?}",
-                                folder.as_ref(),
-                                server_uid,
-                                err
-                            );
-                        }
-                    }
+                    return Err(Error::Other(format!("dc_receive_imf error: {}", err)));
                 }
             }
         } else {
@@ -830,7 +787,6 @@ impl Imap {
         folder: &str,
         uid: u32,
         dest_folder: &str,
-        dest_uid: &mut u32,
     ) -> ImapActionResult {
         task::block_on(async move {
             if folder == dest_folder {
@@ -847,10 +803,6 @@ impl Imap {
                 return imapresult;
             }
             // we are connected, and the folder is selected
-
-            // XXX Rust-Imap provides no target uid on mv, so just set it to 0
-            *dest_uid = 0;
-
             let set = format!("{}", uid);
             let display_folder_id = format!("{}/{}", folder, uid);
 
@@ -983,7 +935,7 @@ impl Imap {
                     return Some(ImapActionResult::RetryLater);
                 }
             }
-            match self.select_folder(context, Some(&folder)).await {
+            match self.select_folder(context, &folder).await {
                 Ok(()) => None,
                 Err(select_folder::Error::ConnectionLost) => {
                     warn!(context, "Lost imap connection");
@@ -1030,10 +982,10 @@ impl Imap {
         context: &Context,
         message_id: &str,
         folder: &str,
-        uid: &mut u32,
+        uid: u32,
     ) -> ImapActionResult {
         task::block_on(async move {
-            if let Some(imapresult) = self.prepare_imap_operation_on_msg(context, folder, *uid) {
+            if let Some(imapresult) = self.prepare_imap_operation_on_msg(context, folder, uid) {
                 return imapresult;
             }
             // we are connected, and the folder is selected
@@ -1055,7 +1007,7 @@ impl Imap {
                                 display_imap_id,
                                 message_id,
                             );
-                            return ImapActionResult::Failed;
+                            return ImapActionResult::AlreadyDone;
                         };
 
                         let remote_message_id = get_fetch_headers(fetch)
@@ -1070,7 +1022,7 @@ impl Imap {
                                 remote_message_id,
                                 message_id,
                             );
-                            *uid = 0;
+                            return ImapActionResult::Failed;
                         }
                     }
                     Err(err) => {
@@ -1078,18 +1030,18 @@ impl Imap {
                             context,
                             "Cannot delete {} on IMAP: {}", display_imap_id, err
                         );
-                        *uid = 0;
+                        return ImapActionResult::RetryLater;
                     }
                 }
             }
 
             // mark the message for deletion
-            if !self.add_flag_finalized(context, *uid, "\\Deleted").await {
+            if !self.add_flag_finalized(context, uid, "\\Deleted").await {
                 warn!(
                     context,
                     "Cannot mark message {} as \"Deleted\".", display_imap_id
                 );
-                ImapActionResult::Failed
+                ImapActionResult::RetryLater
             } else {
                 emit_event!(
                     context,
@@ -1251,13 +1203,13 @@ impl Imap {
                 return;
             }
             if let Err(err) = self.setup_handle_if_needed(context).await {
-                error!(context, "could not setup imap connection: {:?}", err);
+                error!(context, "could not setup imap connection: {}", err);
                 return;
             }
-            if let Err(err) = self.select_folder(context, Some(&folder)).await {
+            if let Err(err) = self.select_folder(context, &folder).await {
                 error!(
                     context,
-                    "Could not select {} for expunging: {:?}", folder, err
+                    "Could not select {} for expunging: {}", folder, err
                 );
                 return;
             }
@@ -1272,12 +1224,12 @@ impl Imap {
 
             // we now trigger expunge to actually delete messages
             self.config.write().await.selected_folder_needs_expunge = true;
-            match self.select_folder::<String>(context, None).await {
+            match self.select_folder(context, &folder).await {
                 Ok(()) => {
                     emit_event!(context, Event::ImapFolderEmptied(folder.to_string()));
                 }
                 Err(err) => {
-                    error!(context, "expunge failed {}: {:?}", folder, err);
+                    error!(context, "expunge failed {}: {}", folder, err);
                 }
             }
 
@@ -1352,30 +1304,70 @@ fn get_folder_meaning(folder_name: &Name) -> FolderMeaning {
     }
 }
 
-fn precheck_imf(context: &Context, rfc724_mid: &str, server_folder: &str, server_uid: u32) -> bool {
-    if let Ok((old_server_folder, old_server_uid, msg_id)) =
-        message::rfc724_mid_exists(context, &rfc724_mid)
+fn precheck_imf(
+    context: &Context,
+    rfc724_mid: &str,
+    server_folder: &str,
+    server_uid: u32,
+) -> Result<bool> {
+    if let Some((old_server_folder, old_server_uid, msg_id)) =
+        message::rfc724_mid_exists(context, &rfc724_mid)?
     {
         if old_server_folder.is_empty() && old_server_uid == 0 {
-            info!(context, "[move] detected bcc-self {}", rfc724_mid,);
-            context.do_heuristics_moves(server_folder.as_ref(), msg_id);
-            job_add(
+            info!(
                 context,
-                Action::MarkseenMsgOnImap,
-                msg_id.to_u32() as i32,
-                Params::new(),
-                0,
+                "[move] detected bcc-self {} as {}/{}", rfc724_mid, server_folder, server_uid
             );
+
+            let delete_server_after = context.get_config_delete_server_after();
+
+            if delete_server_after != Some(0) {
+                context.do_heuristics_moves(server_folder.as_ref(), msg_id);
+                job_add(
+                    context,
+                    Action::MarkseenMsgOnImap,
+                    msg_id.to_u32() as i32,
+                    Params::new(),
+                    0,
+                );
+            }
         } else if old_server_folder != server_folder {
-            info!(context, "[move] detected moved message {}", rfc724_mid,);
+            info!(
+                context,
+                "[move] detected message {} moved by other device from {}/{} to {}/{}",
+                rfc724_mid,
+                old_server_folder,
+                old_server_uid,
+                server_folder,
+                server_uid
+            );
+        } else if old_server_uid == 0 {
+            info!(
+                context,
+                "[move] detected message {} moved by us from {}/{} to {}/{}",
+                rfc724_mid,
+                old_server_folder,
+                old_server_uid,
+                server_folder,
+                server_uid
+            );
+        } else if old_server_uid != server_uid {
+            warn!(
+                context,
+                "UID for message {} in folder {} changed from {} to {}",
+                rfc724_mid,
+                server_folder,
+                old_server_uid,
+                server_uid
+            );
         }
 
         if old_server_folder != server_folder || old_server_uid != server_uid {
             update_server_uid(context, &rfc724_mid, server_folder, server_uid);
         }
-        true
+        Ok(true)
     } else {
-        false
+        Ok(false)
     }
 }
 
@@ -1389,30 +1381,27 @@ fn get_fetch_headers(prefetch_msg: &Fetch) -> Result<Vec<mailparse::MailHeader>>
 }
 
 fn prefetch_get_message_id(headers: &[mailparse::MailHeader]) -> Result<String> {
-    if let Some(message_id) = headers.get_header_value(HeaderDef::MessageId)? {
+    if let Some(message_id) = headers.get_header_value(HeaderDef::MessageId) {
         Ok(crate::mimeparser::parse_message_id(&message_id)?)
     } else {
         Err(Error::Other("prefetch: No message ID found".to_string()))
     }
 }
 
-fn prefetch_is_reply_to_chat_message(
-    context: &Context,
-    headers: &[mailparse::MailHeader],
-) -> Result<bool> {
-    if let Some(value) = headers.get_header_value(HeaderDef::InReplyTo)? {
+fn prefetch_is_reply_to_chat_message(context: &Context, headers: &[mailparse::MailHeader]) -> bool {
+    if let Some(value) = headers.get_header_value(HeaderDef::InReplyTo) {
         if is_msgrmsg_rfc724_mid_in_list(context, &value) {
-            return Ok(true);
+            return true;
         }
     }
 
-    if let Some(value) = headers.get_header_value(HeaderDef::References)? {
+    if let Some(value) = headers.get_header_value(HeaderDef::References) {
         if is_msgrmsg_rfc724_mid_in_list(context, &value) {
-            return Ok(true);
+            return true;
         }
     }
 
-    Ok(false)
+    false
 }
 
 fn prefetch_should_download(
@@ -1420,16 +1409,16 @@ fn prefetch_should_download(
     headers: &[mailparse::MailHeader],
     show_emails: ShowEmails,
 ) -> Result<bool> {
-    let is_chat_message = headers.get_header_value(HeaderDef::ChatVersion)?.is_some();
-    let is_reply_to_chat_message = prefetch_is_reply_to_chat_message(context, &headers)?;
+    let is_chat_message = headers.get_header_value(HeaderDef::ChatVersion).is_some();
+    let is_reply_to_chat_message = prefetch_is_reply_to_chat_message(context, &headers);
 
     // Autocrypt Setup Message should be shown even if it is from non-chat client.
     let is_autocrypt_setup_message = headers
-        .get_header_value(HeaderDef::AutocryptSetupMessage)?
+        .get_header_value(HeaderDef::AutocryptSetupMessage)
         .is_some();
 
     let from_field = headers
-        .get_header_value(HeaderDef::From_)?
+        .get_header_value(HeaderDef::From_)
         .unwrap_or_default();
 
     let (_contact_id, blocked_contact, origin) = from_field_to_contact_id(context, &from_field)?;
