@@ -14,7 +14,7 @@ use crate::login_param::{dc_build_tls, AuthScheme, LoginParam, ServerSecurity, S
 use crate::oauth2::*;
 
 /// SMTP write and read timeout in seconds.
-const SMTP_TIMEOUT: u64 = 30;
+const SMTP_TIMEOUT: u64 = 120;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
