@@ -819,6 +819,56 @@ impl MimeMessage {
             }
         }
     }
+
+    pub fn get_to_ids(
+        &self,
+        context: &Context,
+        origin: Origin,
+        allow_side_effects: bool,
+    ) -> Result<ContactIds> {
+        let mut to_ids = ContactIds::new();
+        for header_def in &[HeaderDef::To, HeaderDef::Cc] {
+            if let Some(field) = self.get(header_def.clone()) {
+                to_ids.extend(&Contact::add_or_lookup_contacts_by_address_list(
+                    context,
+                    &field,
+                    origin,
+                    allow_side_effects,
+                )?);
+            }
+        }
+        Ok(to_ids)
+    }
+
+    /// try extract a grpid from a message-id list header value
+    pub fn extract_grpid(&self, headerdef: HeaderDef) -> Option<&str> {
+        if let Some(header) = self.get(headerdef) {
+            let parts = header
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty());
+            parts.filter_map(dc_extract_grpid_from_rfc724_mid).next()
+        } else {
+            return None;
+        }
+    }
+
+    pub fn get_group_id_from_headers(&self) -> String {
+        if let Some(opt_field) = self.get(HeaderDef::ChatGroupId) {
+            return opt_field.clone();
+        }
+        if let Some(extracted_group_id) =
+            dc_extract_grpid_from_rfc724_mid(self.get_rfc724_mid().unwrap_or_default().as_str()) {
+                return extracted_group_id.to_string();
+            }
+        if let Some(extracted_group_id) = self.extract_grpid(HeaderDef::InReplyTo) {
+            return extracted_group_id.to_string();
+        }
+        if let Some(extracted_group_id) = self.extract_grpid(HeaderDef::References) {
+            return extracted_group_id.to_string();
+        }
+        return "".to_string();
+    }
 }
 
 fn update_gossip_peerstates(
@@ -1698,4 +1748,35 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
         assert_eq!(message.parts[0].typ, Viewtype::Image);
         assert_eq!(message.parts[0].msg, "Test");
     }
+
+    #[test]
+    fn test_grpid_simple() {
+        let context = dummy_context();
+        let raw = b"From: hello\n\
+                    Subject: outer-subject\n\
+                    In-Reply-To: <lqkjwelq123@123123>\n\
+                    References: <Gr.HcxyMARjyJy.9-uvzWPTLtV@nauta.cu>\n\
+                    \n\
+                    hello\x00";
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
+        assert_eq!(mimeparser.extract_grpid(HeaderDef::InReplyTo), None);
+        let grpid = Some("HcxyMARjyJy");
+        assert_eq!(mimeparser.extract_grpid(HeaderDef::References), grpid);
+    }
+
+    #[test]
+    fn test_grpid_from_multiple() {
+        let context = dummy_context();
+        let raw = b"From: hello\n\
+                    Subject: outer-subject\n\
+                    In-Reply-To: <Gr.HcxyMARjyJy.9-qweqwe@asd.net>\n\
+                    References: <qweqweqwe>, <Gr.HcxyMARjyJy.9-uvzWPTLtV@nau.ca>\n\
+                    \n\
+                    hello\x00";
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
+        let grpid = Some("HcxyMARjyJy");
+        assert_eq!(mimeparser.extract_grpid(HeaderDef::InReplyTo), grpid);
+        assert_eq!(mimeparser.extract_grpid(HeaderDef::References), grpid);
+    }
 }
+

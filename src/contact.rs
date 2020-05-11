@@ -68,6 +68,9 @@ pub struct Contact {
     pub param: Params,
 }
 
+// IndexSet is like HashSet but maintains order of insertion
+pub type ContactIds = indexmap::IndexSet<u32>;
+
 /// Possible origins of a contact.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromPrimitive, ToPrimitive, FromSql, ToSql,
@@ -333,6 +336,7 @@ impl Contact {
         );
         ensure!(origin != Origin::Unknown, "Missing valid origin");
 
+        let name = normalize_name(name.as_ref());
         let addr = addr_normalize(addr.as_ref());
         let addr_self = context
             .get_config(Config::ConfiguredAddr)
@@ -347,10 +351,10 @@ impl Contact {
                 context,
                 "Bad address \"{}\" for contact \"{}\".",
                 addr,
-                if !name.as_ref().is_empty() {
-                    name.as_ref()
+                if !name.is_empty() {
+                    name
                 } else {
-                    "<unset>"
+                    "<unset>".to_string()
                 },
             );
             bail!("Bad address supplied: {:?}", addr);
@@ -371,10 +375,10 @@ impl Contact {
                 let row_origin: Origin = row.get(3)?;
                 let row_authname: String = row.get(4)?;
 
-                if !name.as_ref().is_empty() {
+                if !name.is_empty() {
                     if !row_name.is_empty() {
                         if (origin >= row_origin || row_name == row_authname)
-                            && name.as_ref() != row_name
+                            && name != row_name
                         {
                             update_name = true;
                         }
@@ -398,8 +402,8 @@ impl Contact {
             }
             if update_name || update_authname || update_addr || origin > row_origin {
                 let new_name = if update_name {
-                    if !name.as_ref().is_empty() {
-                        name.as_ref()
+                    if !name.is_empty() {
+                        name.as_str()
                     } else {
                         &row_authname
                     }
@@ -420,7 +424,7 @@ impl Contact {
                             row_origin
                         },
                         if update_authname {
-                            name.as_ref()
+                            name.as_str()
                         } else {
                             &row_authname
                         },
@@ -451,10 +455,10 @@ impl Contact {
                 &context.sql,
                 "INSERT INTO contacts (name, addr, origin, authname) VALUES(?, ?, ?, ?);",
                 params![
-                    name.as_ref(),
+                    name.as_str(),
                     addr,
                     origin,
-                    if update_authname { name.as_ref() } else { "" }
+                    if update_authname { name.as_str() } else { "" }
                 ],
             )
             .is_ok()
@@ -468,6 +472,72 @@ impl Contact {
         }
 
         Ok((row_id, sth_modified))
+    }
+
+    /// Add contacts to database on receiving messages.
+    fn add_or_lookup_contact_by_addr(
+        context: &Context,
+        display_name: &Option<String>,
+        addr: &str,
+        origin: Origin,
+        allow_side_effects: bool,
+    ) -> Result<u32> {
+        let contact_id = if allow_side_effects {
+            let name = match display_name {
+                Some(name) => name.clone(),
+                None => "".to_string(),
+            };
+            let (row_id, _modified) =
+                Contact::add_or_lookup(context, name, addr, origin)?;
+            ensure!(row_id > 0, "could not add contact: {:?}", addr);
+            row_id
+        } else {
+            Contact::lookup_id_by_addr(context, addr, origin)
+        };
+
+        Ok(contact_id)
+    }
+
+    pub fn add_or_lookup_contacts_by_address_list(
+        context: &Context,
+        addr_list_raw: &str,
+        origin: Origin,
+        allow_side_effects: bool,
+    ) -> Result<ContactIds> {
+        let addrs = match mailparse::addrparse(addr_list_raw) {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                bail!("could not parse {:?}: {:?}", addr_list_raw, err);
+            }
+        };
+
+        let mut contact_ids = ContactIds::new();
+        for addr in addrs.iter() {
+            match addr {
+                mailparse::MailAddr::Single(info) => {
+                    contact_ids.insert(Self::add_or_lookup_contact_by_addr(
+                        context,
+                        &info.display_name,
+                        &info.addr,
+                        origin,
+                        allow_side_effects,
+                    )?);
+                }
+                mailparse::MailAddr::Group(infos) => {
+                    for info in &infos.addrs {
+                        contact_ids.insert(Self::add_or_lookup_contact_by_addr(
+                            context,
+                            &info.display_name,
+                            &info.addr,
+                            origin,
+                            allow_side_effects,
+                        )?);
+                    }
+                }
+            }
+        }
+
+        Ok(contact_ids)
     }
 
     /// Add a number of contacts.
@@ -1050,7 +1120,7 @@ pub(crate) fn set_profile_image(
 /// - Trims the resulting string
 ///
 /// Typically, this function is not needed as it is called implicitly by `Contact::add_address_book`.
-pub fn normalize_name(full_name: impl AsRef<str>) -> String {
+fn normalize_name(full_name: impl AsRef<str>) -> String {
     let mut full_name = full_name.as_ref().trim();
     if full_name.is_empty() {
         return full_name.into();

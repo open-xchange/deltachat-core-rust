@@ -3968,6 +3968,7 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
  * @param sender_addr The sender address of the message.
  * @param extract_part The part to extract. Counting starts with 0.
  * @param out_total_number_of_parts Returns the total number of parts of this message.
+ * @param out_chat_id Returns id of the chat, decrypted message belongs to or 0 if chat was not identified.
  * @return The decrypted message or NULL in case of error.
  */
 char*           dc_decrypt_message_in_memory(
@@ -3976,7 +3977,8 @@ char*           dc_decrypt_message_in_memory(
     const char *content,
     const char *sender_addr,
     int extract_part,
-    int *out_total_number_of_parts);
+    int *out_total_number_of_parts,
+    int *out_chat_id);
 
 
 /**

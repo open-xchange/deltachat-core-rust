@@ -6,12 +6,16 @@ use mailparse::ParsedMail;
 use num_traits::FromPrimitive;
 
 use crate::aheader::*;
+use crate::chat::ChatId;
 use crate::config::Config;
+use crate::constants::Blocked;
+use crate::contact::Origin;
 use crate::context::Context;
 use crate::error::*;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{DcKey, Key, SignedPublicKey, SignedSecretKey};
 use crate::keyring::*;
+use crate::mimeparser::MimeMessage;
 use crate::peerstate::*;
 use crate::pgp;
 use crate::securejoin::handle_degrade_event;
@@ -319,13 +323,50 @@ pub fn ensure_secret_key_exists(context: &Context) -> Result<String> {
     Ok(self_addr)
 }
 
+fn get_chat_id(context: &Context, msg: &MimeMessage, addr: &str) -> ChatId {
+    let group_id = msg.get_group_id_from_headers();
+    if !group_id.is_empty() {
+        if let Ok((chat_id, _, _)) = crate::chat::get_chat_id_by_grpid(context, group_id) {
+            if !chat_id.is_unset() {
+                return chat_id;
+            }
+        }
+    }
+
+    let from_id =
+        crate::contact::Contact::lookup_id_by_addr(context, addr.to_string(), Origin::Unknown);
+    if from_id == 0 {
+        return ChatId::new(0);
+    }
+
+    // Origin parameter has no effect when allow_side_effects parameter is false
+    if let Ok(to_ids) = msg.get_to_ids(context, Origin::Unknown, false) {
+        if let Ok((chat_id, _)) = crate::dc_receive_imf::create_or_lookup_adhoc_group(
+            context,
+            msg,
+            false,
+            Blocked::Not,
+            from_id,
+            &to_ids,
+        ) {
+            if !chat_id.is_unset() {
+                return chat_id;
+            }
+        }
+    }
+
+    if let Ok((chat_id, _)) = crate::chat::lookup_by_contact_id(context, from_id) {
+        return chat_id;
+    }
+    return ChatId::new(0);
+}
+
 pub fn decrypt_message_in_memory(
     context: &Context,
     content_type: &str,
     content: &str,
     sender_addr: &str,
-) -> Result<Vec<Option<String>>> {
-    use crate::mimeparser::MimeMessage;
+) -> Result<(Vec<Option<String>>, ChatId)> {
     use crate::constants::Viewtype;
 
     let self_addr = context
@@ -337,23 +378,27 @@ pub fn decrypt_message_in_memory(
         self_addr, sender_addr, content_type, content
     );
 
-   let mime_parser = MimeMessage::from_bytes(context, full_mime_msg.as_bytes(), false)?;
+    let mime_parser = MimeMessage::from_bytes(context, full_mime_msg.as_bytes(), false)?;
+
+    let chat_id = get_chat_id(context, &mime_parser, sender_addr);
 
     ensure!(mime_parser.has_headers(), "No Headers Found");
 
-    Ok(mime_parser
-        .parts
-        .iter()
-        .map(|part| {
-            if part.typ == Viewtype::Text {
-                part.msg_raw.clone()
-            } else {
-                None
-            }
-        })
-        .collect())
+    Ok((
+        mime_parser
+            .parts
+            .iter()
+            .map(|part| {
+                if part.typ == Viewtype::Text {
+                    part.msg_raw.clone()
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        chat_id,
+    ))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -365,7 +410,7 @@ mod tests {
         use super::*;
 
         #[test]
-        #[ignore = "see line 591 starting with XXX: in fn decrypt_part()"] 
+        #[ignore = "see line 591 starting with XXX: in fn decrypt_part()"]
         fn test_decrypt_message_in_memory() {
             let content_type = r###"multipart/encrypted; boundary="5d8b0f2e_f8f75182_bb0c"; protocol="application/pgp-encrypted"###;
             let content = r###"--5d8b0f2e_f8f75182_bb0c
@@ -401,11 +446,12 @@ QgoI
 
             assert_eq!(
                 vec![Some(String::from("This is a message"))],
-                decrypt_message_in_memory(&t.ctx, content_type, content, sender_addr).unwrap()
+                decrypt_message_in_memory(&t.ctx, content_type, content, sender_addr)
+                    .unwrap()
+                    .0
             );
         }
     }
-
 
     mod ensure_secret_key_exists {
         use super::*;

@@ -23,9 +23,6 @@ use crate::stock::StockMessage;
 // use crate::error::Error;
 use crate::{contact, location};
 
-// IndexSet is like HashSet but maintains order of insertion
-type ContactIds = indexmap::IndexSet<u32>;
-
 #[derive(Debug, PartialEq, Eq)]
 enum CreateEvent {
     MsgsChanged,
@@ -125,22 +122,17 @@ pub fn dc_receive_imf(
         };
     let incoming = from_id != DC_CONTACT_ID_SELF;
 
-    let mut to_ids = ContactIds::new();
-    for header_def in &[HeaderDef::To, HeaderDef::Cc] {
-        if let Some(field) = mime_parser.get(header_def.clone()) {
-            to_ids.extend(&dc_add_or_lookup_contacts_by_address_list(
-                context,
-                &field,
-                if !incoming {
-                    Origin::OutgoingTo
-                } else if incoming_origin.is_known() {
-                    Origin::IncomingTo
-                } else {
-                    Origin::IncomingUnknownTo
-                },
-            )?);
-        }
-    }
+    let to_ids = mime_parser.get_to_ids(
+        context,
+        if !incoming {
+            Origin::OutgoingTo
+        } else if incoming_origin.is_known() {
+            Origin::IncomingTo
+        } else {
+            Origin::IncomingUnknownTo
+        },
+        true,
+    )?;
 
     // Add parts
 
@@ -252,10 +244,11 @@ pub fn from_field_to_contact_id(
     context: &Context,
     field_from: &str,
 ) -> Result<(u32, bool, Origin)> {
-    let from_ids = dc_add_or_lookup_contacts_by_address_list(
+    let from_ids = Contact::add_or_lookup_contacts_by_address_list(
         context,
         &field_from,
         Origin::IncomingUnknownFrom,
+        true,
     )?;
 
     if from_ids.contains(&DC_CONTACT_ID_SELF) {
@@ -834,38 +827,21 @@ fn create_or_lookup_group(
         set_better_msg(mime_parser, &better_msg);
     }
 
-    let mut grpid = "".to_string();
-    if let Some(optional_field) = mime_parser.get(HeaderDef::ChatGroupId) {
-        grpid = optional_field.clone();
-    }
+    let grpid = mime_parser.get_group_id_from_headers();
 
     if grpid.is_empty() {
-        if let Some(value) = mime_parser.get(HeaderDef::MessageId) {
-            if let Some(extracted_grpid) = dc_extract_grpid_from_rfc724_mid(&value) {
-                grpid = extracted_grpid.to_string();
-            }
-        }
-        if grpid.is_empty() {
-            if let Some(extracted_grpid) = extract_grpid(mime_parser, HeaderDef::InReplyTo) {
-                grpid = extracted_grpid.to_string();
-            } else if let Some(extracted_grpid) = extract_grpid(mime_parser, HeaderDef::References)
-            {
-                grpid = extracted_grpid.to_string();
-            } else {
-                return create_or_lookup_adhoc_group(
-                    context,
-                    mime_parser,
-                    allow_creation,
-                    create_blocked,
-                    from_id,
-                    to_ids,
-                )
-                .map_err(|err| {
-                    info!(context, "could not create adhoc-group: {:?}", err);
-                    err
-                });
-            }
-        }
+        return create_or_lookup_adhoc_group(
+            context,
+            mime_parser,
+            allow_creation,
+            create_blocked,
+            from_id,
+            to_ids,
+        )
+            .map_err(|err| {
+                info!(context, "could not create adhoc-group: {:?}", err);
+                err
+            });
     }
     // now we have a grpid that is non-empty
     // but we might not know about this group
@@ -1120,18 +1096,8 @@ fn create_or_lookup_group(
     Ok((chat_id, chat_id_blocked))
 }
 
-/// try extract a grpid from a message-id list header value
-fn extract_grpid(mime_parser: &MimeMessage, headerdef: HeaderDef) -> Option<&str> {
-    let header = mime_parser.get(headerdef)?;
-    let parts = header
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    parts.filter_map(dc_extract_grpid_from_rfc724_mid).next()
-}
-
 /// Handle groups for received messages, return chat_id/Blocked status on success
-fn create_or_lookup_adhoc_group(
+pub(crate) fn create_or_lookup_adhoc_group(
     context: &Context,
     mime_parser: &MimeMessage,
     allow_creation: bool,
@@ -1599,67 +1565,6 @@ fn is_msgrmsg_rfc724_mid(context: &Context, rfc724_mid: &str) -> bool {
         .unwrap_or_default()
 }
 
-fn dc_add_or_lookup_contacts_by_address_list(
-    context: &Context,
-    addr_list_raw: &str,
-    origin: Origin,
-) -> Result<ContactIds> {
-    let addrs = match mailparse::addrparse(addr_list_raw) {
-        Ok(addrs) => addrs,
-        Err(err) => {
-            bail!("could not parse {:?}: {:?}", addr_list_raw, err);
-        }
-    };
-
-    let mut contact_ids = ContactIds::new();
-    for addr in addrs.iter() {
-        match addr {
-            mailparse::MailAddr::Single(info) => {
-                contact_ids.insert(add_or_lookup_contact_by_addr(
-                    context,
-                    &info.display_name,
-                    &info.addr,
-                    origin,
-                )?);
-            }
-            mailparse::MailAddr::Group(infos) => {
-                for info in &infos.addrs {
-                    contact_ids.insert(add_or_lookup_contact_by_addr(
-                        context,
-                        &info.display_name,
-                        &info.addr,
-                        origin,
-                    )?);
-                }
-            }
-        }
-    }
-
-    Ok(contact_ids)
-}
-
-/// Add contacts to database on receiving messages.
-fn add_or_lookup_contact_by_addr(
-    context: &Context,
-    display_name: &Option<String>,
-    addr: &str,
-    origin: Origin,
-) -> Result<u32> {
-    if context.is_self_addr(addr)? {
-        return Ok(DC_CONTACT_ID_SELF);
-    }
-    let display_name_normalized = display_name
-        .as_ref()
-        .map(normalize_name)
-        .unwrap_or_default();
-
-    let (row_id, _modified) =
-        Contact::add_or_lookup(context, display_name_normalized, addr, origin)?;
-    ensure!(row_id > 0, "could not add contact: {:?}", addr);
-
-    Ok(row_id)
-}
-
 fn dc_create_incoming_rfc724_mid(
     message_timestamp: i64,
     contact_id_from: u32,
@@ -1690,36 +1595,6 @@ mod tests {
 
         let res = hex_hash(data);
         assert_eq!(res, "b94d27b9934d3e08");
-    }
-
-    #[test]
-    fn test_grpid_simple() {
-        let context = dummy_context();
-        let raw = b"From: hello\n\
-                    Subject: outer-subject\n\
-                    In-Reply-To: <lqkjwelq123@123123>\n\
-                    References: <Gr.HcxyMARjyJy.9-uvzWPTLtV@nauta.cu>\n\
-                    \n\
-                    hello\x00";
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
-        assert_eq!(extract_grpid(&mimeparser, HeaderDef::InReplyTo), None);
-        let grpid = Some("HcxyMARjyJy");
-        assert_eq!(extract_grpid(&mimeparser, HeaderDef::References), grpid);
-    }
-
-    #[test]
-    fn test_grpid_from_multiple() {
-        let context = dummy_context();
-        let raw = b"From: hello\n\
-                    Subject: outer-subject\n\
-                    In-Reply-To: <Gr.HcxyMARjyJy.9-qweqwe@asd.net>\n\
-                    References: <qweqweqwe>, <Gr.HcxyMARjyJy.9-uvzWPTLtV@nau.ca>\n\
-                    \n\
-                    hello\x00";
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], true).unwrap();
-        let grpid = Some("HcxyMARjyJy");
-        assert_eq!(extract_grpid(&mimeparser, HeaderDef::InReplyTo), grpid);
-        assert_eq!(extract_grpid(&mimeparser, HeaderDef::References), grpid);
     }
 
     #[test]
