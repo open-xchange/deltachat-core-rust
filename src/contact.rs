@@ -375,16 +375,12 @@ impl Contact {
                 let row_origin: Origin = row.get(3)?;
                 let row_authname: String = row.get(4)?;
 
+                if (origin >= row_origin || row_name == row_authname)
+                    && name != row_name
+                {
+                    update_name = true;
+                }
                 if !name.is_empty() {
-                    if !row_name.is_empty() {
-                        if (origin >= row_origin || row_name == row_authname)
-                            && name != row_name
-                        {
-                            update_name = true;
-                        }
-                    } else {
-                        update_name = true;
-                    }
                     if origin == Origin::IncomingUnknownFrom && name.as_ref() != row_authname {
                         update_authname = true;
                     }
