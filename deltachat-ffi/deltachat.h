@@ -4413,6 +4413,13 @@ char*           dc_decrypt_message_in_memory(
 
 
 /**
+ * A message encrypted with another key received.
+ * @param data1 (const char*) sender address
+ */
+#define DC_EVENT_MISSING_KEY              2016
+
+
+/**
  * Chat changed.  The name or the image of a chat group was changed or members were added or removed.
  * Or the verify state of a chat has changed.
  * See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
