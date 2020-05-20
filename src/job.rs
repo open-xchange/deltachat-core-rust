@@ -7,7 +7,6 @@ use std::{fmt, time};
 
 use deltachat_derive::{FromSql, ToSql};
 use itertools::Itertools;
-use rand::{thread_rng, Rng};
 use imap_proto::Metadata;
 
 use async_smtp::smtp::response::Category;
@@ -37,7 +36,7 @@ use crate::param::*;
 use crate::sql;
 
 // results in ~3 weeks for the last backoff timespan
-const JOB_RETRIES: u32 = 17;
+const JOB_RETRIES: u32 = 4;
 
 /// Thread IDs
 #[derive(Debug, Display, Copy, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
@@ -1283,14 +1282,7 @@ fn perform_job_action(context: &Context, mut job: &mut Job, thread: Thread, trie
 }
 
 fn get_backoff_time_offset(tries: u32) -> i64 {
-    let n = 2_i32.pow(tries - 1) * 60;
-    let mut rng = thread_rng();
-    let r: i32 = rng.gen();
-    let mut seconds = r % (n + 1);
-    if seconds < 1 {
-        seconds = 1;
-    }
-    seconds as i64
+    2_i64.pow(tries - 1) * 5
 }
 
 fn suspend_smtp_thread(context: &Context, suspend: bool) {
