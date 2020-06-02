@@ -661,7 +661,6 @@ fn get_offline_autoconfig(context: &Context, param: &LoginParam) -> Option<Login
 }
 
 async fn try_connect(context: &Context, lp: LoginParam, service: Service) -> TryResult {
-    // let try_s = lp.srv_params[service as usize];
     let inf = format!(
         "{}: {}@{}:{} security={:?} certificate_checks={}",
         service.as_ref(),
