@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use async_smtp::smtp::client::net::*;
 use async_smtp::*;
-// use async_trait::async_trait;
 
 use crate::context::Context;
 use crate::events::Event;
@@ -186,8 +185,6 @@ impl Smtp {
     }
 
     pub(crate) async fn try_connect(&mut self, context: &Context, lp: &LoginParam) -> bool {
-        // let mut smtp_clone = self.clone();
-        println!("Try CONNECT!");
         match self.inner_connect(context, lp).await {
             Ok(()) => true,
             Err(err) => {
@@ -197,7 +194,3 @@ impl Smtp {
         }
     }
 }
-
-// #[async_trait]
-// impl TryConnect for Smtp {
-// }

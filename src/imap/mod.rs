@@ -1256,13 +1256,6 @@ impl Imap {
     }
 }
 
-// #[async_trait]
-// impl TryConnect for Imap {
-//     async fn try_connect(&self, context: &Context, lp: &LoginParam) -> bool {
-//         self.connect(context, lp).await
-//     }
-// }
-
 /// Try to get the folder meaning by the name of the folder only used if the server does not support XLIST.
 // TODO: lots languages missing - maybe there is a list somewhere on other MUAs?
 // however, if we fail to find out the sent-folder,
