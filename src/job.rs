@@ -36,7 +36,7 @@ use crate::param::*;
 use crate::sql;
 
 // results in ~3 weeks for the last backoff timespan
-const JOB_RETRIES: u32 = 4;
+const JOB_RETRIES: u32 = 2;
 
 /// Thread IDs
 #[derive(Debug, Display, Copy, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
