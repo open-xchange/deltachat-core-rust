@@ -286,6 +286,7 @@ impl Job {
                                     ),
                                 };
 
+                                message::set_msg_failed(context, MsgId::new(self.foreign_id), Some(err.to_string()));
                                 Status::Finished(Err(format_err!("Permanent SMTP error: {}", err)))
                             }
                         }
