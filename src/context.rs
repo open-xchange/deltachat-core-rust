@@ -16,6 +16,7 @@ use crate::imap::*;
 use crate::job::*;
 use crate::job_thread::JobThread;
 use crate::key::{DcKey, Key, SignedPublicKey};
+use crate::keyring::Keyring;
 use crate::login_param::LoginParam;
 use crate::lot::Lot;
 use crate::message::{self, Message, MessengerMessage, MsgId};
@@ -325,6 +326,20 @@ impl Context {
         res.insert("uptime", duration_to_str(elapsed.unwrap_or_default()));
 
         res
+    }
+
+    pub fn get_private_keys(&self) -> Option<Vec<String>> {
+        let mut private_keyring = Keyring::default();
+        let self_addr = self.get_config(Config::ConfiguredAddr);
+        if self_addr.is_none() {
+            return None;
+        }
+        let self_addr = self_addr.unwrap();
+        if !private_keyring.load_self_private_for_decrypting(self, self_addr, &self.sql) {
+            return None;
+        }
+        let b64_keys = private_keyring.keys().iter().map(|key| key.to_base64()).collect();
+        Some(b64_keys)
     }
 
     pub fn get_fresh_msgs(&self) -> Vec<MsgId> {

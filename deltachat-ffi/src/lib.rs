@@ -2084,6 +2084,20 @@ pub unsafe extern "C" fn dc_continue_key_transfer(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_private_keys_as_base64(context: *mut dc_context_t) -> *mut dc_array::dc_array_t {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_stop_ongoing_process()");
+        return ptr::null_mut();
+    }
+    let ffi_context = &*context;
+    let keys = ffi_context.with_inner(|ctx| ctx.get_private_keys());
+    match keys {
+        Ok(keys) => Box::into_raw(Box::new(dc_array_t::from(keys.unwrap_or_default()))),
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_stop_ongoing_process(context: *mut dc_context_t) {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_stop_ongoing_process()");
@@ -2400,6 +2414,20 @@ pub unsafe extern "C" fn dc_array_get_raw(array: *const dc_array_t) -> *const u3
     }
 
     (*array).as_ptr()
+}
+
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_array_get_str(
+    array: *const dc_array_t,
+    index: libc::size_t,
+) -> *const libc::c_char {
+    if array.is_null() {
+        eprintln!("ignoring careless call to dc_array_get_raw()");
+        return ptr::null_mut();
+    }
+
+    (*array).get_string(index).as_ptr()
 }
 
 // Return the independent-state of the location at the given index.

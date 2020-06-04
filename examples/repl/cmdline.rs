@@ -453,6 +453,12 @@ pub fn dc_cmdline(context: &Context, line: &str) -> Result<(), Error> {
         "export-keys" => {
             imex(context, ImexMode::ExportSelfKeys, Some(blobdir));
         }
+        "show-keys" => {
+            let keys = context.get_private_keys().unwrap_or(vec!["No_keys".to_string()]);
+            for k in keys {
+                println!("key: {}", k);
+            }
+        }
         "import-keys" => {
             imex(context, ImexMode::ImportSelfKeys, Some(blobdir));
         }

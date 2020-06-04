@@ -2151,6 +2151,13 @@ char*           dc_initiate_key_transfer     (dc_context_t* context);
  */
 int             dc_continue_key_transfer     (dc_context_t* context, uint32_t msg_id, const char* setup_code);
 
+/**
+ * Returns the array of base64 encoded private keys for decryption.
+ * @param context The context object.
+ * @return An array containing base64 encoded private keys.
+ */
+dc_array_t *dc_private_keys_as_base64(dc_context_t* context);
+
 
 /**
  * Signal an ongoing process to stop.
@@ -2614,6 +2621,14 @@ int              dc_array_search_id          (const dc_array_t* array, uint32_t 
  *     It is not possible to enlarge the array this way.  Calling any other dc_array*()-function may discard the returned pointer.
  */
 const uint32_t*  dc_array_get_raw            (const dc_array_t* array);
+
+/**
+ * Get string element of the array
+ * @param array The array object.
+ * @param index Index of the item. Must be between 0 and dc_array_get_cnt()-1.
+ * @return String element at index.
+ */
+const char* dc_array_get_str(const dc_array_t* array, size_t index);
 
 
 /**

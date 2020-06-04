@@ -1,10 +1,12 @@
 use crate::location::Location;
+use std::ffi::CString;
 
 /* * the structure behind dc_array_t */
 #[derive(Debug, Clone)]
 pub enum dc_array_t {
     Locations(Vec<Location>),
     Uint(Vec<u32>),
+    String(Vec<CString>)
 }
 
 impl dc_array_t {
@@ -33,10 +35,19 @@ impl dc_array_t {
         }
     }
 
+    pub fn add_string(&mut self, str: String) {
+        if let Self::String(array) = self {
+            array.push(CString::new(str).unwrap_or_default());
+        } else {
+            panic!("Attempt tp add a string to array of another type");
+        }
+    }
+
     pub fn get_id(&self, index: usize) -> u32 {
         match self {
             Self::Locations(array) => array[index].location_id,
             Self::Uint(array) => array[index] as u32,
+            _ => {panic!("Attempt to get id from array of incompatible type")}
         }
     }
 
@@ -48,10 +59,19 @@ impl dc_array_t {
         }
     }
 
+    pub fn get_string(&self, index: usize) -> CString {
+        if let Self::String(array) = self {
+            array[index].clone()
+        } else {
+            panic!("Not an array of strings")
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Locations(array) => array.is_empty(),
             Self::Uint(array) => array.is_empty(),
+            Self::String(array) => array.is_empty(),
         }
     }
 
@@ -60,6 +80,7 @@ impl dc_array_t {
         match self {
             Self::Locations(array) => array.len(),
             Self::Uint(array) => array.len(),
+            Self::String(array) => array.len(),
         }
     }
 
@@ -67,6 +88,7 @@ impl dc_array_t {
         match self {
             Self::Locations(array) => array.clear(),
             Self::Uint(array) => array.clear(),
+            Self::String(array) => array.clear(),
         }
     }
 
@@ -109,6 +131,12 @@ impl From<Vec<u32>> for dc_array_t {
 impl From<Vec<Location>> for dc_array_t {
     fn from(array: Vec<Location>) -> Self {
         dc_array_t::Locations(array)
+    }
+}
+
+impl From<Vec<String>> for dc_array_t {
+    fn from(array: Vec<String>) -> Self {
+        dc_array_t::String(array.iter().map(|s| CString::new(s.as_bytes()).unwrap_or_default()).collect())
     }
 }
 
